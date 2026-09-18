@@ -104,6 +104,33 @@ export function generationPayload(graph, id) {
   };
 }
 
+/** Restore a recorded request as an independent, editable canvas fragment. */
+export function recipeGraph(recipe, x = 80, y = 80) {
+  const request = recipe?.request;
+  if (!request || typeof request !== 'object' || Array.isArray(request) || !KINDS.includes(request.kind)) throw new Error('任务没有可复用的生成参数');
+  const data = copy(request);
+  delete data.references;
+  delete data.reference_roles;
+  delete data.values;
+  delete data.prompt;
+  if (request.kind === 'api') data.apiPrompt = copy(request.prompt);
+  if (request.kind === 'package') data.packageValues = packageValues(request.values || {});
+  data.title = typeof recipe.title === 'string' ? recipe.title : `复用 · ${request.kind === 'package' ? '工作流包' : request.kind === 'api' ? 'API 工作流' : request.kind.startsWith('h3') ? 'H3 视频生成' : '图片生成'}`;
+  const node = createNode('generation', x, y, data);
+  const fragment = { nodes: [node], edges: [] };
+  if (!['api', 'package'].includes(request.kind)) {
+    (request.references || []).forEach((name, index) => {
+      const metadata = (recipe.references || []).find(item => item.name === name) || {};
+      const reference = createNode('reference', x - 345, y + index * 340, { title: `复用素材 ${index + 1}`, name, url: metadata.url || '', mediaType: 'image', role: request.reference_roles?.[index] || 'reference' });
+      fragment.nodes.push(reference); connect(fragment, reference.id, node.id);
+    });
+  }
+  // Use the same boundary validation as an imported canvas before adding anything.
+  const validated = parseGraph(serializeGraph(fragment));
+  generationPayload(validated, node.id);
+  return { nodes: validated.nodes, edges: validated.edges, generationId: node.id };
+}
+
 export function stableStringify(value) {
   const sort = item => Array.isArray(item) ? item.map(sort) : item && typeof item === 'object' ? Object.fromEntries(Object.keys(item).sort().map(key => [key, sort(item[key])])) : item;
   return JSON.stringify(sort(value), null, 2);
@@ -142,6 +169,22 @@ export function parseGraph(text) {
     }
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
+    if (node.type === 'generation') {
+      // Optional native controls survive recipes and old canvases without adding defaults.
+      for (const key of ['shift_video', 'shift_audio']) {
+        if (!Object.hasOwn(node.data, key)) continue;
+        const value = node.data[key];
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < .01 || value > 100) throw new Error(`${key} 必须是 0.01 到 100 之间的数字`);
+        data[key] = value;
+      }
+      if (Object.hasOwn(node.data, 'ref_image_size')) data.ref_image_size = String(node.data.ref_image_size ?? '').slice(0, 100000);
+      // The backend gives a nonempty top-level LoRA precedence. Normalize it into
+      // the existing editable model role so later UI changes remain effective.
+      if (node.data.lora) {
+        if (typeof node.data.lora !== 'string') throw new Error('LoRA 模型名称必须是文本');
+        data.models = { ...data.models, lora: node.data.lora.slice(0, 100000) };
+      }
+    }
     if (node.type === 'result') {
       if (!Array.isArray(data.outputs)) data.outputs = [];
       data.outputs = data.outputs.filter(item => item && ['image', 'video'].includes(item.type) && typeof item.url === 'string').slice(0, 32);

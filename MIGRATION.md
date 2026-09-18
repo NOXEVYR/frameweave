@@ -8,4 +8,6 @@ v0.2.0 的 [Windows 便携包](https://raw.githubusercontent.com/turnsolesama/po
 
 本次调整限于说明页和迁移记录，保留原创客户端的 MIT 许可与第三方署名。Windows 本地配置仍位于 `%LOCALAPPDATA%/FrameWeave`，画布仍在本机浏览器存储；已有 ComfyUI、模型和生成结果的位置不因仓库拆分而变化。迁移前的功能与验证记录见 [开发记录](docs/DEVELOPMENT_LOG.md)。
 
+2026-09-18：0.3.0 起的新源码归档与 Windows 便携包放在本仓库 `releases/`，下载与校验入口见 README。旧 portfolio 归档保持原样；这些仓库内文件不等同于 GitHub Release 附件。
+
 [返回 README](README.md) · [返回项目总览](https://github.com/turnsolesama/portfolio)

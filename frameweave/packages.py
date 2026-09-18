@@ -4,7 +4,9 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 import threading
 import time
 from collections import deque
@@ -19,6 +21,9 @@ TYPES = {"text", "integer", "number", "boolean", "select", "image"}
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 RESERVED = {"__proto__", "prototype", "constructor"}
 MODEL_INPUTS = {"ckpt_name", "unet_name", "clip_name", "vae_name", "lora_name", "clip_name1", "clip_name2"}
+PACKAGE_ID = re.compile(r"p-[0-9a-f]{24}\Z")
+METADATA_FIELDS = {"favorite", "archived"}
+MAX_METADATA_BYTES = 64 * 1024
 
 
 def encoded(value):
@@ -260,9 +265,48 @@ class PackageStore:
         self.lock = threading.RLock()
 
     def _path(self, package_id):
-        if not isinstance(package_id, str) or not re.fullmatch(r"p-[0-9a-f]{24}", package_id):
+        if not isinstance(package_id, str) or not PACKAGE_ID.fullmatch(package_id):
             raise ValueError("工作流包 ID 无效")
         return self.directory / (package_id + ".json")
+
+    def _read_metadata(self):
+        """Recover valid entries independently; damaged organization never hides a package."""
+        try:
+            with (self.directory / "metadata.json").open("rb") as stream:
+                data = stream.read(MAX_METADATA_BYTES + 1)
+            if len(data) > MAX_METADATA_BYTES:
+                return {}
+            document = json.loads(data)
+        except (OSError, ValueError, RecursionError):
+            return {}
+        if (not isinstance(document, dict) or type(document.get("version")) is not int
+                or document["version"] != 1 or not isinstance(document.get("packages"), dict)):
+            return {}
+        result = {}
+        for package_id, values in document["packages"].items():
+            if (not isinstance(package_id, str) or not PACKAGE_ID.fullmatch(package_id)
+                    or not isinstance(values, dict) or set(values) - METADATA_FIELDS
+                    or any(type(value) is not bool for value in values.values())):
+                continue
+            result[package_id] = {key: values.get(key, False) for key in METADATA_FIELDS}
+        return result
+
+    def _write_metadata(self, metadata):
+        data = encoded({"version": 1, "packages": metadata})
+        if len(data) > MAX_METADATA_BYTES:
+            raise ValueError("工作流包整理信息超过大小上限")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", prefix=".metadata-", suffix=".tmp",
+                                             dir=self.directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(self.directory / "metadata.json")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def save(self, document):
         normalized = normalize_document(document)
@@ -279,35 +323,53 @@ class PackageStore:
             temp.replace(path)
             return self.get(package_id)
 
-    def get(self, package_id):
+    def _get(self, package_id, metadata):
         path = self._path(package_id)
-        with self.lock:
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                raise ValueError("工作流包文件超过大小上限")
             try:
-                with path.open("rb") as stream:
-                    data = stream.read(MAX_BYTES + 1)
-                if len(data) > MAX_BYTES:
-                    raise ValueError("工作流包文件超过大小上限")
-                try:
-                    document = normalize_document(json.loads(data))
-                except RecursionError:
-                    raise ValueError("工作流包 JSON 嵌套过深") from None
-            except FileNotFoundError:
-                raise ValueError("工作流包未在本机安装，请先导入对应工作流包") from None
-            if "p-" + hashlib.sha256(encoded(document)).hexdigest()[:24] != package_id:
-                raise ValueError("工作流包内容已变化，请重新导入")
-            return {**document, "id": package_id, "created_at": path.stat().st_mtime,
-                    "updated_at": path.stat().st_mtime,
-                    "requirements": {"nodes": sorted({node["class_type"] for node in document["prompt"].values()})}}
+                document = normalize_document(json.loads(data))
+            except RecursionError:
+                raise ValueError("工作流包 JSON 嵌套过深") from None
+        except FileNotFoundError:
+            raise ValueError("工作流包未在本机安装，请先导入对应工作流包") from None
+        if "p-" + hashlib.sha256(encoded(document)).hexdigest()[:24] != package_id:
+            raise ValueError("工作流包内容已变化，请重新导入")
+        return {**document, "id": package_id, "created_at": path.stat().st_mtime,
+                "updated_at": path.stat().st_mtime,
+                "favorite": metadata.get(package_id, {}).get("favorite", False),
+                "archived": metadata.get(package_id, {}).get("archived", False),
+                "requirements": {"nodes": sorted({node["class_type"] for node in document["prompt"].values()})}}
+
+    def get(self, package_id):
+        with self.lock:
+            return self._get(package_id, self._read_metadata())
+
+    def update_metadata(self, package_id, patch):
+        if (not isinstance(patch, dict) or not patch or set(patch) - METADATA_FIELDS
+                or any(type(value) is not bool for value in patch.values())):
+            raise ValueError("整理信息只接受 favorite、archived 布尔值，且至少提供一个字段")
+        with self.lock:
+            metadata = self._read_metadata()
+            package = self._get(package_id, metadata)
+            metadata[package_id] = {key: patch.get(key, package[key]) for key in METADATA_FIELDS}
+            self._write_metadata(metadata)
+            return {**package, **metadata[package_id]}
 
     def list(self):
         packages = []
-        for path in list(self.directory.glob("p-*.json"))[:200]:
-            try:
-                package = self.get(path.stem)
-                package.pop("prompt")
-                packages.append(package)
-            except (ValueError, OSError):
-                continue
+        with self.lock:
+            metadata = self._read_metadata()
+            for path in list(self.directory.glob("p-*.json"))[:200]:
+                try:
+                    package = self._get(path.stem, metadata)
+                    package.pop("prompt")
+                    packages.append(package)
+                except (ValueError, OSError):
+                    continue
         return sorted(packages, key=lambda item: item["updated_at"], reverse=True)
 
     def export(self, package_id):

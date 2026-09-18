@@ -1,0 +1,275 @@
+{
+  "version": "0.3.0",
+  "created_utc": "2026-09-18T05:17:04.507113+00:00",
+  "license": "MIT (client code)",
+  "runtime_dependencies": [
+    "Windows x64",
+    "System Edge or default browser",
+    "External local ComfyUI and separately licensed models"
+  ],
+  "contains_weights": false,
+  "contains_private_configuration": false,
+  "exe_bytes": 9490805,
+  "exe_sha256": "f2550a54880ca53963fe6266edf704a236274d13ab4943e179147cf1bb5ce544",
+  "checks": {
+    "date": "2026-09-18",
+    "python_tests": 138,
+    "node_tests": 21,
+    "python_compile": true,
+    "javascript_syntax": true,
+    "ui_checks_source": 17,
+    "ui_checks_packaged": 17,
+    "simulated_visibility_checks_each": 1,
+    "real_window_occlusion_verified": false,
+    "real_krea_image": true,
+    "real_h3_text_video": true,
+    "exact_graph_retry_and_request_dedup": true,
+    "h3_full_decode": true,
+    "h3_width": 768,
+    "h3_height": 448,
+    "h3_frames": 124,
+    "h3_fps": 24,
+    "h3_duration_seconds": 5.167,
+    "model_generation_algorithm_changed": false,
+    "uncached_generation_seconds": {
+      "krea": 14.25,
+      "h3": 143.98
+    },
+    "cached_retry_is_not_inference_benchmark": true
+  },
+  "artifacts": [
+    {
+      "name": "FrameWeave-v0.3.0-Windows-x64.zip",
+      "kind": "Windows x64 portable",
+      "bytes": 9838772,
+      "sha256": "f350e2bedad0e7648d21297104d156c3204b3573238d7a6c72602de34c52a3c7",
+      "unpacked_bytes": 10087541,
+      "file_count": 16
+    },
+    {
+      "name": "FrameWeave-v0.3.0-source.zip",
+      "kind": "Source",
+      "bytes": 665964,
+      "sha256": "a4bbd746fad194ad9dca97e5f7c4989478caf0e1e7c8b0c189ed086a3f339b15",
+      "unpacked_bytes": 1031920,
+      "file_count": 43
+    }
+  ],
+  "source_files": [
+    {
+      "path": ".gitignore",
+      "bytes": 154,
+      "sha256": "66d70e9d30884745e6139f9865b4dfcd3004f97018f711e65feffab949bb25ec"
+    },
+    {
+      "path": "AGENTS.md",
+      "bytes": 1760,
+      "sha256": "514a4d27c641bee04da8262ef43eca54e67bfa960787069bcf7589daf9d8a140"
+    },
+    {
+      "path": "assets/frameweave.ico",
+      "bytes": 1420,
+      "sha256": "a8e42c26022f7a4c6b75ca326e424274fedc87d513082aee0734d82f383d9c7f"
+    },
+    {
+      "path": "assets/frameweave.png",
+      "bytes": 1398,
+      "sha256": "13015f81e13ab443b9f659e6598aa1da2e2eac9bda9add6126adbe5b49884099"
+    },
+    {
+      "path": "docs/ANALYSIS.md",
+      "bytes": 3279,
+      "sha256": "870f256efd9ae772603b1b4a77af1d0755b95fbd2994c9b15cf5c4b1e91ebc52"
+    },
+    {
+      "path": "docs/BUILD.md",
+      "bytes": 1700,
+      "sha256": "60f342b7d3c0bee0b176bb7846647192e6e49d29c6afca0fdbdef44f0ac94b68"
+    },
+    {
+      "path": "docs/DEVELOPMENT_LOG.md",
+      "bytes": 7943,
+      "sha256": "bb9b36d52c8d70ca52cca54ffff530b582675f57fb1b543f2cedcf1ab32f8d5b"
+    },
+    {
+      "path": "docs/ENVIRONMENT.md",
+      "bytes": 7806,
+      "sha256": "b56ed899c64dc1d5fed4694920b2c915d73ea1e006bbbcff2f8dfb1cc2269cb0"
+    },
+    {
+      "path": "docs/MODELS.md",
+      "bytes": 8851,
+      "sha256": "833e3baa6356faa0f6d4e82b3167a8adc0b5264f26ca8a2495f35ba954a3ae5e"
+    },
+    {
+      "path": "docs/screenshot-v0.3.0.png",
+      "bytes": 262780,
+      "sha256": "716ca3f9b8d9a5c7e4476d49e96807e72ac414dc66a5273ec2b1b18f95b7b407"
+    },
+    {
+      "path": "docs/screenshot.png",
+      "bytes": 235897,
+      "sha256": "7774194aef11713eb48ebdb3afa435063a56accc5f1d4e993556e9f3fc901e6a"
+    },
+    {
+      "path": "docs/TASK_HISTORY.md",
+      "bytes": 3601,
+      "sha256": "114ceafff21b0d3f67982fea4317209b0ce7818f6c8b3dc36d63ffd156467691"
+    },
+    {
+      "path": "docs/VALIDATION.md",
+      "bytes": 8249,
+      "sha256": "143590a22c8cb6c88d175beb79a6cb40bf109bd55e6424dc4bc6192f4d88a0b9"
+    },
+    {
+      "path": "docs/WORKFLOW_PACKAGES.md",
+      "bytes": 7275,
+      "sha256": "9776c567c87983da0d709b552535788f50564cdb77f9e6f7c1768900a5a9817c"
+    },
+    {
+      "path": "frameweave/__init__.py",
+      "bytes": 86,
+      "sha256": "a379b5497ff04a4394383f7653e0a7223a41f8b27f4a0bc671b61a53ad8dc0b5"
+    },
+    {
+      "path": "frameweave/__main__.py",
+      "bytes": 2528,
+      "sha256": "4bae04e5e9d59cc9653d1e60b0bbbdf1b8546b01e21c65699270df143f579bdd"
+    },
+    {
+      "path": "frameweave/backend.py",
+      "bytes": 3649,
+      "sha256": "9014429bc0f1bf52b38a4177d1c3a3d4472e6b734b0cbfc8685ce5dc5aaa9cba"
+    },
+    {
+      "path": "frameweave/diagnostics.py",
+      "bytes": 27097,
+      "sha256": "c5f497d30b3b311234d4fce5c9abc73c3e90cda96887ee3770a4b76f33fe8498"
+    },
+    {
+      "path": "frameweave/environment.py",
+      "bytes": 24477,
+      "sha256": "d7aae31c89f1e26f6d346d97da7566c56d612c882a312a17d5cc8597e66c5b42"
+    },
+    {
+      "path": "frameweave/packages.py",
+      "bytes": 18878,
+      "sha256": "4446c1cffbc609901cd2c35b5e09bc3fdcb3523cdca8e2e21864df387232dffe"
+    },
+    {
+      "path": "frameweave/server.py",
+      "bytes": 38310,
+      "sha256": "c14d49d93c8dcc9a8b629b0186bf3d12bcd8f44db0eaf9118af18b2bc253ae8e"
+    },
+    {
+      "path": "frameweave/workflows.py",
+      "bytes": 33805,
+      "sha256": "e5e580f5a15b5dac17d9810bed2c40348cd2db2ab3273fcd40a93965b40bc6f1"
+    },
+    {
+      "path": "launch.py",
+      "bytes": 122,
+      "sha256": "86b9673809c27afd12fe20a16cb5aad80f4309b62b22dfa5409917536dcef173"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1080,
+      "sha256": "3486c5a741c6fd7b50eeae562c570dc7950f99f23680bb8f051d7a5be9039413"
+    },
+    {
+      "path": "MIGRATION.md",
+      "bytes": 1825,
+      "sha256": "21f3dc9b7b7105fba22003cf9fd05bd39685126242b55725aa6a2cf402231e0e"
+    },
+    {
+      "path": "PYTHON-LICENSE.txt",
+      "bytes": 36874,
+      "sha256": "e502c6b880ff58d614901495a9009c136539cd0b1e2a2abb8fc00b934c203419"
+    },
+    {
+      "path": "README.md",
+      "bytes": 8273,
+      "sha256": "1d3c00b955276dcc01b91a6aa4a45961a62ae517b912c6ed8cfb4f60a8a94b30"
+    },
+    {
+      "path": "tests/graph.test.mjs",
+      "bytes": 5647,
+      "sha256": "bdacd904b7c97da954b44f9224f3aeaeac67bf7d488dc009111d45eaab62eb0e"
+    },
+    {
+      "path": "tests/library.test.mjs",
+      "bytes": 5063,
+      "sha256": "42365783db961eb2188e460cf420c58d5aacf90cd605a799a5f77ca7c7e544c9"
+    },
+    {
+      "path": "tests/packages.test.mjs",
+      "bytes": 6084,
+      "sha256": "745009e04b0bf67a111d54f6e36af9f160e3b5785d60769cd9dd37bd164b4059"
+    },
+    {
+      "path": "tests/test_diagnostics.py",
+      "bytes": 14415,
+      "sha256": "7136dcd197f5867acbc35e81b0d9ea7bf061f0bbc0a3af22305f7291713ad561"
+    },
+    {
+      "path": "tests/test_environment.py",
+      "bytes": 14705,
+      "sha256": "476cf5cf29e23d154a3e5b2ec2eb5abce638cba90d5c168d0b025ad206467c77"
+    },
+    {
+      "path": "tests/test_packages.py",
+      "bytes": 16019,
+      "sha256": "17ac92f5d694465c1867c9d8e5f3693cd9cea9dd2bb4e2914ce55610c4312556"
+    },
+    {
+      "path": "tests/test_replay.py",
+      "bytes": 15399,
+      "sha256": "fb543bfc6788ab387617d4ddb29388074db42ab274fa0b13b37a779167151b6a"
+    },
+    {
+      "path": "tests/test_service.py",
+      "bytes": 25641,
+      "sha256": "d41fb504bcbd4816d3732333472413bcc9e3371a5c334422be229f90170abf9f"
+    },
+    {
+      "path": "tests/test_workflows.py",
+      "bytes": 20668,
+      "sha256": "28263df28dddb102547811ca145e6edddec9a68fa009c0630a4e753177cf3bc1"
+    },
+    {
+      "path": "THIRD_PARTY.md",
+      "bytes": 1303,
+      "sha256": "dc32c7df40644451d9f34e7b4f3c0725be01805da9dc35ea95c4148fe75b2b48"
+    },
+    {
+      "path": "web/app.js",
+      "bytes": 93663,
+      "sha256": "34fe9b0aa6bdbf85bee4846be13969e4c1515fb383e4cc52857db74c9ebaa5c3"
+    },
+    {
+      "path": "web/graph.mjs",
+      "bytes": 13020,
+      "sha256": "cb03984866bc1c95e57d2d6c9f287694e867e100954204aee101079d03553729"
+    },
+    {
+      "path": "web/index.html",
+      "bytes": 15089,
+      "sha256": "c4a01cd65393be52d6778e6509c0b9a76825b13ef6bdfdd11d790e709ee9314e"
+    },
+    {
+      "path": "web/library.mjs",
+      "bytes": 1082,
+      "sha256": "e07fbba9e9742f8291d2a644d5742003b48c80fb925cc0f78f49937b91b6d2fb"
+    },
+    {
+      "path": "web/packages.mjs",
+      "bytes": 7191,
+      "sha256": "f19fdb45ac446293a7316e064908dda654ea9c0e67bb94813151f3747edb4ebb"
+    },
+    {
+      "path": "web/style.css",
+      "bytes": 27814,
+      "sha256": "48de25ed359f98f7b0d0e611b62d5489379564e738e01275da31dca624b3bddb"
+    }
+  ]
+}

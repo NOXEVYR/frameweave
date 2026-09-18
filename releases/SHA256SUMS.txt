@@ -1,0 +1,2 @@
+f350e2bedad0e7648d21297104d156c3204b3573238d7a6c72602de34c52a3c7  FrameWeave-v0.3.0-Windows-x64.zip
+a4bbd746fad194ad9dca97e5f7c4989478caf0e1e7c8b0c189ed086a3f339b15  FrameWeave-v0.3.0-source.zip

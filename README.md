@@ -6,15 +6,15 @@
 
 深墨蓝与青绿的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；重点是 MiniMax H3 视频、Krea 2 / SDXL 图片控制、缺失项检查和可复现工作流。
 
-> **0.2.0**：新增自动环境发现和可填写参数的工作流包。客户端替代日常 ComfyUI 画布操作，生成计算由用户已有的本地 ComfyUI 后端完成。客户端不包含原参考软件代码、模型、PyTorch 或 CUDA。
+> **0.3.0**：增加历史任务参数复用、再次生成与防重复提交、队列搜索筛选、工作流包收藏和归档，并优化媒体刷新与输入保存。生成计算由用户已有的本地 ComfyUI 后端完成；客户端不包含模型、PyTorch 或 CUDA。
 
-![帧织画布界面](docs/screenshot.png)
+![帧织 0.3.0 图片与视频任务界面](docs/screenshot-v0.3.0.png)
 
 ## 开始使用
 
-**[下载 Windows 便携版](https://raw.githubusercontent.com/turnsolesama/portfolio/main/frameweave/releases/FrameWeave-v0.2.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/turnsolesama/portfolio/main/frameweave/releases/FrameWeave-v0.2.0-source.zip) · [SHA-256 校验值](https://github.com/turnsolesama/portfolio/blob/main/frameweave/releases/SHA256SUMS.txt)
+**[下载 Windows 便携版](https://raw.githubusercontent.com/turnsolesama/frameweave/main/releases/FrameWeave-v0.3.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/turnsolesama/frameweave/main/releases/FrameWeave-v0.3.0-source.zip) · [SHA-256 校验值](https://github.com/turnsolesama/frameweave/blob/main/releases/SHA256SUMS.txt)
 
-上面的 v0.2.0 发行文件与校验值保留在原 portfolio 仓库；独立仓库维护 FrameWeave 源码与文档。本次拆分沿用已有便携包，详情见 [迁移说明](MIGRATION.md)。
+新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/turnsolesama/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 
 Windows 用户通过上面的下载链接获取便携 ZIP，完整解压后打开 `FrameWeave.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
 
@@ -40,6 +40,8 @@ python launch.py
 
 详细步骤和分享范围见 [工作流包指南](docs/WORKFLOW_PACKAGES.md)。
 
+包库可按名称、说明与 ID 搜索，将常用包收藏，把暂不用的包归档。归档仅隐藏常规列表中的条目，可随时恢复；已有画布仍可使用它。收藏与归档只存本机，不进入导出的分享文件。
+
 ## 画布和生成
 
 - 无限画布：平移、鼠标锚点缩放、节点拖动、框选、端口连线、复制、删除、撤销重做、适配视图与小地图。
@@ -47,7 +49,9 @@ python launch.py
 - 参考图：PNG / JPEG / WebP 上传到本机推理服务。H3 支持文生、首尾帧、1–9 张图像参考；视频和音频参考请使用专用 API 工作流。
 - 控制：模式、模型、种子、尺寸、步数、CFG、采样器、调度器、LoRA、降噪、时长。H3 固定 24 fps，展示按 `17n+5` 对齐的真实帧数和时长。
 - 图片：Krea 2 文生图与带兼容节点/LoRA的参考编辑、SDXL 文生图和图生图。参数与节点会在提交前校验。
-- 队列：只追踪本客户端提交的任务，保存复现图、耗时、执行错误和输出。结果可大图预览、视频播放。
+- 队列：只追踪本客户端提交的任务，保存复现图、耗时、执行错误和输出；支持状态筛选与标题、ID、类型、错误搜索，刷新时复用未变化的缩略图。
+- 参数复用：从历史任务创建独立生成节点，修改提示词或参数再运行。再次生成使用保存的精确 API 图与种子，并校验当前节点；同一次请求不会重复排队。详见 [任务历史指南](docs/TASK_HISTORY.md)。
+- 预览：图片放大、视频播放与下载；关闭或更换预览时暂停并释放媒体源。输入即时保存，轮询不会覆盖尚未失焦的有效文本。
 - 取消：支持原子按任务中断的后端可取消运行中任务；旧后端只取消排队任务，不调用会影响其他客户端的全局中断。
 - 高级用户：导入 ComfyUI **API 格式** JSON 工作流。普通 ComfyUI UI 格式 JSON 需要先在 ComfyUI 导出为 API 格式。
 

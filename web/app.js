@@ -1,9 +1,11 @@
-import { createNode, createDemo, connect, removeNodes, duplicateNodes, generationPayload, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
+import { createNode, createDemo, connect, removeNodes, duplicateNodes, generationPayload, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
 import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, redactLocalText, publicChecksReport } from './packages.mjs';
+import { filterJobs, filterPackages } from './library.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
 const JOB_MAP_KEY = 'frameweave.jobs.v1';
+const RETRY_REQUESTS_KEY = 'frameweave.retry-requests.v1';
 const KIND_NAMES = { h3_t2v: 'H3 · 文生视频', h3_i2v: 'H3 · 首尾帧视频', h3_ref: 'H3 · 参考生成视频', sdxl: 'SDXL · 图片生成', krea: 'Krea 2 · 图片生成', api: 'ComfyUI · API 工作流', package: '工作流包 · 填写即生成' };
 const STATUS_NAMES = { queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', cancelled: '已取消' };
 const canvas = $('#canvas');
@@ -42,6 +44,12 @@ let workflowChecks = [];
 let workflowRepair = '';
 let diagnosticNodeId = null;
 let diagnosticBusy = false;
+const jobViews = new Map();
+const retrying = new Set();
+const retryRequests = new Map();
+const reusing = new Set();
+const organizingPackages = new Set();
+let draftEditing = null;
 const clone = value => JSON.parse(JSON.stringify(value));
 
 function el(tag, className, text) {
@@ -101,6 +109,11 @@ function pushHistory(before) {
 function mutate(action, options = {}) {
   const before = snapshot();
   action();
+  if (draftEditing) {
+    if (!draftEditing.recorded && before !== snapshot()) { pushHistory(before); draftEditing.recorded = true; }
+    else save();
+    return;
+  }
   pushHistory(before);
   renderNodes();
   if (options.inspector !== false) renderInspector();
@@ -222,18 +235,27 @@ function outputMedia(output, className, controls = false) {
   media.src = url;
   if (output.type === 'video') { media.controls = controls; media.preload = 'metadata'; media.playsInline = true; }
   else { media.alt = output.filename || '本地生成结果'; media.loading = 'lazy'; }
-  media.addEventListener('error', () => { if (media.isConnected) media.replaceWith(el('div', 'media-error', '媒体文件不可用。导入的画布不包含原始媒体，请重新导入素材或检查本地输出。')); }, { once: true });
+  media.addEventListener('error', () => { if (media.isConnected && media.hasAttribute('src')) media.replaceWith(el('div', 'media-error', '媒体文件不可用。导入的画布不包含原始媒体，请重新导入素材或检查本地输出。')); }, { once: true });
   if (!controls) media.addEventListener('click', event => { event.stopPropagation(); preview(output); });
   return media;
+}
+function releaseMedia(root) {
+  root.querySelectorAll('video,audio').forEach(media => { media.pause(); media.removeAttribute('src'); media.load(); });
+}
+function clearPreview() {
+  releaseMedia($('#preview-content'));
+  $('#preview-content').replaceChildren();
+  $('#preview-download').removeAttribute('href');
 }
 function preview(output) {
   const url = mediaURL(output.url);
   if (!url) throw new Error('只能预览当前本地服务的媒体');
+  clearPreview();
   $('#preview-title').textContent = output.filename || '本地媒体预览';
   $('#preview-content').replaceChildren(outputMedia(output, '', true));
   $('#preview-download').href = url;
   $('#preview-download').download = output.filename || 'frameweave-output';
-  $('#preview-dialog').showModal();
+  if (!$('#preview-dialog').open) $('#preview-dialog').showModal();
 }
 function port(node, direction) {
   const element = button('', `port ${direction}${connecting?.source === node.id && direction === 'output' ? ' armed' : ''}`, () => {
@@ -253,9 +275,17 @@ function port(node, direction) {
 }
 function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '滚轮缩放 · 空白拖动 · Shift 框选'; renderEdges(); renderSelection(); }
 function renderNodes() {
-  nodesLayer.replaceChildren();
+  const remaining = new Map([...nodesLayer.children].map(card => [card.dataset.nodeId, card]));
   graph.nodes.forEach((node, index) => {
+    const previous = remaining.get(node.id); remaining.delete(node.id);
+    const signature = JSON.stringify([node.data, index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => getNode(edge.source)?.data), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
+    if (previous && previous._node === node && (previous._signature === signature || previous.contains(document.activeElement))) {
+      previous.style.left = `${node.x}px`; previous.style.top = `${node.y}px`; previous.classList.toggle('selected', selected.has(node.id));
+      if (nodesLayer.children[index] !== previous) nodesLayer.insertBefore(previous, nodesLayer.children[index] || null);
+      return;
+    }
     const card = el('article', `node node-${node.type}${selected.has(node.id) ? ' selected' : ''}`);
+    card._node = node; card._signature = signature;
     card.id = `fw-node-${node.id}`; card.dataset.nodeId = node.id; card.style.left = `${node.x}px`; card.style.top = `${node.y}px`;
     card.setAttribute('aria-label', `${node.data.title} 节点`);
     const header = el('div', 'node-header');
@@ -264,6 +294,7 @@ function renderNodes() {
     const body = el('div', 'node-body');
     if (node.type === 'prompt') {
       const text = el('textarea', 'node-textarea'); text.value = node.data.text; text.placeholder = '描述画面、主体、镜头与运动…'; text.setAttribute('aria-label', `${node.data.title} 内容`);
+      bindDraft(text, value => mutate(() => { node.data.text = value; }, { inspector: false }));
       text.addEventListener('change', () => mutate(() => { node.data.text = text.value; }, { inspector: false }));
       body.append(text); card.append(body);
       const footer = el('div', 'node-footer'); footer.append(el('span', '', `${node.data.text.length} 字 · 可连接多个生成节点`), button('复制提示词 ↗', 'node-action', () => copyText(node.data.text))); card.append(footer, port(node, 'output'));
@@ -284,7 +315,7 @@ function renderNodes() {
       footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer); if (node.data.kind !== 'package') card.append(port(node, 'input')); card.append(port(node, 'output'));
     } else if (node.type === 'reference') {
       if (node.data.url) body.append(outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.name }, 'reference-media'));
-      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', '＋'), el('span', '', '选择参考图片'), el('span', 'field-help', 'PNG · JPG · WebP · 最大 20 MiB')); body.append(drop); }
+      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '选择参考图片'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此图片' : 'PNG · JPG · WebP · 最大 20 MiB')); body.append(drop); }
       body.append(el('div', 'reference-name', node.data.name || '参考图保存在本机推理服务中')); card.append(body);
       const footer = el('div', 'node-footer'); footer.append(el('span', '', { start: '首帧参考', end: '尾帧参考', reference: '角色 / 场景参考' }[node.data.role] || '参考素材'), button('更换素材', 'node-action', () => chooseReference(node.id))); card.append(footer, port(node, 'output'));
     } else {
@@ -299,8 +330,10 @@ function renderNodes() {
       }
       card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', 'IMAGE / VIDEO')); card.append(footer, port(node, 'input'));
     }
-    nodesLayer.append(card);
+    if (previous) { releaseMedia(previous); previous.replaceWith(card); }
+    if (nodesLayer.children[index] !== card) nodesLayer.insertBefore(card, nodesLayer.children[index] || null);
   });
+  remaining.forEach(card => { releaseMedia(card); card.remove(); });
   $('#node-count').textContent = `${graph.nodes.length} 个节点`;
   $('#canvas-empty').hidden = !!graph.nodes.length;
   updateNodeJobStatus();
@@ -312,6 +345,16 @@ function renderSelection() {
   drawMinimap();
 }
 function editNode(id, key, value, refreshInspector = false) { mutate(() => { const node = getNode(id); if (node) node.data[key] = value; }, { inspector: refreshInspector }); }
+function bindDraft(input, change, number = false) {
+  let session = { recorded: false };
+  input.addEventListener('focus', () => { session = { recorded: false }; });
+  input.addEventListener('input', () => {
+    if (input.readOnly || number && (input.value === '' || !input.checkValidity())) return;
+    draftEditing = session;
+    try { change(number ? Number(input.value) : input.value); } finally { draftEditing = null; }
+  });
+  input.addEventListener('blur', () => { if (input.closest('#nodes')) queueMicrotask(renderNodes); });
+}
 function field(label, value, onChange, options = {}) {
   const wrapper = el('label', 'field'); wrapper.append(el('span', '', label));
   if (options.help) wrapper.append(el('span', 'field-help', options.help));
@@ -327,10 +370,25 @@ function field(label, value, onChange, options = {}) {
   if (options.max !== undefined) input.max = String(options.max);
   if (options.step !== undefined) input.step = String(options.step);
   input.value = value ?? '';
+  let acceptedValue = input.value;
+  const commit = next => {
+    try {
+      if (onChange(next) === false) {
+        if (options.number && !draftEditing) input.value = acceptedValue;
+        return;
+      }
+      if (options.number) acceptedValue = String(next);
+    } catch (error) {
+      if (options.number) input.value = acceptedValue;
+      if (!draftEditing) reportError(error);
+    }
+  };
+  if (!options.select && options.live !== false) bindDraft(input, commit, !!options.number);
   input.addEventListener('change', () => {
+    if (input.readOnly) return;
     const next = options.number ? Number(input.value) : input.value;
-    if (options.number && (!Number.isFinite(next) || !input.checkValidity())) { toast(`「${label}」参数超出可用范围`, true); input.value = value; return; }
-    onChange(next);
+    if (options.number && (input.value.trim() === '' || !Number.isFinite(next) || !input.checkValidity())) { toast(`「${label}」请输入范围内的数字，已恢复上次有效值`, true); input.value = acceptedValue; return; }
+    commit(next);
   });
   wrapper.append(input); return wrapper;
 }
@@ -380,7 +438,7 @@ function renderPackageInputs(wrap, node) {
       try {
         const next = coerceFieldValue(definition, raw);
         mutate(() => { node.data.packageValues = { ...(node.data.packageValues || {}), [definition.id]: next }; }, { inspector: false });
-      } catch (error) { reportError(error); renderInspector(); }
+      } catch (error) { if (!draftEditing) { reportError(error); renderInspector(); } return false; }
     };
     let control;
     if (type === 'boolean') {
@@ -415,17 +473,37 @@ async function loadPackages() {
   packages = Array.isArray(result.packages) ? result.packages : [];
   packagesLoaded = true;
   renderPackageLibrary(); renderNodes();
-  if (singleSelected()?.data?.kind === 'package') renderInspector();
+  if (singleSelected()?.data?.kind === 'package' && !$('#properties-panel').contains(document.activeElement)) renderInspector();
 }
 function renderPackageLibrary() {
   const list = $('#package-list'); list.replaceChildren();
-  if (!packages.length) { list.append(el('div', 'package-empty', packagesLoaded ? '包库还是空的。导入一套已调好的 API 工作流，把常用输入变成简单表单。' : '正在读取工作流包…')); return; }
-  for (const pack of packages) {
+  if (!packages.length) { $('#package-library-count').textContent = '0 个工作流包'; list.append(el('div', 'package-empty', packagesLoaded ? '包库还是空的。导入一套已调好的 API 工作流，把常用输入变成简单表单。' : '正在读取工作流包…')); return; }
+  const filtered = filterPackages(packages, $('#package-scope').value, $('#package-search').value);
+  $('#package-library-count').textContent = `${filtered.length} / ${packages.length} 个工作流包`;
+  if (!filtered.length) list.append(el('div', 'package-empty', '没有符合当前筛选的工作流包。可以清空搜索或切换到其他分类。'));
+  for (const pack of filtered) {
     const card = el('article', 'package-card');
-    card.append(el('span', 'eyebrow', 'LOCAL WORKFLOW'), el('h3', '', pack.name), el('p', 'muted', pack.description || '可复用的本地图片 / 视频工作流'));
+    card.dataset.packageId = pack.id;
+    const heading = el('div', 'package-heading');
+    const favorite = button(pack.favorite ? '★ 已收藏' : '☆ 收藏', `package-favorite${pack.favorite ? ' active' : ''}`, () => organizePackage(pack.id, { favorite: !pack.favorite }));
+    favorite.setAttribute('aria-pressed', String(pack.favorite === true)); favorite.disabled = organizingPackages.has(pack.id);
+    heading.append(el('span', 'eyebrow', pack.archived ? 'ARCHIVED WORKFLOW' : 'LOCAL WORKFLOW'), favorite);
+    card.append(heading, el('h3', '', pack.name), el('p', 'muted', pack.description || '可复用的本地图片 / 视频工作流'));
     const meta = el('div', 'package-card-meta'); meta.append(el('span', '', `${pack.fields?.length || 0} 个可填输入`), el('span', 'inline-code', String(pack.id).slice(0, 14))); card.append(meta);
-    const actions = el('div', 'inspector-actions'); actions.append(button('添加到画布', 'button primary', () => addPackageNode(pack)), button('导出包', 'button quiet', () => exportPackage(pack.id))); card.append(actions); list.append(card);
+    const actions = el('div', 'inspector-actions'); actions.append(button('添加到画布', 'button primary', () => addPackageNode(pack)), button('导出包', 'button quiet', () => exportPackage(pack.id))); card.append(actions);
+    const archive = button(pack.archived ? '恢复到包库' : '归档', 'text-link package-archive', () => organizePackage(pack.id, { archived: !pack.archived }), pack.archived ? '恢复到常规包库' : '归档只隐藏包库中的条目，不影响已有画布节点');
+    archive.disabled = organizingPackages.has(pack.id); card.append(archive); list.append(card);
   }
+}
+async function organizePackage(id, metadata) {
+  if (organizingPackages.has(id)) return;
+  organizingPackages.add(id); renderPackageLibrary();
+  try {
+    const result = await api(`/api/packages/${encodeURIComponent(id)}/metadata`, metadata);
+    if (!result.package?.id) throw new Error('服务没有返回工作流包整理结果');
+    packages = packages.map(pack => pack.id === id ? { ...pack, ...result.package } : pack);
+    if ('archived' in metadata) toast(metadata.archived ? '已归档；已有画布节点仍可使用' : '已恢复到工作流包库');
+  } finally { organizingPackages.delete(id); renderPackageLibrary(); }
 }
 async function openPackages() {
   if (!$('#packages-dialog').open) $('#packages-dialog').showModal();
@@ -486,7 +564,7 @@ async function packageCurrentNode() {
   await inspectPackageDocument({ prompt: result.prompt }, node.data.title);
 }
 function renderInspector() {
-  const content = $('#inspector-content'); content.replaceChildren();
+  const content = $('#inspector-content'); releaseMedia(content); content.replaceChildren();
   if (selectedEdge) {
     const wrap = el('div', 'inspector-empty'); wrap.append(el('span', 'eyebrow', 'CONNECTION'), el('h2', '', '工作流连接'), el('p', '', '连接将提示词、参考素材和生成结果传递给下一个节点。'), button('删除此连接', 'button quiet', () => deleteSelection())); content.append(wrap); return;
   }
@@ -519,7 +597,7 @@ function renderInspector() {
     } else if (node.data.kind === 'api') {
       wrap.append(el('p', 'model-note', '导入 ComfyUI「Save (API Format)」JSON。工作流完整保留，模型与路径仍需在你的推理引擎中可用。'));
       wrap.append(button(node.data.apiPrompt ? '重新导入 API 工作流' : '导入 API 工作流', 'button quiet', () => { workflowTarget = node.id; $('#workflow-input').click(); }));
-      if (node.data.apiPrompt) wrap.append(field('API 工作流 JSON', stableStringify(node.data.apiPrompt), value => { try { const parsed = parseJSONWithSafeNumbers(value); if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(); editNode(node.id, 'apiPrompt', parsed); } catch (error) { toast(error.message || 'API 工作流必须是有效 JSON 对象', true); } }, { multiline: true, rows: 10 }));
+      if (node.data.apiPrompt) wrap.append(field('API 工作流 JSON', stableStringify(node.data.apiPrompt), value => { try { const parsed = parseJSONWithSafeNumbers(value); if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(); editNode(node.id, 'apiPrompt', parsed); } catch (error) { toast(error.message || 'API 工作流必须是有效 JSON 对象', true); } }, { multiline: true, rows: 10, live: false }));
     } else {
       if (node.data.kind.startsWith('h3')) wrap.append(el('p', 'model-note', 'MiniMax H3 需要兼容扩展与模型。默认 20 步；低步数加速须配合对应 Turbo LoRA。实际帧数与时长由引擎校正。'));
       if (node.data.kind === 'h3_i2v') wrap.append(el('p', 'form-note', '连接首帧参考素材，可再连接一张尾帧。素材属性中选择「首帧」与「尾帧」角色。'));
@@ -748,26 +826,103 @@ function updateNodeJobStatus() {
     element.textContent = job ? `${job.status === 'completed' ? '✓' : job.status === 'failed' ? '!' : '○'} ${STATUS_NAMES[job.status] || job.status} · ${duration(job.elapsed)}` : '○ 等待提交';
   });
 }
+function jobTitle(job) { return getNode(jobNodes[job.id])?.data.title || job.summary?.package_name || KIND_NAMES[job.kind] || `任务 ${job.id.slice(0, 8)}`; }
+function installRecipe(recipe) {
+  const box = bounds();
+  const fragment = recipeGraph(recipe, graph.nodes.length ? box.maxX + 390 : 400, singleSelected()?.y ?? 80);
+  if (graph.nodes.length + fragment.nodes.length > 500 || graph.edges.length + fragment.edges.length > 2000) throw new Error('当前画布已满，请先导出或整理节点再复用。');
+  mutate(() => { graph.nodes.push(...fragment.nodes); graph.edges.push(...fragment.edges); selected = new Set([fragment.generationId]); selectedEdge = null; });
+  const node = getNode(fragment.generationId);
+  viewport.x = canvas.clientWidth / 2 - (node.x + 152) * viewport.scale; viewport.y = 150 - node.y * viewport.scale;
+  applyViewport(); switchTab('properties'); save(true);
+  return node;
+}
+async function reuseJob(id) {
+  if (reusing.has(id)) return;
+  reusing.add(id); renderJobs();
+  try {
+    const recipe = await api(`/api/jobs/${encodeURIComponent(id)}/recipe`);
+    installRecipe(recipe);
+    toast('已添加独立生成节点，可修改参数后再生成');
+    for (const warning of recipe.warnings || []) toast(warning);
+  } finally { reusing.delete(id); renderJobs(); }
+}
+async function retryJob(id) {
+  if (retrying.has(id)) return;
+  retrying.add(id);
+  if (!retryRequests.has(id)) { retryRequests.set(id, crypto.randomUUID()); saveRetryRequests(); }
+  renderJobs();
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(id)}/retry`, { request_id: retryRequests.get(id) });
+    if (!job.id) throw new Error('服务没有返回任务 ID，请先检查队列。再次点击会查询同一次请求。');
+    retryRequests.delete(id); saveRetryRequests();
+    jobs = [job, ...jobs.filter(item => item.id !== job.id)];
+    if (!graph.nodes.some(node => node.type === 'result' && node.data.jobId === job.id) && graph.nodes.length < 500) {
+      addNode('result', { title: `${jobTitle(job)} · 再次生成`, jobId: job.id, outputs: job.outputs || [] });
+    }
+    switchTab('jobs'); save(true); toast('任务已加入队列；原参数和随机种子保持不变');
+    await pollJobs();
+  } finally { retrying.delete(id); renderJobs(); }
+}
+function saveRetryRequests() {
+  try { localStorage.setItem(RETRY_REQUESTS_KEY, JSON.stringify([...retryRequests].slice(-200))); }
+  catch { /* The current page still retains retry identities when browser storage is full. */ }
+}
+function newJobView(id) {
+  const card = el('article', 'job-card'); card.dataset.jobId = id;
+  const heading = el('div', 'job-heading'), title = el('span', 'job-title'), status = el('span', 'job-tag'); heading.append(title, status);
+  const time = el('div', 'job-time'), elapsed = el('span'); time.append(elapsed, el('span', '', id.slice(0, 8)));
+  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar);
+  const state = el('div', 'progress-state'), error = el('p', 'job-error'), warning = el('p', 'job-warning'), provenance = el('p', 'job-provenance'), thumbs = el('div', 'job-thumbs');
+  const actions = el('div', 'job-actions');
+  const reuse = button('复用参数', 'job-action', () => reuseJob(id), '把原任务参数添加为独立节点，不会自动开始生成');
+  const retry = button('再次生成', 'job-action', () => retryJob(id), '以原任务参数和随机种子再提交一次，由当前引擎重新校验');
+  const cancel = button('取消任务', 'job-action job-cancel', async () => { cancel.disabled = true; try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, {}); toast('已发送取消请求'); await pollJobs(); } finally { cancel.disabled = false; } });
+  actions.append(reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, thumbs, actions);
+  return { card, title, status, elapsed, bar, state, error, warning, provenance, thumbs, reuse, retry, cancel, outputSignature: '' };
+}
 function renderJobs() {
   $('#job-count').textContent = String(jobs.filter(job => ['queued', 'running'].includes(job.status)).length);
-  const list = $('#jobs-list'); list.replaceChildren();
-  if (!jobs.length) { list.append(el('div', 'jobs-empty', '还没有生成任务\n选中生成节点，点击「开始生成」。')); return; }
-  jobs.forEach(job => {
-    const card = el('article', 'job-card');
-    const heading = el('div', 'job-heading'); heading.append(el('span', '', getNode(jobNodes[job.id])?.data.title || `任务 ${job.id.slice(0, 8)}`), el('span', `job-tag ${job.status}`, STATUS_NAMES[job.status] || job.status)); card.append(heading);
-    const time = el('div', 'job-time'); time.append(el('span', '', `耗时 ${duration(job.elapsed)}`), el('span', '', job.id.slice(0, 8))); card.append(time);
-    const progress = progressPercent(job.progress);
-    const track = el('div', 'progress-track'); const bar = el('div', 'progress-bar'); bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`; track.append(bar); card.append(track);
-    if (progress === null && ['queued', 'running'].includes(job.status)) card.append(el('div', 'progress-state', job.status === 'queued' ? '等待引擎执行' : '推理进行中 · 后端暂未提供逐步进度'));
-    if (job.error) card.append(el('p', 'job-error', job.error));
-    if (job.outputs?.length) {
-      const thumbs = el('div', 'job-thumbs'); job.outputs.forEach(output => { const item = button('', '', () => preview(output), `预览 ${output.filename || '输出'}`); const media = outputMedia(output, ''); item.append(media); thumbs.append(item); }); card.append(thumbs);
+  const list = $('#jobs-list');
+  const filtered = filterJobs(jobs, $('#job-status-filter').value, $('#job-search').value, jobTitle);
+  $('#jobs-filter-count').textContent = `显示 ${filtered.length} / ${jobs.length} 个任务`;
+  const visible = new Set(filtered.map(job => job.id));
+  const current = new Set(jobs.map(job => job.id));
+  jobViews.forEach((view, id) => {
+    if (!current.has(id)) { releaseMedia(view.card); view.card.remove(); jobViews.delete(id); }
+    else if (!visible.has(id)) { view.card.hidden = true; view.card.querySelectorAll('video,audio').forEach(media => media.pause()); }
+  });
+  const existingEmpty = list.querySelector('.jobs-empty'); if (existingEmpty) existingEmpty.remove();
+  if (!filtered.length) list.append(el('div', 'jobs-empty', jobs.length ? '没有符合当前筛选的任务。\n试试其他状态或清空搜索。' : '还没有生成任务\n选中生成节点，点击「开始生成」。'));
+  const write = (node, value) => { if (node.textContent !== value) node.textContent = value; };
+  filtered.forEach((job, index) => {
+    let view = jobViews.get(job.id);
+    if (!view) { view = newJobView(job.id); jobViews.set(job.id, view); }
+    view.card.hidden = false;
+    write(view.title, jobTitle(job)); write(view.status, STATUS_NAMES[job.status] || job.status); view.status.className = `job-tag ${job.status}`;
+    write(view.elapsed, `耗时 ${duration(job.elapsed)}`);
+    const progress = progressPercent(job.progress); view.bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`;
+    const active = ['queued', 'running'].includes(job.status);
+    view.state.hidden = progress !== null || !active;
+    write(view.state, job.status === 'queued' ? '等待引擎执行' : '推理进行中 · 后端暂未提供逐步进度');
+    write(view.error, String(job.error || '')); view.error.hidden = !job.error;
+    const warnings = [job.retry_warning, job.storage_warning].filter(Boolean).join('\n'); write(view.warning, warnings); view.warning.hidden = !warnings;
+    write(view.provenance, job.retry_of ? `来自任务 ${String(job.retry_of).slice(0, 8)} · 保留原始参数` : ''); view.provenance.hidden = !job.retry_of;
+    const signature = JSON.stringify(job.outputs || []);
+    if (view.outputSignature !== signature) {
+      releaseMedia(view.thumbs); view.thumbs.replaceChildren();
+      (job.outputs || []).forEach(output => { const item = button('', '', () => preview(output), `预览 ${output.filename || '输出'}`); item.append(outputMedia(output, '')); view.thumbs.append(item); });
+      view.outputSignature = signature;
     }
-    if (['queued', 'running'].includes(job.status)) card.append(button('取消任务', 'job-cancel', async () => { await api(`/api/jobs/${encodeURIComponent(job.id)}/cancel`, {}); toast('已发送取消请求'); await pollJobs(); }));
-    list.append(card);
+    view.thumbs.hidden = !job.outputs?.length;
+    view.reuse.disabled = !job.can_reuse || reusing.has(job.id); write(view.reuse, reusing.has(job.id) ? '正在读取…' : '复用参数');
+    view.retry.hidden = active; view.retry.disabled = !job.can_retry || retrying.has(job.id); write(view.retry, retrying.has(job.id) ? '正在提交…' : retryRequests.has(job.id) ? '查询 / 重试请求' : '再次生成');
+    view.cancel.hidden = !active;
+    if (list.children[index] !== view.card) list.insertBefore(view.card, list.children[index] || null);
   });
   updateNodeJobStatus();
 }
+
 async function pollJobs() {
   if (pollBusy || !csrf) return;
   pollBusy = true;
@@ -787,6 +942,7 @@ async function pollJobs() {
 }
 function switchTab(tab) {
   const properties = tab === 'properties';
+  $(properties ? '#jobs-panel' : '#properties-panel').querySelectorAll('video,audio').forEach(media => media.pause());
   $('#tab-properties').classList.toggle('active', properties); $('#tab-properties').setAttribute('aria-selected', String(properties));
   $('#tab-jobs').classList.toggle('active', !properties); $('#tab-jobs').setAttribute('aria-selected', String(!properties));
   $('#properties-panel').hidden = !properties; $('#jobs-panel').hidden = properties;
@@ -885,11 +1041,15 @@ document.addEventListener('keydown', event => {
 });
 document.addEventListener('keyup', event => { if (event.code === 'Space') { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); } });
 window.addEventListener('blur', () => { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); });
-window.addEventListener('beforeunload', () => save(true));
+window.addEventListener('beforeunload', () => { save(true); releaseMedia(document); });
+window.addEventListener('pagehide', () => { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); }
+});
 new ResizeObserver(() => { applyViewport(); }).observe(canvas);
 document.querySelectorAll('[data-close]').forEach(element => element.addEventListener('click', () => element.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); } }));
-$('#preview-dialog').addEventListener('close', () => $('#preview-content').replaceChildren());
+$('#preview-dialog').addEventListener('close', clearPreview);
 bind('#tool-select', () => { tool = 'select'; canvas.classList.remove('hand'); $('#tool-select').classList.add('active'); $('#tool-hand').classList.remove('active'); $('#tool-select').setAttribute('aria-pressed', 'true'); $('#tool-hand').setAttribute('aria-pressed', 'false'); });
 bind('#tool-hand', () => { tool = 'hand'; canvas.classList.add('hand'); $('#tool-hand').classList.add('active'); $('#tool-select').classList.remove('active'); $('#tool-hand').setAttribute('aria-pressed', 'true'); $('#tool-select').setAttribute('aria-pressed', 'false'); });
 bind('#add-prompt', () => addNode('prompt'));
@@ -901,6 +1061,8 @@ bind('#load-demo', () => { mutate(() => { graph = createDemo(); selected = new S
 bind('#undo', undo); bind('#redo', redo); bind('#zoom-in', () => zoom(1.15)); bind('#zoom-out', () => zoom(1 / 1.15)); bind('#zoom-reset', () => zoom(1 / viewport.scale)); bind('#fit-view', fitView); bind('#minimap-button', fitView);
 bind('#save-project', exportProject); bind('#open-project', () => $('#project-input').click()); bind('#help-button', () => $('#help-dialog').showModal());
 bind('#tab-properties', () => switchTab('properties')); bind('#tab-jobs', () => switchTab('jobs'));
+$('#job-search').addEventListener('input', renderJobs); $('#job-status-filter').addEventListener('change', renderJobs);
+$('#package-search').addEventListener('input', renderPackageLibrary); $('#package-scope').addEventListener('change', renderPackageLibrary);
 bind('#engine-status', () => runDiagnostics()); bind('#diagnostics-button', () => runDiagnostics()); bind('#diagnostic-refresh', () => runDiagnostics(getNode(diagnosticNodeId) || selectedGeneration(), true)); bind('#copy-repair', () => copyText($('#repair-prompt').value, '已复制脱敏修复提示词，可交给 AI 助手'));
 bind('#discovery-open', () => runDiagnostics());
 bind('#export-diagnostics', () => { downloadJSON(publicChecksReport(diagnosticChecks, knownLocalPaths(), { mode: getNode(diagnosticNodeId)?.data.kind, repair_prompt: workflowRepair }), `frameweave-environment-${new Date().toISOString().slice(0, 10)}.json`); toast('已导出脱敏状态摘要，不包含本机路径或原始检查明细'); });
@@ -962,6 +1124,12 @@ $('#workflow-input').addEventListener('change', event => {
 });
 
 async function initialize() {
+  try {
+    const pending = JSON.parse(localStorage.getItem(RETRY_REQUESTS_KEY) || '[]');
+    if (Array.isArray(pending)) for (const pair of pending.slice(-200)) {
+      if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' && pair[0].length <= 120 && typeof pair[1] === 'string' && /^[\da-f-]{36}$/i.test(pair[1])) retryRequests.set(...pair);
+    }
+  } catch { /* Invalid retry metadata never prevents restoring the canvas. */ }
   try {
     const cached = localStorage.getItem(STORAGE_KEY);
     if (cached) { const parsed = parseGraph(cached); graph = { nodes: parsed.nodes, edges: parsed.edges }; viewport = parsed.viewport; selected = new Set([graph.nodes.find(node => node.type === 'generation')?.id].filter(Boolean)); restored = true; }

@@ -21,10 +21,19 @@ from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
 from .packages import PackageStore, apply_values, inspect_document
-from .workflows import capabilities, catalog, compile_workflow
+from .workflows import capabilities, catalog, compile_workflow, validate_prompt
 
 MAX_JSON = 28 * 1024 * 1024
 TERMINAL = {"completed", "failed", "cancelled"}
+MAX_RUN = 4 * 1024 * 1024
+REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
+                  "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
+                  "references", "reference_roles", "lora", "lora_strength", "shift_video",
+                  "shift_audio", "ref_image_size", "package_id", "values"}
+
+
+class SubmissionUncertain(BackendError):
+    """The backend may have accepted the prompt; never repeat automatically."""
 
 
 def atomic_json(path, value):
@@ -213,26 +222,184 @@ class App:
 
     def submit(self, data):
         with self.lock:
-            if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
-                raise ValueError("最多同时保留 24 个未结束任务")
             result = self.compile(data)
-            response = self.backend.request("/prompt", {"prompt": result["prompt"], "client_id": self.client_id}, timeout=30)
+            request = {k: copy.deepcopy(v) for k, v in data.items() if k in REQUEST_FIELDS}
+            if data.get("kind") == "api":
+                request = None  # The exact graph is already stored once below.
+            elif data.get("kind") != "package":
+                summary = result.get("summary", {})
+                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles"):
+                    if key in summary:
+                        request[key] = copy.deepcopy(summary[key])
+            result["request"] = request
+            return self._dispatch(result, data.get("kind"))
+
+    def _dispatch(self, result, kind, retry_of=None):
+        """Called under lock. Prepare storage before any inference side effect."""
+        if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
+            raise ValueError("最多同时保留 24 个未结束任务")
+        encoded = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2)
+        if len(encoded.encode("utf-8")) > MAX_RUN:
+            raise ValueError("任务复现记录超过 4 MiB，请精简工作流与参数")
+        run_dir = self.data_dir / "runs"
+        run_dir.mkdir(exist_ok=True)
+        pending = run_dir / ("pending-" + uuid.uuid4().hex + ".json")
+        atomic_json(pending, result)
+        try:
+            try:
+                response = self.backend.request("/prompt", {"prompt": result["prompt"], "client_id": self.client_id}, timeout=30)
+            except BackendError as exc:
+                if str(exc).startswith(("后端 HTTP 400:", "后端 HTTP 422:")):
+                    raise
+                raise SubmissionUncertain("提交结果不确定，请先检查后端队列，不要重复提交：" + str(exc)) from None
+            if not isinstance(response, dict):
+                raise SubmissionUncertain("后端提交结果不明确，请先检查后端队列")
             if response.get("node_errors"):
                 raise BackendError("工作流被后端拒绝：" + json.dumps(response["node_errors"], ensure_ascii=False)[:5000])
             job_id = response.get("prompt_id")
             if not isinstance(job_id, str) or not re.fullmatch(r"[\w-]{1,100}", job_id):
-                raise BackendError("后端未返回有效 prompt_id")
+                raise SubmissionUncertain("后端未返回有效 prompt_id，请先检查后端队列")
             job = {"id": job_id, "status": "queued", "progress": None, "elapsed": 0,
                    "created_at": time.time(), "started_at": None, "finished_at": None,
-                   "kind": data.get("kind"), "outputs": [], "backend": self.backend.url,
+                   "kind": kind, "outputs": [], "backend": self.backend.url,
                    "summary": result.get("summary", {}), "error": ""}
+            if retry_of:
+                job["retry_of"] = retry_of
             self.jobs[job_id] = job
-            # Exact, reproducible API graph is stored only in the user's private data directory.
-            run_dir = self.data_dir / "runs"
-            run_dir.mkdir(exist_ok=True)
-            atomic_json(run_dir / f"{job_id}.json", result)
-            self.persist_jobs()
-            return copy.deepcopy(job)
+            # Once accepted, disk errors must not be reported as a failed submission.
+            try:
+                os.replace(pending, run_dir / f"{job_id}.json")
+                self.persist_jobs()
+            except OSError:
+                job["storage_warning"] = "后端已接受任务，但本地记录保存失败；请勿重复提交，修复磁盘权限或空间后保留任务 ID。"
+            return self.public_job(job)
+        finally:
+            # Remove only our preflight file when the operation failed before acceptance.
+            if pending.exists() and not locals().get("job_id"):
+                try:
+                    pending.unlink()
+                except OSError:
+                    pass
+
+    def public_job(self, job):
+        result = copy.deepcopy(job)
+        try:
+            has_run = (self.data_dir / "runs" / f"{job['id']}.json").is_file()
+        except OSError:
+            has_run = False
+        attempt = job.get("retry_attempt", {})
+        result["can_reuse"] = has_run
+        result["can_retry"] = bool(has_run and job.get("status") in TERMINAL and
+                                   job.get("backend") == self.backend.url and
+                                   attempt.get("state") not in {"pending", "unknown"})
+        if attempt.get("state") in {"pending", "unknown"}:
+            result["retry_warning"] = "上次再次生成的提交结果不确定，请先在原后端核实队列；此记录已停止重提。"
+        result.pop("backend", None)
+        result.pop("retry_attempt", None)
+        result.pop("retry_requests", None)
+        return result
+
+    def _read_run(self, job_id):
+        if job_id not in self.jobs:
+            raise ValueError("任务不属于此客户端")
+        try:
+            file = self.data_dir / "runs" / f"{job_id}.json"
+            with file.open("rb") as stream:
+                raw = stream.read(MAX_RUN + 1)
+            if len(raw) > MAX_RUN:
+                raise ValueError("任务复现记录超过 4 MiB")
+            run = json.loads(raw)
+            if not isinstance(run, dict) or not isinstance(run.get("prompt"), dict) or not run["prompt"]:
+                raise ValueError("无有效 API 图")
+            return run
+        except (OSError, ValueError, RecursionError, TypeError):
+            raise ValueError("任务复现记录缺失、损坏或过大，无法恢复") from None
+
+    def recipe(self, job_id):
+        with self.lock:
+            run = self._read_run(job_id)
+            job = self.jobs[job_id]
+            warnings = ["再次生成使用保存的 API 图和种子，提交前重新校验节点与模型；原后端输入素材需要保留。"]
+            request = run.get("request")
+            if isinstance(request, dict) and request.get("kind") == "package":
+                try:
+                    self.packages.get(request.get("package_id"))
+                except ValueError:
+                    request = None
+            if not isinstance(request, dict):
+                request = {"kind": "api", "prompt": run["prompt"]}
+                warnings.append("此任务恢复为 API 工作流，完整保留原始节点和参数。")
+            # Do not silently round legacy 64-bit seeds in the browser.
+            stack = [request]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, dict):
+                    stack.extend(value.values())
+                elif isinstance(value, list):
+                    stack.extend(value)
+                elif isinstance(value, (int, float)) and (not -9007199254740991 <= value <= 9007199254740991):
+                    raise ValueError("旧任务包含浏览器无法精确编辑的数字；请使用再次生成以保留原始精度")
+            same_backend = job.get("backend") == self.backend.url
+            if not same_backend:
+                warnings.append("当前后端地址与原任务不同；可恢复编辑，请重新选择模型和上传参考图后再提交。")
+            return {"request": copy.deepcopy(request), "summary": run.get("summary", {}),
+                    "warnings": warnings, "replayable": same_backend}
+
+    def retry(self, job_id, data):
+        key = data.get("request_id")
+        if not isinstance(key, str) or not re.fullmatch(r"[\w-]{8,100}", key):
+            raise ValueError("再次生成需要有效的 request_id")
+        with self.lock:
+            run = self._read_run(job_id)
+            source = self.jobs[job_id]
+            if source.get("backend") != self.backend.url or source.get("status") not in TERMINAL:
+                raise ValueError("只能在原后端对已结束的任务再次生成")
+            requests = source.setdefault("retry_requests", {})
+            if key in requests:
+                known = self.jobs.get(requests[key])
+                if not known:
+                    raise ValueError("该请求已提交，其结果已超出最近任务范围；请核实后端历史")
+                return self.public_job(known)
+            previous = source.get("retry_attempt", {})
+            child = self.jobs.get(previous.get("job_id"))
+            if child and (previous.get("key") == key or child.get("status") not in TERMINAL):
+                if len(requests) >= 64 and key not in requests:
+                    raise ValueError("该历史任务的请求次数超过限制，请从最近生成的任务继续")
+                requests[key] = child["id"]
+                try:
+                    self.persist_jobs()
+                except OSError:
+                    child["storage_warning"] = "任务已存在，但本地记录保存失败；请保留任务 ID，勿重复提交。"
+                return self.public_job(child)
+            if previous.get("state") in {"pending", "unknown"}:
+                raise ValueError("上次提交结果不确定，请先在原后端检查；为避免重复任务已停止重提")
+            if len(requests) >= 64:
+                raise ValueError("该历史任务已再次生成 64 次，请从最近生成的任务继续")
+            validate_prompt(run["prompt"], self.object_info(refresh=True))
+            if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
+                raise ValueError("最多同时保留 24 个未结束任务")
+            source["retry_attempt"] = {"key": key, "state": "pending"}
+            try:
+                self.persist_jobs()  # If this fails, no backend submission occurs.
+            except OSError:
+                source["retry_attempt"] = previous
+                raise
+            try:
+                result = self._dispatch(run, source.get("kind"), retry_of=job_id)
+            except (OSError, ValueError, BackendError) as exc:
+                source["retry_attempt"] = {"key": key, "state": "unknown"} if isinstance(exc, SubmissionUncertain) else previous
+                try:
+                    self.persist_jobs()
+                except OSError:
+                    pass
+                raise
+            source["retry_attempt"].update(state="accepted", job_id=result["id"])
+            requests[key] = result["id"]
+            try:
+                self.persist_jobs()
+            except OSError:
+                self.jobs[result["id"]]["storage_warning"] = "后端已接受任务，但本地记录保存失败；请保留任务 ID，勿重复提交。"
+            return self.public_job(self.jobs[result["id"]])
 
     def persist_jobs(self):
         atomic_json(self.data_dir / "jobs.json", list(self.jobs.values())[-200:])
@@ -240,7 +407,7 @@ class App:
     def job_list(self):
         with self.lock:
             now = time.time()
-            jobs = copy.deepcopy(list(self.jobs.values()))
+            jobs = [self.public_job(job) for job in list(self.jobs.values())[-200:]]
         for job in jobs:
             start = job.get("started_at") or job.get("created_at", now)
             job["elapsed"] = round(max(0, (job.get("finished_at") or now) - start), 1)
@@ -404,6 +571,8 @@ def make_server(app, port=0):
                     self.respond(app.status())
                 elif path == "/api/jobs":
                     self.respond(app.job_list())
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/recipe", path):
+                    self.respond(app.recipe(path.split("/")[3]))
                 elif path == "/api/packages":
                     self.respond({"packages": app.packages.list()})
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}", path):
@@ -497,6 +666,8 @@ def make_server(app, port=0):
                     result = {"document": app.packages.export(path.split("/")[3])}
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/apply", path):
                     result = {"prompt": apply_values(app.packages.get(path.split("/")[3]), data.get("values", {}))}
+                elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/metadata", path):
+                    result = {"package": app.packages.update_metadata(path.split("/")[3], data)}
                 elif path == "/api/compile":
                     result = app.compile(data)
                 elif path == "/api/jobs":
@@ -505,6 +676,8 @@ def make_server(app, port=0):
                     result = app.upload(data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/cancel", path):
                     result = app.cancel(path.split("/")[3])
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/retry", path):
+                    result = app.retry(path.split("/")[3], data)
                 elif path == "/api/shutdown":
                     self.respond({"ok": True})
                     app.closed.set()

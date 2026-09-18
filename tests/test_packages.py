@@ -3,10 +3,13 @@
 import copy
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
-from frameweave.packages import PackageStore, apply_values, inspect_document, normalize_document
+from frameweave.packages import MAX_METADATA_BYTES, PackageStore, apply_values, inspect_document, normalize_document
 
 
 def sample():
@@ -168,6 +171,126 @@ class PackageTests(unittest.TestCase):
         document["fields"] = []
         with self.assertRaisesRegex(ValueError, "上传参数"):
             normalize_document(document)
+
+    def test_organizing_library_is_persistent_without_changing_identity_or_export(self):
+        package = self.store.save(sample())
+        package_id = package["id"]
+        self.assertFalse(package["favorite"])
+        self.assertFalse(package["archived"])
+        original = self.store.export(package_id)
+        path = self.store.directory / (package_id + ".json")
+        original_bytes, original_mtime = path.read_bytes(), path.stat().st_mtime_ns
+        updated = self.store.update_metadata(package_id, {"favorite": True})
+        self.assertTrue(updated["favorite"])
+        self.assertFalse(updated["archived"])
+        reopened = PackageStore(self.store.directory)
+        self.assertTrue(reopened.get(package_id)["favorite"])
+        self.assertTrue(reopened.list()[0]["favorite"])
+        self.assertTrue(reopened.save(original)["favorite"])
+        self.assertEqual(reopened.export(package_id), original)
+        self.assertEqual(path.read_bytes(), original_bytes)
+        self.assertEqual(path.stat().st_mtime_ns, original_mtime)
+        elsewhere = PackageStore(self.root / "elsewhere").save(original)
+        self.assertEqual(elsewhere["id"], package_id)
+        self.assertFalse(elsewhere["favorite"])
+        self.assertFalse(elsewhere["archived"])
+
+    def test_archive_is_reversible_and_existing_canvas_can_still_run_package(self):
+        package_id = self.store.save(sample())["id"]
+        self.store.update_metadata(package_id, {"favorite": True, "archived": True})
+        archived = self.store.get(package_id)
+        self.assertTrue(archived["archived"])
+        self.assertEqual(self.store.list()[0]["id"], package_id)
+        self.assertEqual(apply_values(archived, {"seed": 123})["1"]["inputs"]["seed"], 123)
+        restored = self.store.update_metadata(package_id, {"archived": False})
+        self.assertFalse(restored["archived"])
+        self.assertTrue(restored["favorite"])
+        self.assertFalse(self.store.update_metadata(package_id, {"favorite": False})["favorite"])
+
+    def test_metadata_patch_requires_known_boolean_fields_and_installed_valid_package(self):
+        package_id = self.store.save(sample())["id"]
+        self.store.update_metadata(package_id, {"favorite": True})
+        metadata_path = self.store.directory / "metadata.json"
+        before = metadata_path.read_bytes()
+        for invalid in (None, [], True, {}, {"favorite": 1}, {"favorite": "false"},
+                        {"archived": None}, {"archived": []}, {"name": "renamed"},
+                        {"favorite": True, "unexpected": False}, {1: False}):
+            with self.subTest(patch=invalid), self.assertRaises(ValueError):
+                self.store.update_metadata(package_id, invalid)
+        for invalid_id in (None, "../outside", "p-" + "0" * 24):
+            with self.subTest(package_id=invalid_id), self.assertRaises(ValueError):
+                self.store.update_metadata(invalid_id, {"favorite": False})
+        package_path = self.store.directory / (package_id + ".json")
+        changed = sample()
+        changed["name"] = "Changed on disk"
+        package_path.write_text(json.dumps(changed), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "变化"):
+            self.store.update_metadata(package_id, {"favorite": False})
+        self.assertEqual(metadata_path.read_bytes(), before)
+
+    def test_damaged_metadata_defaults_to_visible_without_changing_package_data(self):
+        package_id = self.store.save(sample())["id"]
+        before = self.store.export(package_id)
+        metadata_path = self.store.directory / "metadata.json"
+        cases = (b"not json", b"\xff", b"x" * (MAX_METADATA_BYTES + 1),
+                 b"[" * 2000 + b"0" + b"]" * 2000, b"[]", b"null",
+                 b'{"version": true, "packages": {}}', b'{"version": 2, "packages": {}}',
+                 b'{"version": 1, "packages": []}')
+        for content in cases:
+            with self.subTest(content=content[:60]):
+                metadata_path.write_bytes(content)
+                package = self.store.get(package_id)
+                self.assertFalse(package["favorite"])
+                self.assertFalse(package["archived"])
+                self.assertEqual(len(self.store.list()), 1)
+                self.assertEqual(self.store.export(package_id), before)
+                self.assertEqual(metadata_path.read_bytes(), content)
+        self.assertTrue(self.store.update_metadata(package_id, {"favorite": True})["favorite"])
+        self.assertTrue(PackageStore(self.store.directory).get(package_id)["favorite"])
+
+    def test_one_damaged_metadata_entry_does_not_discard_other_package_state(self):
+        first = self.store.save(sample())["id"]
+        second = self.store.save({**sample(), "name": "另一个包"})["id"]
+        metadata_path = self.store.directory / "metadata.json"
+        for broken in ({"favorite": "true"}, {"archived": 1}, {"favorite": True, "name": "unexpected"}, []):
+            metadata_path.write_text(json.dumps({"version": 1, "packages": {
+                first: {"favorite": True, "archived": True}, second: broken,
+                "../outside": {"archived": True}}}), encoding="utf-8")
+            self.assertTrue(self.store.get(first)["favorite"])
+            self.assertTrue(self.store.get(first)["archived"])
+            self.assertFalse(self.store.get(second)["favorite"])
+            self.assertFalse(self.store.get(second)["archived"])
+        self.store.update_metadata(second, {"favorite": True})
+        self.assertTrue(self.store.get(first)["archived"])
+        self.assertTrue(self.store.get(second)["favorite"])
+
+    def test_concurrent_partial_updates_preserve_both_fields(self):
+        package_id = self.store.save(sample())["id"]
+        barrier = threading.Barrier(2)
+
+        def update(field):
+            barrier.wait(timeout=3)
+            return self.store.update_metadata(package_id, {field: True})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(update, ("favorite", "archived")))
+        self.assertEqual({result["id"] for result in results}, {package_id})
+        restored = PackageStore(self.store.directory).get(package_id)
+        self.assertTrue(restored["favorite"])
+        self.assertTrue(restored["archived"])
+
+    def test_failed_atomic_metadata_replace_preserves_previous_state_and_cleans_temp(self):
+        package_id = self.store.save(sample())["id"]
+        self.store.update_metadata(package_id, {"favorite": True})
+        metadata_path = self.store.directory / "metadata.json"
+        before = metadata_path.read_bytes()
+        with patch.object(Path, "replace", side_effect=PermissionError("write blocked")):
+            with self.assertRaises(PermissionError):
+                self.store.update_metadata(package_id, {"archived": True})
+        self.assertEqual(metadata_path.read_bytes(), before)
+        self.assertTrue(self.store.get(package_id)["favorite"])
+        self.assertFalse(self.store.get(package_id)["archived"])
+        self.assertEqual(list(self.store.directory.glob(".metadata-*.tmp")), [])
 
 
 if __name__ == "__main__":

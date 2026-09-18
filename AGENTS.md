@@ -10,3 +10,4 @@
 - Do not claim generation quality/speed from protocol or mock tests. Report real GPU generation separately.
 - Keep docs/DEVELOPMENT_LOG.md current with each change's scope, decisions, issues, validation evidence and outstanding limits. Record private paths, prompts and temporary runtime details only outside the public project tree.
 - Workflow packages are data-only JSON with explicit scalar/image bindings; importing must never submit a job. Preserve stable package identity and old canvas compatibility, and validate live node schemas before generation.
+- Package organization is local metadata; archival must preserve existing canvas references and exported content identity. Replay exact saved API graphs only on the original backend after fresh schema validation; retain request IDs and never resend an uncertain submission automatically.

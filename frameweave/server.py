@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
+from .automation import PROTOCOL_VERSIONS, dispatch as dispatch_mcp
 from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
@@ -418,7 +419,7 @@ class App:
         with self.lock:
             job = self.jobs.get(job_id)
             if not job:
-                raise ValueError("只能取消由帧织提交的任务")
+                raise ValueError("只能取消由棱光提交的任务")
             if job["status"] in TERMINAL:
                 return {"id": job_id, "status": job["status"]}
             # Newer ComfyUI exposes an atomic job-scoped cancellation API.
@@ -567,6 +568,8 @@ def make_server(app, port=0):
                                   "presets": [{"id": "draft", "label": "构图试样", "steps": 20, "width": 768, "height": 448, "seconds": 4},
                                               {"id": "balanced", "label": "标准制作", "steps": 20, "width": 1344, "height": 768, "seconds": 5},
                                               {"id": "quality", "label": "细节优先", "steps": 25, "width": 1344, "height": 768, "seconds": 5}]})
+                elif path == "/mcp":
+                    self.respond({"error": "此 MCP 接口使用 POST；不提供 SSE 订阅"}, 405, extra={"Allow": "POST"})
                 elif path == "/api/status":
                     self.respond(app.status())
                 elif path == "/api/jobs":
@@ -632,11 +635,40 @@ def make_server(app, port=0):
                     pass
 
         def do_POST(self):
+            path = urllib.parse.urlsplit(self.path).path
+            is_mcp = path == "/mcp"
+            supplied = self.headers.get("Authorization", "") if is_mcp else self.headers.get("X-FW-Token", "")
+            expected = "Bearer " + app.csrf if is_mcp else app.csrf
             if (not self.allowed_host() or not self.origin_ok()
-                    or not hmac.compare_digest(self.headers.get("X-FW-Token", ""), app.csrf)):
+                    or self.headers.get("Sec-Fetch-Site") == "cross-site"
+                    or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))):
                 self.close_connection = True
                 self.respond({"error": "请求校验失败，请刷新客户端后重试"}, 403)
                 return
+            app.last_seen = time.monotonic()
+            if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) > 1:
+                self.close_connection = True
+                self.respond({"error": "请求须使用单一 Content-Length"}, 400)
+                return
+            if is_mcp:
+                accepted = set()
+                for part in self.headers.get("Accept", "").split(","):
+                    media_type, *parameters = part.lower().strip().split(";")
+                    try:
+                        quality = next((float(value.split("=", 1)[1]) for value in parameters if value.strip().startswith("q=")), 1)
+                    except ValueError:
+                        quality = 0
+                    if 0 < quality <= 1:
+                        accepted.add(media_type.strip())
+                if not {"application/json", "text/event-stream"} <= accepted:
+                    self.close_connection = True
+                    self.respond({"error": "MCP Accept 须包含 application/json 和 text/event-stream"}, 406)
+                    return
+                protocol = self.headers.get("MCP-Protocol-Version", "2025-03-26")
+                if protocol not in PROTOCOL_VERSIONS:
+                    self.close_connection = True
+                    self.respond({"error": "不支持此 MCP 协议版本"}, 400)
+                    return
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 self.close_connection = True
                 self.respond({"error": "仅支持 application/json"}, 415)
@@ -648,10 +680,20 @@ def make_server(app, port=0):
                     self.respond({"error": "请求大小超限"}, 413)
                     return
                 self.connection.settimeout(30)
-                data = json.loads(self.rfile.read(length), parse_constant=lambda _: (_ for _ in ()).throw(ValueError("数字无效")))
+                try:
+                    raw = self.rfile.read(length)
+                    data = json.loads(raw.decode("utf-8") if is_mcp else raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("数字无效")))
+                except (ValueError, UnicodeDecodeError, RecursionError):
+                    if is_mcp:
+                        self.respond({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "JSON 解析失败"}}, 400)
+                        return
+                    raise
+                if is_mcp:
+                    code, response = dispatch_mcp(app, data)
+                    self.respond(b"" if response is None else response, code)
+                    return
                 if not isinstance(data, dict):
                     raise ValueError("请求应为 JSON 对象")
-                path = urllib.parse.urlsplit(self.path).path
                 if path == "/api/settings":
                     result = app.save_settings(data)
                 elif path == "/api/environment":
@@ -694,6 +736,15 @@ def make_server(app, port=0):
 
         def do_OPTIONS(self):
             self.respond({"error": "不允许跨站请求"}, 403)
+
+        def do_DELETE(self):
+            self.close_connection = True
+            if not self.allowed_host() or not self.origin_ok() or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                self.respond({"error": "仅允许本机客户端访问"}, 403)
+            elif urllib.parse.urlsplit(self.path).path == "/mcp":
+                self.respond({"error": "此 MCP 接口不创建会话"}, 405, extra={"Allow": "POST"})
+            else:
+                self.respond({"error": "接口不存在"}, 404)
 
     server = Server(("127.0.0.1", port), Handler)
     server.app = app

@@ -1,3 +1,3 @@
-"""FrameWeave: an independent, local-first creative canvas."""
+"""PrismCanvas 棱光, with the compatible FrameWeave data and API identity."""
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"

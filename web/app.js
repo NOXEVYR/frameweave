@@ -1,6 +1,7 @@
 import { createNode, createDemo, connect, removeNodes, duplicateNodes, generationPayload, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
 import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, redactLocalText, publicChecksReport } from './packages.mjs';
 import { filterJobs, filterPackages } from './library.mjs';
+import { placeFragment } from './canvas-layout.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
@@ -165,7 +166,26 @@ function zoom(factor, x = canvas.clientWidth / 2, y = canvas.clientHeight / 2) {
 }
 function nodeSize(node) {
   const dom = document.getElementById(`fw-node-${node.id}`);
-  return { width: dom?.offsetWidth || (node.type === 'result' ? 338 : node.type === 'generation' ? 304 : 286), height: dom?.offsetHeight || 340 };
+  return { width: dom?.offsetWidth || (node.type === 'result' ? 338 : node.type === 'generation' ? 304 : 286), height: dom?.offsetHeight || (node.type === 'generation' ? 440 : 340) };
+}
+function placementSize(node) {
+  const size = nodeSize(node);
+  // Images/videos load after placement. Reserve the maximum media height plus
+  // header, caption, multiple-output action and footer for both new and pending
+  // cards, so a later portrait image cannot grow into an adjacent node.
+  return { ...size, height: Math.max(size.height, ['result', 'reference'].includes(node.type) ? 480 : node.type === 'generation' ? 440 : 340) };
+}
+function placeNewNodes(nodes, preferredAnchor = null) {
+  const rectangles = nodes.map(node => ({ x: node.x, y: node.y, ...placementSize(node) }));
+  const occupied = graph.nodes.map(node => ({ x: node.x, y: node.y, ...placementSize(node) }));
+  const preferred = preferredAnchor ? { x: preferredAnchor.x + Math.min(...rectangles.map(rect => rect.x)) - nodes[0].x, y: preferredAnchor.y + Math.min(...rectangles.map(rect => rect.y)) - nodes[0].y } : null;
+  placeFragment(rectangles, occupied, preferred).forEach((position, index) => { nodes[index].x = position.x; nodes[index].y = position.y; });
+}
+function centerOnNode(node) {
+  const size = nodeSize(node);
+  viewport.x = canvas.clientWidth / 2 - (node.x + size.width / 2) * viewport.scale;
+  viewport.y = Math.max(112, (canvas.clientHeight - size.height * viewport.scale) / 2) - node.y * viewport.scale;
+  applyViewport(); save();
 }
 function bounds() {
   if (!graph.nodes.length) return { minX: 0, minY: 0, maxX: 800, maxY: 500 };
@@ -193,10 +213,10 @@ function drawMinimap() {
   context.lineWidth = 1;
   for (const node of graph.nodes) {
     const size = nodeSize(node);
-    context.fillStyle = selected.has(node.id) ? '#68baa4' : node.type === 'generation' ? '#345d59' : '#31475d';
+    context.fillStyle = selected.has(node.id) ? '#4968cf' : node.type === 'generation' ? '#bc8373' : '#a0a6b7';
     context.fillRect(offsetX + (node.x - minX) * scale, offsetY + (node.y - minY) * scale, size.width * scale, size.height * scale);
   }
-  context.strokeStyle = '#86c5b570'; context.fillStyle = '#7dd8ba05';
+  context.strokeStyle = '#4968cf99'; context.fillStyle = '#4968cf0c';
   const rect = [offsetX + (viewBox.x - minX) * scale, offsetY + (viewBox.y - minY) * scale, viewBox.width * scale, viewBox.height * scale];
   context.fillRect(...rect); context.strokeRect(...rect);
 }
@@ -228,6 +248,18 @@ function copyText(value, success = '已复制到剪贴板') {
     toast(success);
   });
 }
+async function openAiConnection() {
+  const trigger = $('#aiConnectBtn'); trigger.disabled = true;
+  try {
+    const bootstrap = await api('/api/bootstrap');
+    if (!bootstrap.csrf) throw new Error('本地服务没有返回有效的接入令牌');
+    csrf = bootstrap.csrf;
+    $('#mcpUrl').value = `${location.origin}/mcp`;
+    $('#mcpConfig').textContent = JSON.stringify({ mcpServers: { frameweave: { url: `${location.origin}/mcp`, headers: { Authorization: `Bearer ${csrf}` } } } }, null, 2);
+    if (!$('#aiDialog').open) $('#aiDialog').showModal();
+  } finally { trigger.disabled = false; }
+}
+function clearAiConnection() { $('#mcpUrl').value = ''; $('#mcpConfig').textContent = ''; }
 function outputMedia(output, className, controls = false) {
   const url = mediaURL(output.url);
   if (!url) return el('div', 'media-error', '此媒体地址不可用。请从本地任务重新载入。');
@@ -325,8 +357,11 @@ function renderNodes() {
         const caption = el('div', 'output-caption'); caption.append(el('span', '', outputs[0].type === 'video' ? 'VIDEO · 本地输出' : 'IMAGE · 本地输出'), button('大图预览 ↗', 'node-action', () => preview(outputs[0]))); body.append(caption);
         if (outputs.length > 1) body.append(button(`查看全部 ${outputs.length} 个输出 →`, 'node-action', () => switchTab('jobs')));
       } else {
-        const placeholder = el('div', 'output-placeholder'); placeholder.append(el('span', 'empty-icon', '▻'), el('strong', '', '等待第一帧灵感'), el('p', '', '连接生成节点并运行，实际图像与视频将在这里呈现。')); body.append(placeholder);
-        const caption = el('div', 'output-caption'); caption.append(el('span', '', 'OUTPUT / 本地媒体'), el('span', '', '未生成')); body.append(caption);
+        const placeholder = el('div', 'output-placeholder'), headline = el('strong', '', '等待第一帧灵感'), detail = el('p', '', '连接生成节点并运行，实际图像与视频将在这里呈现。');
+        headline.dataset.resultHeadline = node.data.jobId; detail.dataset.resultDetail = node.data.jobId;
+        placeholder.append(el('span', 'empty-icon', '▻'), headline, detail); body.append(placeholder);
+        const caption = el('div', 'output-caption'), state = el('span', '', '未生成'); state.dataset.resultStatus = node.data.jobId;
+        caption.append(el('span', '', 'OUTPUT / 本地媒体'), state); body.append(caption);
       }
       card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', 'IMAGE / VIDEO')); card.append(footer, port(node, 'input'));
     }
@@ -649,9 +684,12 @@ function renderInspector() {
 }
 function renderAll() { renderNodes(); renderInspector(); updateHistory(); applyViewport(); }
 function addNode(type, data = {}, position = null) {
+  if (graph.nodes.length >= 500) throw new Error('当前画布已满，请先导出或整理节点。');
   const point = viewPoint(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2);
   const node = createNode(type, position?.x ?? point.x - 145, position?.y ?? point.y - 115, data);
+  placeNewNodes([node]);
   mutate(() => { graph.nodes.push(node); selected = new Set([node.id]); selectedEdge = null; });
+  centerOnNode(node);
   return node;
 }
 function deleteSelection() {
@@ -710,7 +748,7 @@ function renderDiagnosticChecks() {
       const body = el('div'); body.append(el('div', 'check-name', check.name), el('div', 'check-detail', check.detail)); row.append(body); group.append(row);
     }); list.append(group);
   }
-  const prompt = workflowRepair || '请协助我补齐 FrameWeave 本地图片 / 视频工作流环境。先解释缺失项与操作影响，再给出可核查的安装、配置与验证步骤。保留现有模型和数据；不要把“待确认”当成已安装或已损坏。';
+  const prompt = workflowRepair || '请协助我补齐棱光 PrismCanvas 本地图片 / 视频工作流环境。先解释缺失项与操作影响，再给出可核查的安装、配置与验证步骤。保留现有模型和数据；不要把“待确认”当成已安装或已损坏。';
   $('#repair-prompt').value = redactLocalText(prompt, knownLocalPaths());
   $('#copy-repair').disabled = !diagnosticChecks.length; $('#export-diagnostics').disabled = !diagnosticChecks.length;
 }
@@ -806,12 +844,19 @@ async function runNode(id) {
   try {
     const job = await api('/api/jobs', payload);
     if (!job.id) throw new Error('服务没有返回任务 ID');
-    jobNodes[job.id] = id;
-    mutate(() => {
-      let targets = graph.edges.filter(edge => edge.source === id).map(edge => getNode(edge.target)).filter(item => item?.type === 'result');
-      if (!targets.length) { const result = createNode('result', node.x + 385, node.y, { title: `${node.data.title} · 结果` }); graph.nodes.push(result); connect(graph, id, result.id); targets = [result]; }
-      targets.forEach(target => { target.data.jobId = job.id; target.data.outputs = []; });
-    });
+    // A slow submission may finish after the user imported or deleted a canvas.
+    // Keep the accepted task visible without attaching it to stale graph objects.
+    if (getNode(id) === node) {
+      jobNodes[job.id] = id;
+      mutate(() => {
+        let targets = graph.edges.filter(edge => edge.source === id).map(edge => getNode(edge.target)).filter(item => item?.type === 'result');
+        if (!targets.length && graph.nodes.length < 500 && graph.edges.length < 2000) {
+          const result = createNode('result', node.x + nodeSize(node).width + 64, node.y, { title: `${node.data.title} · 结果` });
+          placeNewNodes([result]); graph.nodes.push(result); connect(graph, id, result.id); targets = [result];
+        }
+        targets.forEach(target => { target.data.jobId = job.id; target.data.outputs = clone(job.outputs || []); });
+      });
+    }
     jobs.unshift({ ...job, elapsed: job.elapsed || 0, outputs: job.outputs || [] });
     switchTab('jobs'); renderJobs(); save(true);
     toast('任务已提交到本地引擎');
@@ -825,16 +870,53 @@ function updateNodeJobStatus() {
     element.classList.toggle('error', job?.status === 'failed');
     element.textContent = job ? `${job.status === 'completed' ? '✓' : job.status === 'failed' ? '!' : '○'} ${STATUS_NAMES[job.status] || job.status} · ${duration(job.elapsed)}` : '○ 等待提交';
   });
+  document.querySelectorAll('[data-result-status],[data-result-headline],[data-result-detail]').forEach(element => {
+    const id = element.dataset.resultStatus ?? element.dataset.resultHeadline ?? element.dataset.resultDetail;
+    if (!id) return;
+    const job = jobs.find(item => item.id === id);
+    if ('resultStatus' in element.dataset) element.textContent = job ? STATUS_NAMES[job.status] || job.status : '等待同步';
+    else if ('resultHeadline' in element.dataset) element.textContent = { queued: '任务已排队', running: '正在生成', failed: '生成失败', cancelled: '任务已取消', completed: '任务已完成' }[job?.status] || '正在同步任务';
+    else element.textContent = { queued: '引擎开始执行后，生成状态会自动更新。', running: '图像与视频生成完成后会自动出现在这里。', failed: '在任务列表查看错误详情，修复后可再次生成。', cancelled: '原始参数仍保留，可在任务列表复用或再次生成。', completed: '此任务没有可预览的图像或视频输出，请检查工作流输出节点。' }[job?.status] || '请保持本地服务运行，或在任务列表查看记录。';
+  });
 }
 function jobTitle(job) { return getNode(jobNodes[job.id])?.data.title || job.summary?.package_name || KIND_NAMES[job.kind] || `任务 ${job.id.slice(0, 8)}`; }
+function resultForJob(id) { return graph.nodes.find(node => node.type === 'result' && node.data.jobId === id); }
+function placeJobOnCanvas(id, focus = true) {
+  const job = jobs.find(item => item.id === id);
+  if (!job) throw new Error('此任务已不在本地列表中，请刷新后重试。');
+  let node = resultForJob(id);
+  if (!node) {
+    if (graph.nodes.length >= 500) throw new Error('当前画布已满，请先导出或整理节点。');
+    const previous = resultForJob(job.retry_of), source = job.retry_of ? null : getNode(jobNodes[id]);
+    // Exact retries may differ from a subsequently edited generation card.
+    // Keep their result independent; reuse explicitly restores the saved recipe.
+    const anchor = previous || source || getNode(jobNodes[job.retry_of]);
+    const point = viewPoint(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2);
+    node = createNode('result', anchor ? anchor.x + nodeSize(anchor).width + 64 : point.x - 169, anchor?.y ?? point.y - 160, { title: `${jobTitle(job)} · 结果`, jobId: id, outputs: clone(job.outputs || []) });
+    placeNewNodes([node]);
+    mutate(() => {
+      graph.nodes.push(node); selected = new Set([node.id]); selectedEdge = null;
+      if (source?.type === 'generation' && graph.edges.length < 2000) { connect(graph, source.id, node.id); jobNodes[id] = source.id; }
+    });
+    centerOnNode(node);
+  }
+  if (focus) { selected = new Set([node.id]); selectedEdge = null; renderSelection(); renderInspector(); centerOnNode(node); switchTab('properties'); }
+  renderJobs(); save(true);
+  return node;
+}
 function installRecipe(recipe) {
-  const box = bounds();
-  const fragment = recipeGraph(recipe, graph.nodes.length ? box.maxX + 390 : 400, singleSelected()?.y ?? 80);
+  const anchor = singleSelected();
+  const point = viewPoint(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2);
+  // Validate the recipe at a safe origin before placing it near an imported
+  // node that may already be at the canvas coordinate boundary.
+  const fragment = recipeGraph(recipe, 0, 0);
   if (graph.nodes.length + fragment.nodes.length > 500 || graph.edges.length + fragment.edges.length > 2000) throw new Error('当前画布已满，请先导出或整理节点再复用。');
+  let referenceY = 0;
+  for (const reference of fragment.nodes.filter(node => node.type === 'reference')) { reference.y = referenceY; referenceY += placementSize(reference).height + 36; }
+  placeNewNodes(fragment.nodes, { x: anchor ? anchor.x + nodeSize(anchor).width + 64 : point.x - 152, y: anchor?.y ?? point.y - 160 });
   mutate(() => { graph.nodes.push(...fragment.nodes); graph.edges.push(...fragment.edges); selected = new Set([fragment.generationId]); selectedEdge = null; });
   const node = getNode(fragment.generationId);
-  viewport.x = canvas.clientWidth / 2 - (node.x + 152) * viewport.scale; viewport.y = 150 - node.y * viewport.scale;
-  applyViewport(); switchTab('properties'); save(true);
+  centerOnNode(node); switchTab('properties'); save(true);
   return node;
 }
 async function reuseJob(id) {
@@ -857,9 +939,7 @@ async function retryJob(id) {
     if (!job.id) throw new Error('服务没有返回任务 ID，请先检查队列。再次点击会查询同一次请求。');
     retryRequests.delete(id); saveRetryRequests();
     jobs = [job, ...jobs.filter(item => item.id !== job.id)];
-    if (!graph.nodes.some(node => node.type === 'result' && node.data.jobId === job.id) && graph.nodes.length < 500) {
-      addNode('result', { title: `${jobTitle(job)} · 再次生成`, jobId: job.id, outputs: job.outputs || [] });
-    }
+    if (!resultForJob(job.id) && graph.nodes.length < 500) placeJobOnCanvas(job.id, false);
     switchTab('jobs'); save(true); toast('任务已加入队列；原参数和随机种子保持不变');
     await pollJobs();
   } finally { retrying.delete(id); renderJobs(); }
@@ -872,20 +952,22 @@ function newJobView(id) {
   const card = el('article', 'job-card'); card.dataset.jobId = id;
   const heading = el('div', 'job-heading'), title = el('span', 'job-title'), status = el('span', 'job-tag'); heading.append(title, status);
   const time = el('div', 'job-time'), elapsed = el('span'); time.append(elapsed, el('span', '', id.slice(0, 8)));
-  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar);
+  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '生成进度');
   const state = el('div', 'progress-state'), error = el('p', 'job-error'), warning = el('p', 'job-warning'), provenance = el('p', 'job-provenance'), thumbs = el('div', 'job-thumbs');
   const actions = el('div', 'job-actions');
   const reuse = button('复用参数', 'job-action', () => reuseJob(id), '把原任务参数添加为独立节点，不会自动开始生成');
+  const locate = button('放入画布', 'job-action', () => placeJobOnCanvas(id), '在当前画布中查看任务结果，不会重新提交生成');
   const retry = button('再次生成', 'job-action', () => retryJob(id), '以原任务参数和随机种子再提交一次，由当前引擎重新校验');
   const cancel = button('取消任务', 'job-action job-cancel', async () => { cancel.disabled = true; try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, {}); toast('已发送取消请求'); await pollJobs(); } finally { cancel.disabled = false; } });
-  actions.append(reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, thumbs, actions);
-  return { card, title, status, elapsed, bar, state, error, warning, provenance, thumbs, reuse, retry, cancel, outputSignature: '' };
+  actions.append(locate, reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, thumbs, actions);
+  return { card, title, status, elapsed, track, bar, state, error, warning, provenance, thumbs, locate, reuse, retry, cancel, outputSignature: '' };
 }
 function renderJobs() {
   $('#job-count').textContent = String(jobs.filter(job => ['queued', 'running'].includes(job.status)).length);
   const list = $('#jobs-list');
   const filtered = filterJobs(jobs, $('#job-status-filter').value, $('#job-search').value, jobTitle);
-  $('#jobs-filter-count').textContent = `显示 ${filtered.length} / ${jobs.length} 个任务`;
+  const unattached = jobs.filter(job => !resultForJob(job.id)).length;
+  $('#jobs-filter-count').textContent = `显示 ${filtered.length} / ${jobs.length} 个任务${unattached ? ` · ${unattached} 个可放入画布` : ''}`;
   const visible = new Set(filtered.map(job => job.id));
   const current = new Set(jobs.map(job => job.id));
   jobViews.forEach((view, id) => {
@@ -903,11 +985,16 @@ function renderJobs() {
     write(view.elapsed, `耗时 ${duration(job.elapsed)}`);
     const progress = progressPercent(job.progress); view.bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`;
     const active = ['queued', 'running'].includes(job.status);
-    view.state.hidden = progress !== null || !active;
-    write(view.state, job.status === 'queued' ? '等待引擎执行' : '推理进行中 · 后端暂未提供逐步进度');
+    const progressValue = job.status === 'completed' ? 100 : progress;
+    if (progressValue === null) view.track.removeAttribute('aria-valuenow'); else view.track.setAttribute('aria-valuenow', String(Math.round(progressValue)));
+    view.track.setAttribute('aria-valuetext', progressValue === null ? STATUS_NAMES[job.status] || job.status : `${Math.round(progressValue)}%`);
+    view.state.hidden = !active;
+    write(view.state, progress !== null ? `${Math.round(progress)}% · ${job.status === 'queued' ? '排队中' : '正在生成'}` : job.status === 'queued' ? '等待引擎执行' : '推理进行中 · 后端暂未提供逐步进度');
     write(view.error, String(job.error || '')); view.error.hidden = !job.error;
     const warnings = [job.retry_warning, job.storage_warning].filter(Boolean).join('\n'); write(view.warning, warnings); view.warning.hidden = !warnings;
-    write(view.provenance, job.retry_of ? `来自任务 ${String(job.retry_of).slice(0, 8)} · 保留原始参数` : ''); view.provenance.hidden = !job.retry_of;
+    const attached = !!resultForJob(job.id);
+    const provenance = [job.retry_of ? `来自任务 ${String(job.retry_of).slice(0, 8)} · 保留原始参数` : '', !attached ? '尚未放入当前画布，可直接添加结果或复用参数' : ''].filter(Boolean).join('\n');
+    write(view.provenance, provenance); view.provenance.hidden = !provenance;
     const signature = JSON.stringify(job.outputs || []);
     if (view.outputSignature !== signature) {
       releaseMedia(view.thumbs); view.thumbs.replaceChildren();
@@ -915,6 +1002,7 @@ function renderJobs() {
       view.outputSignature = signature;
     }
     view.thumbs.hidden = !job.outputs?.length;
+    write(view.locate, attached ? '定位画布' : '放入画布'); view.locate.setAttribute('aria-label', attached ? '定位画布' : '放入画布'); view.locate.disabled = !attached && graph.nodes.length >= 500;
     view.reuse.disabled = !job.can_reuse || reusing.has(job.id); write(view.reuse, reusing.has(job.id) ? '正在读取…' : '复用参数');
     view.retry.hidden = active; view.retry.disabled = !job.can_retry || retrying.has(job.id); write(view.retry, retrying.has(job.id) ? '正在提交…' : retryRequests.has(job.id) ? '查询 / 重试请求' : '再次生成');
     view.cancel.hidden = !active;
@@ -1042,7 +1130,7 @@ document.addEventListener('keydown', event => {
 document.addEventListener('keyup', event => { if (event.code === 'Space') { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); } });
 window.addEventListener('blur', () => { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); });
 window.addEventListener('beforeunload', () => { save(true); releaseMedia(document); });
-window.addEventListener('pagehide', () => { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); });
+window.addEventListener('pagehide', () => { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); if ($('#aiDialog').open) $('#aiDialog').close(); clearAiConnection(); document.querySelectorAll('video,audio').forEach(media => media.pause()); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); }
 });
@@ -1050,6 +1138,10 @@ new ResizeObserver(() => { applyViewport(); }).observe(canvas);
 document.querySelectorAll('[data-close]').forEach(element => element.addEventListener('click', () => element.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); } }));
 $('#preview-dialog').addEventListener('close', clearPreview);
+$('#aiDialog').addEventListener('close', clearAiConnection);
+bind('#aiConnectBtn', openAiConnection);
+bind('#copyMcpUrl', () => copyText($('#mcpUrl').value, '已复制 MCP 接入地址'));
+bind('#copyMcpConfig', () => copyText($('#mcpConfig').textContent, '已复制含本次接入令牌的配置，请仅粘贴到可信 AI 客户端'));
 bind('#tool-select', () => { tool = 'select'; canvas.classList.remove('hand'); $('#tool-select').classList.add('active'); $('#tool-hand').classList.remove('active'); $('#tool-select').setAttribute('aria-pressed', 'true'); $('#tool-hand').setAttribute('aria-pressed', 'false'); });
 bind('#tool-hand', () => { tool = 'hand'; canvas.classList.add('hand'); $('#tool-hand').classList.add('active'); $('#tool-select').classList.remove('active'); $('#tool-hand').setAttribute('aria-pressed', 'true'); $('#tool-select').setAttribute('aria-pressed', 'false'); });
 bind('#add-prompt', () => addNode('prompt'));
@@ -1143,7 +1235,7 @@ async function initialize() {
     await refreshEngine(); renderInspector(); await pollJobs();
     loadPackages().catch(reportError);
     scanEnvironment().catch(error => toast(`自动环境发现未完成：${error.message}`, true));
-  } catch (error) { $('#engine-label').textContent = '本地服务不可用'; $('#engine-status').classList.add('offline'); reportError(new Error(`无法连接 FrameWeave 本地服务：${error.message}`)); }
+  } catch (error) { $('#engine-label').textContent = '本地服务不可用'; $('#engine-status').classList.add('offline'); reportError(new Error(`无法连接棱光本地服务：${error.message}`)); }
   setInterval(() => { if (!document.hidden) pollJobs(); }, 1800);
   setInterval(() => { if (!document.hidden) refreshEngine(); }, 15000);
 }

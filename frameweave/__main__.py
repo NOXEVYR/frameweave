@@ -11,7 +11,7 @@ from .server import App, make_server
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FrameWeave 帧织 · 轻量本地 AI 画布")
+    parser = argparse.ArgumentParser(description="棱光 PrismCanvas · 轻量本地 AI 画布")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--backend")
     parser.add_argument("--model-root", action="append")
@@ -29,7 +29,7 @@ def main():
     url = f"http://127.0.0.1:{server.server_port}/"
     (data / "last-url.txt").write_text(url, encoding="utf-8")
     if sys.stdout:
-        print(f"FrameWeave: {url}\nData: {data}", flush=True)
+        print(f"PrismCanvas 棱光: {url}\nData: {data}", flush=True)
     threading.Thread(target=app.poll, daemon=True).start()
     if not args.no_browser:
         edge_paths = [Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe",

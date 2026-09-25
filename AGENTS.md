@@ -1,5 +1,7 @@
 # FrameWeave development
 
+- Display brand since 0.5.0: 棱光 PrismCanvas. Preserve the FrameWeave Python package, data directory, browser storage keys, schemas, MCP server name and API identity for compatibility. New Windows builds use PrismCanvas.exe. The selected E04 geometry lives in assets/frameweave.svg and web/brand.svg.
+
 - Reply in Chinese for this project. This is an independently written lightweight AI canvas client.
 - Never copy YUH Studio implementation, branding, advertisements, user history, configuration, or weights into this repository.
 - Use Python 3.11+ standard library for the local HTTP service, plain ES modules/CSS for the canvas. No runtime npm dependencies.
@@ -11,3 +13,4 @@
 - Keep docs/DEVELOPMENT_LOG.md current with each change's scope, decisions, issues, validation evidence and outstanding limits. Record private paths, prompts and temporary runtime details only outside the public project tree.
 - Workflow packages are data-only JSON with explicit scalar/image bindings; importing must never submit a job. Preserve stable package identity and old canvas compatibility, and validate live node schemas before generation.
 - Package organization is local metadata; archival must preserve existing canvas references and exported content identity. Replay exact saved API graphs only on the original backend after fresh schema validation; retain request IDs and never resend an uncertain submission automatically.
+- MCP uses stateless JSON Streamable HTTP at /mcp with the current startup Bearer token. Keep tool schemas consistent with compiler inputs. Preserve durable request IDs, cross-process locking and uncertain-submit guards; never log or export connection tokens. Protocol tests use the mock backend, not real GPU inference.

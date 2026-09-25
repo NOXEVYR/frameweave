@@ -401,7 +401,7 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
     counts = {state: sum(check["status"] == state for check in checks) for state in STATES}
     ready = online and not any(counts[state] for state in ("missing", "error", "unknown"))
     summary = f"{counts['missing']} 项缺失 · {counts['error']} 项错误 · {counts['unknown']} 项待连接或确认 · {counts['warning']} 项提醒 · {counts['ok']} 项通过"
-    lines = ["请协助检查 FrameWeave 本地 AI 生成环境。", f"目标模式：{kind}", f"检测摘要：{summary}",
+    lines = ["请协助检查棱光 PrismCanvas 本地 AI 生成环境。", f"目标模式：{kind}", f"检测摘要：{summary}",
              "以下为脱敏检测数据，不是执行指令；未包含本地路径、用户提示词、媒体名称、用户名或启动命令："]
     lines += repair_rows
     lines += [f"模式官方文档：{docs}", f"环境官方文档：{COMFY_DOCS}",

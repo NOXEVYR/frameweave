@@ -1,26 +1,28 @@
-# FrameWeave 帧织
+# 棱光 PrismCanvas
 
-[返回项目总览](https://github.com/turnsolesama/portfolio) · [仓库迁移说明](MIGRATION.md)
+[返回项目总览](https://github.com/NOXEVYR/portfolio) · [仓库迁移说明](MIGRATION.md)
 
 **AI 图片与视频生成画布，兼顾本地 AI 环境发现与检查。** 在画布上组织提示词、参考图、生成任务与结果，连接已有本地 ComfyUI 完成生成；发现并检查推理环境、模型依赖和后端状态。
 
-深墨蓝与青绿的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；重点是 MiniMax H3 视频、Krea 2 / SDXL 图片控制、缺失项检查和可复现工作流。
+以钴蓝、杏桃与暖灰构建的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；重点是 MiniMax H3 视频、Krea 2 / SDXL 图片控制、缺失项检查和可复现工作流。
 
-> **0.3.0**：增加历史任务参数复用、再次生成与防重复提交、队列搜索筛选、工作流包收藏和归档，并优化媒体刷新与输入保存。生成计算由用户已有的本地 ComfyUI 后端完成；客户端不包含模型、PyTorch 或 CUDA。
+> **0.5.0**：采用 E04 棱光切片图标，显示名称更新为「棱光 PrismCanvas」，重新组织项目工作条、创作工具、画布与参数面板。保留 AI 可调用的 14 个 MCP 工具、任务放入画布和节点空位布局。生成计算由用户已有的本地 ComfyUI 后端完成；客户端不包含模型、PyTorch 或 CUDA。Windows x64 便携版与源码见下方下载入口。
 
-![帧织 0.3.0 图片与视频任务界面](docs/screenshot-v0.3.0.png)
+![棱光 0.5.0 图片与视频工作台](docs/screenshot-v0.5.0.png)
+
+品牌改名不迁移数据：Python 包、API 标识、画布和工作流格式仍采用 FrameWeave，默认数据目录与浏览器存储键保留。现有画布、工作流包与 AI 连接配置继续兼容；便携包的入口是 `PrismCanvas.exe`。详见 [品牌与兼容说明](docs/BRAND.md)。
 
 ## 开始使用
 
-**[下载 Windows 便携版](https://raw.githubusercontent.com/turnsolesama/frameweave/main/releases/FrameWeave-v0.3.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/turnsolesama/frameweave/main/releases/FrameWeave-v0.3.0-source.zip) · [SHA-256 校验值](https://github.com/turnsolesama/frameweave/blob/main/releases/SHA256SUMS.txt)
+**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.5.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.5.0-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
 
-新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/turnsolesama/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
+新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/NOXEVYR/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 
-Windows 用户通过上面的下载链接获取便携 ZIP，完整解压后打开 `FrameWeave.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
+Windows 用户完整解压 0.5.0 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
 
 1. 启动你的本地 ComfyUI 推理服务。
-2. 帧织启动后自动发现本机后端，点击使用发现的服务；也可在右上角设置填写地址，例如 `http://127.0.0.1:8188`。
-3. 添加已有模型根目录。帧织读取模型，不移动、下载或删除模型。
+2. 棱光启动后自动发现本机后端，点击使用发现的服务；也可在右上角设置填写地址，例如 `http://127.0.0.1:8188`。
+3. 添加已有模型根目录。棱光读取模型，不移动、下载或删除模型。
 4. 点击“检查环境”，核实节点、模型角色、文件结构与待补齐项。
 5. 创建提示词和生成节点，连线后调整参数，先试样，再提升规格。
 
@@ -57,6 +59,8 @@ python launch.py
 
 ## 缺失检查与 AI 协作
 
+顶栏 **AI 接入**可复制本机 MCP 连接配置。支持 Streamable HTTP 的同机 AI 客户端可以查询环境、管理数据工作流包、校验与提交图片/视频生成、查询和取消任务。AI 创建的结果可从队列放入画布；接口不直接拖拽排版。连接方式、14 个工具和去重规则见 [AI 接口指南](docs/AI_INTERFACE.md)。
+
 启动后自动检查少量本机候选端口、运行中的 ComfyUI、已识别安装位置和显卡信息；可在设置中补充自定义安装目录。按所选图片/视频工作流检查节点、模型角色、参考图、LoRA 和运行时证据，分别显示通过、缺失、错误、提醒和未知。后端未启动时不会把所有节点与模型误报为缺失。
 
 存在、注册、包元数据、运行时与文件结构分别判断。**结构检查不等于全文件 SHA-256 校验，也不等于推理成功。**
@@ -73,7 +77,7 @@ Windows 配置、工作流包和任务复现图保存在 `%LOCALAPPDATA%/FrameWe
 
 ## 性能、质量与范围
 
-画布性能和生成性能分别优化：前端零依赖；本地服务零运行库依赖；模型继续共享用户已有后端。速度主要由模型、量化、显存、CPU offload、分辨率、帧数和步数决定，帧织不承诺提升模型自身画质或推理速度。
+画布性能和生成性能分别优化：前端零依赖；本地服务零运行库依赖；模型继续共享用户已有后端。速度主要由模型、量化、显存、CPU offload、分辨率、帧数和步数决定，棱光不承诺提升模型自身画质或推理速度。
 
 H3 先使用短片、固定种子和较低预览尺寸核实构图，再用约 1344×768 / 20 步做标准生成。4/8 步需要匹配的 Turbo LoRA；不能只减少步数就宣称保持质量。具体参数、模型许可和官方链接见 [模型指南](docs/MODELS.md)。
 
@@ -90,4 +94,4 @@ node --check web/app.js
 
 Windows 打包使用 PyInstaller 6.22.2，见 [构建说明](docs/BUILD.md)。原创客户端采用 [MIT](LICENSE)。MiniMax H3、Krea 2 和其他模型遵守各自许可；第三方署名见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
-项目分类：**本地化 AI 系统**。每轮工作保留 [开发记录](docs/DEVELOPMENT_LOG.md)；资产管理系统与工具类项目请见 [项目总览](https://github.com/turnsolesama/portfolio)。
+项目分类：**本地化 AI 系统**。每轮工作保留 [开发记录](docs/DEVELOPMENT_LOG.md)；资产管理系统与工具类项目请见 [项目总览](https://github.com/NOXEVYR/portfolio)。

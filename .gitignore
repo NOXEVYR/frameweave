@@ -11,6 +11,9 @@ data/
 settings.json
 jobs.json
 last-url.txt
+automation-requests.json
+.automation.lock
+.automation-*.tmp
 runs/
 workflow-packages/
 .DS_Store

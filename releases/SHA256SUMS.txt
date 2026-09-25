@@ -1,2 +1,2 @@
-f350e2bedad0e7648d21297104d156c3204b3573238d7a6c72602de34c52a3c7  FrameWeave-v0.3.0-Windows-x64.zip
-a4bbd746fad194ad9dca97e5f7c4989478caf0e1e7c8b0c189ed086a3f339b15  FrameWeave-v0.3.0-source.zip
+9eca42041ac98f845bf0ebc46950b1fcb14d5956dec13e8e69a2d0a8dab6f704  PrismCanvas-v0.5.0-Windows-x64.zip
+433785bc9bfc14cfbaa5d08e540ef3e8d062eedf6665752fe703203be9d38160  PrismCanvas-v0.5.0-source.zip

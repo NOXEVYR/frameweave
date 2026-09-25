@@ -52,7 +52,7 @@
     "external_ai_product_configured": false,
     "native_window_and_taskbar_icon_verified": false,
     "new_runtime_dependencies": false,
-    "published": false
+    "published": true
   },
   "artifacts": [
     {
@@ -346,10 +346,14 @@
   ],
   "package_revision": "publication-20260925",
   "publication": {
-    "state": "prepared",
+    "state": "published",
     "repository": "NOXEVYR/frameweave",
     "branch": "main",
     "requested_date": "2026-09-25",
-    "method": "repository releases directory"
+    "method": "repository releases directory",
+    "verified_commit": "ff120ca70f356c731c22a734d8324e3728986746",
+    "verified_date": "2026-09-25",
+    "download_sha256_and_crc_verified": true,
+    "verified_source_files": 54
   }
 }

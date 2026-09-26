@@ -9,19 +9,27 @@ export function newDraft(mode, kind = STUDIO_MODES[mode]?.kinds[0][0]) {
   return { kind, positive: '', negative: '', width: video ? 768 : 1024, height: video ? 448 : 1024,
     steps: video ? 20 : qwen21 ? 40 : krea ? 8 : 25, cfg: video || krea || qwen21 ? 1 : 7, seed: 42, seconds: 5,
     sampler: 'euler', scheduler: 'simple', denoise: mode === 'img2img' && !qwen21 ? .65 : 1,
-    shift_video: 12, shift_audio: 3, ref_image_size: 'match', custom_size: false, ref_resolution: 1024, models: {}, loras: [], references: [] };
+    shift_video: 12, shift_audio: 3, ref_image_size: 'match', custom_size: false, ref_resolution: 1024,
+    refine: { enabled: false, width: 1536, height: 1536, steps: 12, denoise: .25, upscale_method: '' },
+    models: {}, loras: [], references: [] };
 }
 export function restoreDraft(mode, source) {
   if (!source || typeof source !== 'object' || Array.isArray(source) || !STUDIO_MODES[mode].kinds.some(([kind]) => kind === source.kind)) return newDraft(mode);
   const draft = newDraft(mode, source.kind);
   for (const key of Object.keys(draft)) if (!['models', 'loras', 'references'].includes(key) && ['string', 'number', 'boolean'].includes(typeof source[key])) draft[key] = source[key];
   if (source.kind.startsWith('qwen21')) { draft.steps = source.steps === undefined ? 40 : draft.steps; draft.cfg = source.cfg === undefined ? 1 : draft.cfg; draft.denoise = 1; }
-  if (source.models && typeof source.models === 'object') for (const key of ['checkpoint', 'dit', 'text_encoder', 'vae', 'audio_vae']) if (typeof source.models[key] === 'string') draft.models[key] = source.models[key].slice(0, 1024);
+  if (source.models && typeof source.models === 'object') for (const key of ['checkpoint', 'dit', 'text_encoder', 'vae', 'audio_vae', 'sdxl_clip_l', 'sdxl_clip_g']) if (typeof source.models[key] === 'string') draft.models[key] = source.models[key].slice(0, 1024);
+  if (source.refine && typeof source.refine === 'object' && !Array.isArray(source.refine)) {
+    for (const key of ['enabled', 'width', 'height', 'steps', 'denoise', 'upscale_method']) {
+      const value = source.refine[key];
+      if (['string', 'number', 'boolean'].includes(typeof value)) draft.refine[key] = value;
+    }
+  }
   if (Array.isArray(source.loras)) draft.loras = source.loras.slice(0, 4).filter(item => item && typeof item.name === 'string').map(item => ({ name: item.name.slice(0, 1024), strength_model: item.strength_model ?? 1, ...(source.kind.startsWith('sdxl') ? { strength_clip: item.strength_clip ?? 1 } : {}) }));
   if (source.kind !== 'qwen21_t2i' && Array.isArray(source.references)) draft.references = source.references.slice(0, source.kind === 'qwen21_edit' ? 10 : 9).filter(item => item && typeof item.name === 'string' && typeof item.url === 'string').map(item => ({ name: item.name.slice(0, 1024), url: item.url.slice(0, 2048), label: String(item.label || item.name).slice(0, 200), backend: typeof item.backend === 'string' ? item.backend : '' }));
   return draft;
 }
-export function buildStudioRequest(draft, backend = '') {
+export function buildStudioRequest(draft, backend = '', generationOptions = {}) {
   if (!Object.values(STUDIO_MODES).some(mode => mode.kinds.some(([kind]) => kind === draft.kind))) throw new Error('不支持此生成模式');
   if (typeof draft.positive !== 'string' || !draft.positive.trim()) throw new Error('请填写正向提示词');
   const video = draft.kind.startsWith('h3'), imageEdit = draft.kind === 'sdxl_i2i', qwen21 = draft.kind.startsWith('qwen21'), qwen21Edit = draft.kind === 'qwen21_edit';
@@ -36,6 +44,40 @@ export function buildStudioRequest(draft, backend = '') {
     steps: read('steps', 1, 200, true), cfg: read('cfg', 0, 100), seed: read('seed', 0, Number.MAX_SAFE_INTEGER, true),
     sampler: draft.sampler, scheduler: draft.scheduler, denoise: video || qwen21 || !imageEdit ? 1 : read('denoise', 0, 1),
     models: { ...(draft.models || {}) }, loras: (draft.loras || []).filter(item => item.name).map(item => ({ ...item })) };
+  const hasSdxlClipL = !!request.models.sdxl_clip_l, hasSdxlClipG = !!request.models.sdxl_clip_g;
+  if ((hasSdxlClipL || hasSdxlClipG) && !imageEdit && draft.kind !== 'sdxl') throw new Error('外置 SDXL 编码器只能用于 SDXL 文生图或图生图');
+  if (hasSdxlClipL !== hasSdxlClipG) throw new Error('SDXL 外置文本编码器需要同时选择 CLIP-L 与 CLIP-G');
+  if (hasSdxlClipL) {
+    const clips = generationOptions.sdxl_clip;
+    if (!clips?.available || !Array.isArray(clips.types) || !clips.types.includes('sdxl')) throw new Error(clips?.reason || '当前后端没有可用的 SDXL 双编码器加载器');
+    if (!clips.clip_name1?.includes(request.models.sdxl_clip_l) || !clips.clip_name2?.includes(request.models.sdxl_clip_g)) throw new Error('所选 SDXL 编码器不在当前后端实时模型列表中，请刷新模型');
+  }
+  if (!hasSdxlClipL && !hasSdxlClipG) {
+    delete request.models.sdxl_clip_l;
+    delete request.models.sdxl_clip_g;
+  }
+  if (draft.refine?.enabled === true) {
+    if (!['sdxl', 'sdxl_i2i'].includes(draft.kind)) throw new Error('高清二次重绘目前仅支持 SDXL 文生图与图生图');
+    const capability = generationOptions.refine;
+    if (!capability?.available) throw new Error(capability?.reason || `当前后端缺少高清二次重绘节点：${(capability?.missing || []).join('、') || '尚未通过实时 schema 检查'}`);
+    const methods = Array.isArray(capability.upscale_methods) ? capability.upscale_methods : [];
+    const readRefine = (key, min, max, integer = false) => {
+      const raw = draft.refine[key], value = Number(raw);
+      if (raw === '' || raw === null || raw === undefined || !Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) throw new Error(`二次重绘参数 ${key} 无效或超出范围`);
+      return value;
+    };
+    const refine = {
+      enabled: true,
+      width: readRefine('width', 64, 8192, true),
+      height: readRefine('height', 64, 8192, true),
+      steps: readRefine('steps', 1, 200, true),
+      denoise: readRefine('denoise', 0, 1),
+      upscale_method: draft.refine.upscale_method,
+    };
+    if (refine.width % 8 || refine.height % 8) throw new Error('二次重绘宽高须为 8 的倍数');
+    if (!methods.includes(refine.upscale_method)) throw new Error('请选择当前后端实时 schema 提供的潜空间放大方法');
+    request.refine = refine;
+  }
   const step = video || qwen21 ? 32 : draft.kind === 'krea' ? 16 : 8;
   if (request.width % step || request.height % step) throw new Error(`当前模式的宽高须为 ${step} 的倍数`);
   const refs = draft.references || [];
@@ -69,4 +111,18 @@ export function buildStudioRequest(draft, backend = '') {
     }
   }
   return request;
+}
+
+/** Return only dimensions explicitly recommended by the local backend. */
+export function performanceSuggestion(mode, plan) {
+  const values = plan?.suggested;
+  if (!values || !['txt2img', 'img2img', 'video'].includes(mode)) return null;
+  const prefix = mode === 'video' ? 'video' : 'image';
+  const width = Number(values[`${prefix}_width`]), height = Number(values[`${prefix}_height`]);
+  const suggestion = { width, height };
+  if (mode === 'video') suggestion.seconds = Number(values.video_seconds);
+  const alignment = mode === 'video' ? 32 : 8;
+  if (![width, height].every(value => Number.isSafeInteger(value) && value >= 64 && value <= 8192 && value % alignment === 0)) return null;
+  if (mode === 'video' && (!Number.isFinite(suggestion.seconds) || suggestion.seconds < 1 || suggestion.seconds > 30)) return null;
+  return suggestion;
 }

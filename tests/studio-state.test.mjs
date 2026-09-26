@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { newDraft, restoreDraft, buildStudioRequest } from '../web/studio-state.mjs';
+import { newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from '../web/studio-state.mjs';
 import { studioModelNames } from '../web/generation-studio.mjs';
 test('independent text generation includes exact models and LoRA strengths', () => {
   const d = { ...newDraft('txt2img'), positive: '光与山', models: { checkpoint: 'XL.safetensors' }, loras: [{ name: 'style.safetensors', strength_model: .8, strength_clip: .4 }] };
@@ -82,4 +82,36 @@ test('Qwen model choices require known qwen21 family or an explicit search for u
   assert.deepEqual(studioModelNames(names, families, 'dit', 'qwen21'), ['qwen21-dit']);
   assert.deepEqual(studioModelNames(names, families, 'dit', 'qwen21', 'custom'), ['custom-engine-file']);
   assert.deepEqual(studioModelNames(names, families, 'dit', 'qwen21', 'qwen25'), []);
+});
+test('SDXL external encoders require a live compatible DualCLIPLoader pair while VAE stays optional', () => {
+  const draft = { ...newDraft('txt2img', 'sdxl'), positive: 'portrait', models: { checkpoint: 'xl.safetensors', vae: 'separate-vae.safetensors', sdxl_clip_l: 'clip-l.safetensors', sdxl_clip_g: 'clip-g.safetensors' } };
+  const options = { sdxl_clip: { available: true, types: ['sdxl'], clip_name1: ['clip-l.safetensors'], clip_name2: ['clip-g.safetensors'] } };
+  const request = buildStudioRequest(draft, '', options);
+  assert.equal(request.models.vae, 'separate-vae.safetensors');
+  assert.equal(request.models.sdxl_clip_l, 'clip-l.safetensors');
+  assert.throws(() => buildStudioRequest({ ...draft, models: { ...draft.models, sdxl_clip_g: '' } }, '', options), /同时选择/);
+  assert.throws(() => buildStudioRequest(draft, '', { sdxl_clip: { available: false, reason: '缺少 DualCLIPLoader' } }), /缺少 DualCLIPLoader/);
+  assert.throws(() => buildStudioRequest({ ...draft, models: { ...draft.models, sdxl_clip_g: 'other.safetensors' } }, '', options), /实时模型列表/);
+});
+test('SDXL refine is omitted when disabled and requires explicit live backend capability when enabled', () => {
+  const base = { ...newDraft('img2img', 'sdxl_i2i'), positive: 'rerender', references: [{ name: 'input.png' }] };
+  assert.equal(Object.hasOwn(buildStudioRequest(base), 'refine'), false);
+  const refined = { ...base, refine: { enabled: true, width: 1536, height: 1024, steps: 12, denoise: .3, upscale_method: 'nearest-exact' } };
+  assert.throws(() => buildStudioRequest(refined), /不支持高清二次重绘|schema/);
+  const request = buildStudioRequest(refined, '', { refine: { available: true, missing: [], upscale_methods: ['nearest-exact', 'bilinear'] } });
+  assert.deepEqual(request.refine, { enabled: true, width: 1536, height: 1024, steps: 12, denoise: .3, upscale_method: 'nearest-exact' });
+  assert.throws(() => buildStudioRequest({ ...refined, refine: { ...refined.refine, width: 1537 } }, '', { refine: { available: true, upscale_methods: ['nearest-exact'] } }), /8 的倍数/);
+  assert.throws(() => buildStudioRequest({ ...refined, refine: { ...refined.refine, upscale_method: 'unknown' } }, '', { refine: { available: true, upscale_methods: ['nearest-exact'] } }), /实时 schema/);
+});
+test('restored SDXL draft retains external encoders and refine controls', () => {
+  const restored = restoreDraft('txt2img', { ...newDraft('txt2img', 'sdxl'), models: { sdxl_clip_l: 'clip-l.safetensors', sdxl_clip_g: 'clip-g.safetensors' }, refine: { enabled: true, width: 2048, denoise: .2, upscale_method: 'bilinear' } });
+  assert.equal(restored.models.sdxl_clip_l, 'clip-l.safetensors');
+  assert.equal(restored.refine.enabled, true); assert.equal(restored.refine.width, 2048); assert.equal(restored.refine.steps, 12);
+});
+test('GPU performance suggestions are explicit, mode-specific, and reject invalid backend values', () => {
+  const plan = { profile: 'balanced', suggested: { image_width: 1024, image_height: 768, video_width: 768, video_height: 448, video_seconds: 5 } };
+  assert.deepEqual(performanceSuggestion('txt2img', plan), { width: 1024, height: 768 });
+  assert.deepEqual(performanceSuggestion('video', plan), { width: 768, height: 448, seconds: 5 });
+  assert.equal(performanceSuggestion('img2img', { suggested: { image_width: 1001, image_height: 768 } }), null);
+  assert.equal(performanceSuggestion('audio', plan), null);
 });

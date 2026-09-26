@@ -62,12 +62,26 @@ class EnvironmentTests(unittest.TestCase):
         with patch.object(env, "_request_stats", side_effect=TimeoutError("C:/secret")):
             result = env._probe({"url": "http://127.0.0.1:8188", "source": "test"})
         self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["offline_reason"], "timeout")
         self.assertNotIn("secret", json.dumps(result))
+
+    def test_probe_reports_refused_non_comfy_and_unknown_identity_separately(self):
+        cases = [(ConnectionRefusedError(10061, "secret"), "refused"),
+                 (env._ProbeFailure("non_comfy"), "non_comfy"),
+                 (env._ProbeFailure("identity_unknown"), "identity_unknown")]
+        for error, expected in cases:
+            with self.subTest(reason=expected), patch.object(env, "_request_stats", side_effect=error):
+                result = env._probe({"url": "http://127.0.0.1:8188", "source": "test"})
+                self.assertEqual(result["offline_reason"], expected)
+                self.assertFalse(result["online"])
+                self.assertNotIn("secret", json.dumps(result))
 
     def test_candidate_ports_deduplicate_and_reject_remote(self):
         result = self.discover({"backend_url": "http://localhost:8188"})
         self.assertEqual(len(result["candidates"]), 4)
         self.assertEqual(result["candidates"][0]["source"], "当前设置")
+        self.assertEqual(result["candidates"][0]["classification"], "current")
+        self.assertEqual(result["candidates"][1]["classification"], "probe_only")
         result = self.discover({"backend_url": "http://example.org:8190"})
         self.assertFalse(any("example.org" in c["url"] for c in result["candidates"]))
         self.assertTrue(any(c["id"] == "backend_setting" for c in result["checks"]))
@@ -78,6 +92,8 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(result["hardware"]["status"], "unknown")
         self.assertFalse(any(c["status"] == "missing" for c in result["checks"]))
         self.assertFalse(any(c["online"] for c in result["candidates"]))
+        self.assertTrue(all(c["classification"] in {"current", "probe_only"} for c in result["candidates"]))
+        self.assertTrue(all(c["offline_reason"] for c in result["candidates"]))
 
     def test_process_port_requires_independently_valid_comfy_directory(self):
         exe = self.base / "python.exe"
@@ -121,6 +137,20 @@ class EnvironmentTests(unittest.TestCase):
         self.assertNotIn("SECRET_TOKEN", json.dumps(result))
         self.assertNotIn("CommandLine", json.dumps(result))
         self.assertTrue(any(c["url"].endswith(":9001") for c in result["candidates"]))
+
+    def test_registered_alternate_port_is_discovered_and_probe_only_ports_are_not_missing(self):
+        root = self.installation()
+        exe = self.base / "python.exe"
+        records = [{"Name": "python.exe", "ExecutablePath": str(exe),
+                    "CommandLine": f'"{exe}" "{root / "main.py"}" --port 9211'}]
+        result = self.discover(records=records, stats=None)
+        alternate = next(row for row in result["candidates"] if row["url"].endswith(":9211"))
+        self.assertEqual(alternate["classification"], "discovered")
+        self.assertEqual(alternate["offline_reason"], "identity_unknown")
+        backups = [row for row in result["candidates"] if row["classification"] == "probe_only"]
+        self.assertTrue(backups)
+        self.assertTrue(all(row["status"] == "unknown" for row in backups))
+        self.assertFalse(any(row["status"] == "missing" for row in result["checks"]))
 
     def test_explicit_installation_does_not_walk_or_execute(self):
         root = self.installation()
@@ -185,16 +215,28 @@ class EnvironmentTests(unittest.TestCase):
                 patch.object(env, "_run_fixed", side_effect=subprocess.TimeoutExpired("nvidia-smi", 3)) as run:
             result = env._gpu()
         self.assertEqual(result["status"], "unknown")
-        self.assertEqual(run.call_args.args[0][1:], ["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
+        self.assertEqual(run.call_args.args[0][1:], ["--query-gpu=name,memory.total,memory.free,driver_version", "--format=csv,noheader,nounits"])
         self.assertEqual(run.call_args.args[1], 3)
 
     def test_gpu_response_is_validated_and_does_not_claim_cuda(self):
         with patch.object(env.shutil, "which", return_value=str(self.base / "nvidia-smi")), \
                 patch.object(env, "_exists", return_value=True), \
-                patch.object(env, "_run_fixed", return_value=Mock(returncode=0, stdout="NVIDIA Test, 16384, 580.1\n")):
+                patch.object(env, "_run_fixed", return_value=Mock(returncode=0, stdout="NVIDIA Test, 16384, 8192, 580.1\n")):
             result = env._gpu()
         self.assertEqual(result["gpus"][0]["memory_total_mb"], 16384)
+        self.assertEqual(result["gpus"][0]["memory_free_mb"], 8192)
         self.assertIn("未验证", result["detail"])
+
+    def test_recommendation_prefers_current_backend_device_memory(self):
+        current = {"classification": "current", "online": True,
+                   "devices": [{"vram_total": 32 * 1024**3, "vram_free": 10 * 1024**3}]}
+        hardware = {"gpus": [{"memory_total_mb": 49152, "memory_free_mb": 40000}]}
+        result = env._recommendation([current], hardware)
+        self.assertEqual(result["basis"], "backend_device")
+        self.assertEqual(result["available_vram_mb"], 10240)
+        self.assertEqual(result["total_vram_mb"], 32768)
+        self.assertEqual(result["level"], "balanced")
+        self.assertEqual(set(result["suggested"]), {"image_width", "image_height", "video_width", "video_height", "video_seconds"})
 
     def test_process_probe_timeout_is_unknown(self):
         with patch.object(env.os, "name", "nt"), patch.object(env, "_path", return_value=self.base), \

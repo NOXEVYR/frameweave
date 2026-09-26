@@ -56,7 +56,8 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(response["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
         status, response = self.rpc("tools/list")
-        self.assertEqual(len(response["result"]["tools"]), 14)
+        self.assertEqual(len(response["result"]["tools"]), 16)
+        self.assertTrue({"fw_upload_audio", "fw_audio_capabilities"} <= {t["name"] for t in response["result"]["tools"]})
         for item in response["result"]["tools"]:
             self.assertFalse(item["inputSchema"]["additionalProperties"])
             self.assertFalse(item["annotations"]["openWorldHint"])

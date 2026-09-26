@@ -29,6 +29,8 @@ from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
 from .engines import EngineManager
 from .updates import UpdateManager, UpdateError
+from .canvas_store import CanvasStore
+from .workspace_services import PROFILES, performance_plan, result_location
 from .packages import PackageStore, apply_values, inspect_document, transport_document
 from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
@@ -41,7 +43,7 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
                   "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
                   "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video",
-                  "shift_audio", "ref_image_size", "custom_size", "ref_resolution", "package_id", "values"}
+                  "shift_audio", "ref_image_size", "custom_size", "ref_resolution", "refine", "package_id", "values"}
 
 
 class SubmissionUncertain(BackendError):
@@ -83,6 +85,9 @@ class App:
         saved_options = locals().get("saved", {})
         self.settings["auto_start_engine"] = isinstance(saved_options, dict) and saved_options.get("auto_start_engine") is True
         self.settings["auto_update"] = isinstance(saved_options, dict) and saved_options.get("auto_update") is True
+        self.settings["performance_profile"] = saved_options.get("performance_profile", "auto") if isinstance(saved_options, dict) else "auto"
+        if self.settings["performance_profile"] not in PROFILES:
+            self.settings["performance_profile"] = "auto"
         self.updates = UpdateManager(__version__, self.data_dir, auto_check=self.settings["auto_update"])
         self.update_lock = threading.Lock()
         self.update_busy = False
@@ -95,6 +100,7 @@ class App:
         self.media = {}
         self.uploaded = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
+        self.canvases = CanvasStore(self.data_dir / "canvases")
         self.environment_lock = threading.Lock()
         self.environment_snapshot = None
         self.environment_at = 0
@@ -254,12 +260,15 @@ class App:
 
     def save_settings(self, data):
         settings = {"backend_url": local_url(data.get("backend_url", "")),
+                    "performance_profile": data.get("performance_profile", self.settings.get("performance_profile", "auto")),
                     "auto_start_engine": data.get("auto_start_engine", self.settings.get("auto_start_engine", False)),
                     "auto_update": data.get("auto_update", self.settings.get("auto_update", False)),
                     "model_roots": self.validate_roots(data.get("model_roots", [])),
                     "comfy_roots": self.validate_roots(data.get("comfy_roots", self.settings.get("comfy_roots", [])))}
         if type(settings["auto_start_engine"]) is not bool or type(settings["auto_update"]) is not bool:
             raise ValueError("自动启动设置须为布尔值")
+        if settings["performance_profile"] not in PROFILES:
+            raise ValueError("显存预算选项无效")
         with self.lock:
             changed = settings["backend_url"] != self.backend.url
             enable_updates = settings["auto_update"] and not self.settings.get("auto_update", False)
@@ -306,6 +315,48 @@ class App:
         except (ValueError, binascii.Error):
             raise ValueError("图片编码无效") from None
         return self._upload_content(content)
+
+    def upload_audio(self, data):
+        with self.lock:
+            try:
+                content = base64.b64decode(data.get('data', ''), validate=True)
+            except (ValueError, TypeError, binascii.Error):
+                raise ValueError('音频编码无效') from None
+            if not 12 <= len(content) <= MAX_IMAGE_BYTES:
+                raise ValueError('参考音频须在 12 字节到 20 MiB 之间')
+            if content[:4] == b'RIFF' and content[8:12] == b'WAVE':
+                if int.from_bytes(content[4:8], 'little') + 8 != len(content):
+                    raise ValueError('WAV 文件长度无效')
+                ext, mime = '.wav', 'audio/wav'
+            elif content.startswith(b'fLaC'):
+                ext, mime = '.flac', 'audio/flac'
+            elif content.startswith(b'ID3') or content[0] == 255 and content[1] & 0xe0 == 0xe0:
+                ext, mime = '.mp3', 'audio/mpeg'
+            elif content.startswith(b'OggS'):
+                ext, mime = '.ogg', 'audio/ogg'
+            else:
+                raise ValueError('参考音频仅支持 WAV、FLAC、MP3、OGG 文件')
+            name = 'prismcanvas-' + uuid.uuid4().hex + ext
+            result = self.backend.upload(name, content, mime)
+            if not isinstance(result, dict) or not result.get('name') or result.get('type', 'input') != 'input':
+                raise BackendError('后端未确认音频上传')
+            relative = '/'.join(filter(None, [result.get('subfolder', ''), result['name']]))
+            safe_relative(relative)
+            url = self.register_media(result['name'], result.get('subfolder', ''), 'input')
+            self.uploaded.add(relative)
+            self.info_at = 0
+            return {'name': relative, 'url': url, 'backend': self.backend.url}
+
+    def output_location(self, job_id, data):
+        if type(data.get('open', False)) is not bool:
+            raise ValueError('打开目录选项无效')
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                raise ValueError('结果不属于此客户端的任务')
+            with self.engines._lock:
+                profiles = copy.deepcopy(self.engines._profiles)
+            return result_location(job, data.get('index', 0), profiles, open_folder=data.get('open', False))
 
     def _upload_content(self, content, *, complete=False):
         if not 8 <= len(content) <= MAX_IMAGE_BYTES:
@@ -494,7 +545,10 @@ class App:
                                    attempt.get("state") not in {"pending", "unknown"})
         if attempt.get("state") in {"pending", "unknown"}:
             result["retry_warning"] = "上次再次生成的提交结果不确定，请先在原后端核实队列；此记录已停止重提。"
-        result.pop("backend", None)
+        try:
+            result["backend"] = local_url(job.get("backend"))
+        except ValueError:
+            result.pop("backend", None)
         result.pop("retry_attempt", None)
         result.pop("retry_requests", None)
         return result
@@ -611,7 +665,6 @@ class App:
         for job in jobs:
             start = job.get("started_at") or job.get("created_at", now)
             job["elapsed"] = round(max(0, (job.get("finished_at") or now) - start), 1)
-            job.pop("backend", None)
         return {"jobs": list(reversed(jobs[-200:]))}
 
     def cancel(self, job_id):
@@ -680,7 +733,7 @@ class App:
                                 job["error"] = "\n".join(errors)[:4000] or "后端执行失败或被中断"
                             outputs = []
                             for node_result in item.get("outputs", {}).values():
-                                for key in ("images", "gifs", "videos", "video", "audio"):
+                                for key in ("images", "gifs", "videos", "video", "audio", "audios"):
                                     values = node_result.get(key, [])
                                     if not isinstance(values, list):
                                         continue
@@ -689,12 +742,12 @@ class App:
                                             continue
                                         filename = entry["filename"]
                                         suffix = Path(filename).suffix.lower()
-                                        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".wav", ".mp3", ".flac"):
+                                        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
                                             continue
                                         subfolder = entry.get("subfolder", "")
                                         url = self.register_media(filename, subfolder, entry.get("type", "output"), old["backend"])
-                                        out_type = "video" if suffix in (".mp4", ".webm") else "audio" if suffix in (".wav", ".mp3", ".flac") else "image"
-                                        outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type})
+                                        out_type = "video" if suffix in (".mp4", ".webm") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
+                                        outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type, "storage_type": entry.get("type", "output")})
                             job["outputs"] = outputs
                     elif job_id in running:
                         job["status"] = "running"
@@ -809,6 +862,15 @@ def make_server(app, port=0):
                     self.reject({"error": "此 MCP 接口使用 POST；不提供 SSE 订阅"}, 405, extra={"Allow": "POST"})
                 elif path == "/api/status":
                     self.respond(app.status())
+                elif path == '/api/performance-plan':
+                    self.respond(performance_plan(app.settings['performance_profile'], app.status()))
+                elif path == '/api/canvases':
+                    self.respond(app.canvases.list())
+                elif re.fullmatch(r'/api/canvases/[0-9a-f]{32}', path):
+                    self.respond(app.canvases.get(path.rsplit('/', 1)[-1]))
+                elif path == '/api/audio-capabilities':
+                    from .audio_workflows import audio_capabilities
+                    self.respond({**audio_capabilities(app.object_info(), [app.packages.get(p['id']) for p in app.packages.list()]), 'backend_url': app.backend.url})
                 elif path == "/api/engines":
                     self.respond(app.engines.status())
                 elif path == "/api/updates":
@@ -937,6 +999,12 @@ def make_server(app, port=0):
                     raise ValueError("请求应为 JSON 对象")
                 if path == "/api/settings":
                     result = app.save_settings(data)
+                elif path == '/api/canvases':
+                    result = app.canvases.save(data.get('document'))
+                elif path == '/api/upload-audio':
+                    result = app.upload_audio(data)
+                elif re.fullmatch(r'/api/jobs/[\w-]{1,100}/output-location', path):
+                    result = app.output_location(path.split('/')[3], data)
                 elif path == "/api/engines/start":
                     result = app.engines.start(data.get("id"))
                 elif path == "/api/engines/register":

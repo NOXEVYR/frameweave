@@ -112,7 +112,7 @@ export function createWorkflowCanvas(host) {
     try { return await runner.resume(); } finally { operation = ''; renderState(runner.getState()); }
   }
 
-  async function exportBundle() {
+  async function buildBundle() {
     await host.loadPackages();
     const canvas = JSON.parse(serializeGraph(host.graph(), host.viewport()));
     const ids = [...new Set(canvas.nodes.filter(n => n.data.kind === 'package').map(n => n.data.package_id))];
@@ -121,7 +121,10 @@ export function createWorkflowCanvas(host) {
     const document = { schema: BUNDLE, version: 1, name: host.title(), canvas, packages };
     const serialized = stableStringify(document);
     if (new TextEncoder().encode(serialized).length > LIMIT) throw new Error('工作流画布集合最大为 8 MiB，请减少节点或拆分画布');
-    host.downloadJSON(serialized, 'prismcanvas-workflow-project.json');
+    return document;
+  }
+  async function exportBundle() {
+    host.downloadJSON(stableStringify(await buildBundle()), 'prismcanvas-workflow-project.json');
     host.toast('已导出画布与对应工作流定义；不包含模型、素材或生成结果文件');
   }
 
@@ -179,5 +182,5 @@ export function createWorkflowCanvas(host) {
       host.reportError(new Error(`工作流记录读取失败：${error.message}`));
     }
   }
-  return { init, connectNodes, describeInput, run, exportBundle, importBundle, state: () => runner?.getState(), isRunning: () => runner?.isRunning() || !!operation, refresh: () => { if (runner) renderState(runner.getState()); } };
+  return { init, connectNodes, describeInput, run, buildBundle, exportBundle, importBundle, state: () => runner?.getState(), isRunning: () => runner?.isRunning() || !!operation, refresh: () => { if (runner) renderState(runner.getState()); } };
 }

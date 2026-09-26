@@ -92,3 +92,6 @@ AI 提交的任务与界面使用相同记录。打开 **生成队列 → 放入
 ```
 
 接口按 MCP 官方 [传输规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[生命周期](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) 和 [工具规范](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) 实现。当前验证是本机 HTTP 客户端及浏览器端到端检查；不同 AI 产品的实际连接配置需分别验证。
+
+
+0.10 新增 `fw_audio_capabilities`（只读）和 `fw_upload_audio`（上传参考音频）。音频通过 `fw_generate` 的 package 请求运行，仍须固定 request_id。SDXL 请求支持 models.sdxl_clip_l / sdxl_clip_g 成对覆盖、models.vae，以及 refine 对象：enabled、width、height、steps、denoise、upscale_method；先用 fw_compile 验证当前接口。

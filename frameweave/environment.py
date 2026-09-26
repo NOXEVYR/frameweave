@@ -7,6 +7,7 @@ walk a model tree. Package metadata is evidence of files, not runtime health.
 import concurrent.futures
 import csv
 import datetime
+import errno
 import http.client
 import io
 import json
@@ -27,6 +28,7 @@ PORTS = (8188, 8189, 8190, 8000)
 MAX_CANDIDATES = 12
 MAX_INSTALLATIONS = 12
 PACKAGES = ("torch", "torchvision", "torchaudio", "safetensors", "numpy", "comfyui_frontend_package")
+REFUSED_ERRNOS = {errno.ECONNREFUSED, 10061}
 PROCESS_SCRIPT = (
     "$ErrorActionPreference='Stop'; "
     "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
@@ -325,6 +327,12 @@ def _installation(hint):
             "detail": "安装目录结构与包元数据仅证明文件存在，未执行 Python 或导入 torch；不代表可推理"}
 
 
+class _ProbeFailure(ValueError):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _request_stats(url, timeout=1, limit=131072):
     """Use a socket shutdown deadline, including slow headers or body trickles.
 
@@ -337,10 +345,17 @@ def _request_stats(url, timeout=1, limit=131072):
     deadline = time.monotonic() + timeout
     timer = None
     try:
-        connection.connect()
+        try:
+            connection.connect()
+        except OSError as exc:
+            if getattr(exc, "errno", None) in REFUSED_ERRNOS or getattr(exc, "winerror", None) in REFUSED_ERRNOS:
+                raise _ProbeFailure("refused") from None
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                raise _ProbeFailure("timeout") from None
+            raise _ProbeFailure("identity_unknown") from None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("本机服务探测超时")
+            raise _ProbeFailure("timeout")
         sock = connection.sock
         sock.settimeout(remaining)
 
@@ -356,13 +371,13 @@ def _request_stats(url, timeout=1, limit=131072):
         connection.request("GET", "/system_stats", headers={"Accept": "application/json", "Connection": "close"})
         response = connection.getresponse()
         if response.status != 200:
-            raise ValueError("不是有效的服务状态响应")
+            raise _ProbeFailure("non_comfy")
         length = response.getheader("Content-Length")
         if length and (not length.isdigit() or int(length) > limit):
             raise ValueError("服务状态响应过大或长度无效")
         body = response.read(limit + 1)
         if time.monotonic() > deadline:
-            raise TimeoutError("本机服务探测超时")
+            raise _ProbeFailure("timeout")
         if len(body) > limit:
             raise ValueError("服务状态响应过大")
         return json.loads(body)
@@ -374,7 +389,7 @@ def _request_stats(url, timeout=1, limit=131072):
 
 def _probe(candidate):
     result = {**candidate, "online": False, "version": None, "devices": [], "status": "unknown",
-              "detail": "未收到有效 ComfyUI 响应；服务可能未启动、超时或端口不同"}
+              "offline_reason": "identity_unknown", "detail": "服务身份未知；没有足够证据确认这是 ComfyUI"}
     try:
         stats = _request_stats(candidate["url"], timeout=1, limit=131072)
         if not isinstance(stats, dict):
@@ -395,9 +410,24 @@ def _probe(candidate):
                     row[name] = value
             cleaned.append(row)
         result.update(online=True, version=_text(system["comfyui_version"], 100), devices=cleaned,
-                      status="ok", detail="ComfyUI system_stats 结构校验通过；仍需实际生成验证")
+                      status="ok", offline_reason=None,
+                      detail="ComfyUI system_stats 结构校验通过；仍需实际生成验证")
+    except _ProbeFailure as exc:
+        result["offline_reason"] = exc.reason
+        result["detail"] = {"refused": "连接被拒绝；该候选端口当前没有接受连接的服务",
+                            "timeout": "连接或状态响应超时；服务是否运行尚未确认",
+                            "non_comfy": "端口有 HTTP 响应，但不是 ComfyUI system_stats 接口",
+                            "identity_unknown": "端口服务身份未知；响应格式或访问状态无法确认"}.get(exc.reason, result["detail"])
+    except (TimeoutError, socket.timeout):
+        result["offline_reason"] = "timeout"
+        result["detail"] = "连接或状态响应超时；服务是否运行尚未确认"
+    except OSError as exc:
+        refused = getattr(exc, "errno", None) in REFUSED_ERRNOS or getattr(exc, "winerror", None) in REFUSED_ERRNOS
+        result["offline_reason"] = "refused" if refused else "identity_unknown"
+        result["detail"] = "连接被拒绝；该候选端口当前没有接受连接的服务" if refused else "端口服务身份未知；响应格式或访问状态无法确认"
     except (http.client.HTTPException, OSError, ValueError, TypeError, RecursionError):
-        pass
+        # Reachable but malformed/ambiguous JSON is not evidence that ComfyUI is absent.
+        result["offline_reason"] = "identity_unknown"
     return result
 
 
@@ -421,23 +451,69 @@ def _gpu():
     if not executable:
         return unknown
     try:
-        result = _run_fixed([str(executable), "--query-gpu=name,memory.total,driver_version",
+        result = _run_fixed([str(executable), "--query-gpu=name,memory.total,memory.free,driver_version",
                              "--format=csv,noheader,nounits"], 3)
         if result.returncode or len(result.stdout) > 16384:
             return unknown
         gpus = []
         for row in list(csv.reader(io.StringIO(result.stdout)))[:32]:
-            if len(row) != 3 or not _text(row[0]) or not row[1].strip().isdigit():
+            if len(row) != 4 or not _text(row[0]) or not row[1].strip().isdigit() or not row[2].strip().isdigit():
                 return unknown
-            memory = int(row[1].strip())
-            if not 0 < memory <= 16 * 1024 * 1024:
+            memory, free = int(row[1].strip()), int(row[2].strip())
+            if not 0 < memory <= 16 * 1024 * 1024 or not 0 <= free <= memory:
                 return unknown
-            gpus.append({"name": _text(row[0]), "memory_total_mb": memory, "driver": _text(row[2], 80)})
+            gpus.append({"name": _text(row[0]), "memory_total_mb": memory,
+                         "memory_free_mb": free, "driver": _text(row[3], 80)})
         if gpus:
             return {"gpus": gpus, "status": "ok", "detail": "NVIDIA 驱动工具已响应；未验证目标 Python 的 CUDA / torch 可用性"}
     except (OSError, ValueError, subprocess.TimeoutExpired, csv.Error):
         pass
     return unknown
+
+
+def _recommendation(probed, hardware):
+    """Conservative UI form hints; backend-reported device memory has priority."""
+    evidence = None
+    basis = "unknown"
+    current = next((item for item in probed if item.get("classification") == "current" and item.get("online")), None)
+    if current:
+        devices = current.get("devices", [])
+        valid = [(device.get("vram_free"), device.get("vram_total")) for device in devices
+                 if isinstance(device, dict) and type(device.get("vram_free")) is int
+                 and type(device.get("vram_total")) is int
+                 and 0 <= device["vram_free"] <= device["vram_total"] <= 2 ** 60]
+        if valid:
+            free_bytes, total_bytes = max(valid, key=lambda pair: pair[0])
+            evidence = (free_bytes // (1024 * 1024), total_bytes // (1024 * 1024))
+            basis = "backend_device"
+    if evidence is None and isinstance(hardware, dict):
+        devices = hardware.get("gpus", [])
+        valid = [(device.get("memory_free_mb"), device.get("memory_total_mb")) for device in devices
+                 if isinstance(device, dict) and type(device.get("memory_free_mb")) is int
+                 and type(device.get("memory_total_mb")) is int
+                 and 0 <= device["memory_free_mb"] <= device["memory_total_mb"] <= 16 * 1024 * 1024]
+        if valid:
+            evidence = max(valid, key=lambda pair: pair[0])
+            basis = "nvidia_smi"
+    if evidence is None:
+        return {"level": "unknown", "basis": basis, "available_vram_mb": None,
+                "total_vram_mb": None, "suggested": None,
+                "detail": "未取得可用显存证据；请以实际后端设备报告和短任务验证为准"}
+    free_mb, total_mb = evidence
+    if free_mb < 8 * 1024:
+        level, suggested = "low", {"image_width": 768, "image_height": 768,
+                                     "video_width": 512, "video_height": 512, "video_seconds": 2}
+    elif free_mb < 24 * 1024:
+        level, suggested = "balanced", {"image_width": 1024, "image_height": 1024,
+                                         "video_width": 768, "video_height": 512, "video_seconds": 3}
+    else:
+        level, suggested = "high", {"image_width": 1280, "image_height": 1280,
+                                     "video_width": 1024, "video_height": 576, "video_seconds": 4}
+    detail = ("根据当前配置后端报告的空闲/总显存给出保守表单建议；后端设备证据优先。"
+              if basis == "backend_device" else
+              "根据 nvidia-smi 空闲/总显存给出保守表单建议；实际后端设备证据优先，建议不代表模型兼容或质量保证。")
+    return {"level": level, "basis": basis, "available_vram_mb": free_mb,
+            "total_vram_mb": total_mb, "suggested": suggested, "detail": detail}
 
 
 def discover_environment(settings):
@@ -456,16 +532,16 @@ def discover_environment(settings):
             row["action"] = action
         checks.append(row)
 
-    def add_candidate(value, source):
+    def add_candidate(value, source, classification):
         try:
             url = local_url(value)
         except (TypeError, ValueError):
             return False
         if len(candidates) < MAX_CANDIDATES and not any(item["url"] == url for item in candidates):
-            candidates.append({"url": url, "source": source})
+            candidates.append({"url": url, "source": source, "classification": classification})
         return True
 
-    if not add_candidate(settings.get("backend_url"), "当前设置"):
+    if not add_candidate(settings.get("backend_url"), "当前设置", "current"):
         check("backend_setting", "backend", "当前后端地址", "unknown", "地址未设置或格式无效；仅探测本机回环 HTTP", "在设置中填写本机 ComfyUI 地址")
     # GPU and process queries can each take three seconds; execute independently.
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as system_pool:
@@ -475,9 +551,9 @@ def discover_environment(settings):
         hardware = gpu_future.result()
     hints, ports = _process_hints(records)
     for port in ports[:MAX_CANDIDATES]:
-        add_candidate(f"http://127.0.0.1:{port}", "ComfyUI 进程端口")
+        add_candidate(f"http://127.0.0.1:{port}", "ComfyUI 进程端口", "discovered")
     for port in PORTS:
-        add_candidate(f"http://127.0.0.1:{port}", "常见本机端口")
+        add_candidate(f"http://127.0.0.1:{port}", "常见本机端口", "probe_only")
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         probed = list(pool.map(_probe, candidates))
     explicit = settings.get("comfy_roots", [])
@@ -509,6 +585,7 @@ def discover_environment(settings):
           None if installations else "可手动添加已有安装目录，或先启动已有推理程序再检测")
     check("gpu_driver", "hardware", "NVIDIA GPU 与驱动", hardware["status"], hardware["detail"],
           None if hardware["status"] == "ok" else "通过系统设备管理器与显卡官方工具核实硬件和驱动；其他 GPU 仍需后端确认")
+    hardware = {**hardware, "recommendation": _recommendation(probed, hardware)}
     for index, installation in enumerate(installations, 1):
         missing = [p["name"] for p in installation["packages"] if p["status"] == "missing"]
         known = [p for p in installation["packages"] if p["status"] == "ok"]

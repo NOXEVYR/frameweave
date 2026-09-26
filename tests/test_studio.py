@@ -49,6 +49,7 @@ class StudioHTTPTests(unittest.TestCase):
         self.assertEqual(found["job_id"], first["id"])
         self.assertEqual(found["job"]["id"], first["id"])
         self.assertNotIn("backend", found)
+        self.assertEqual(found["job"]["backend"], self.backend.url)
         changed = copy.deepcopy(API_JOB)
         changed["prompt"]["1"]["inputs"]["text"] = "another scene"
         self.assertEqual(self.submit_guarded(changed)[0], 400)

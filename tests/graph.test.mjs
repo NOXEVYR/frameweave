@@ -315,3 +315,11 @@ test('duplicating workflow packages retains all public port bindings and clears 
   assert.doesNotThrow(() => parseGraph(serializeGraph(graph)));
   assert.deepEqual(executionOrder(graph, [clone.id]), [ids[0], ids[2]]);
 });
+
+
+test('canvas preserves explicit refinement and audio package fields/results through reload', () => {
+  const graph = { nodes: [createNode('generation', 0, 0, { kind: 'sdxl', refine: { enabled: true, width: 1536, height: 1536, steps: 12, denoise: .25, upscale_method: 'bilinear' } }), createNode('result', 500, 0, { outputs: [{ type: 'audio', url: '/api/media/test', filename: 'sample.wav' }] })], edges: [] };
+  const restored = parseGraph(serializeGraph(graph));
+  assert.deepEqual(restored.nodes[0].data.refine, graph.nodes[0].data.refine);
+  assert.equal(restored.nodes[1].data.outputs[0].type, 'audio');
+});

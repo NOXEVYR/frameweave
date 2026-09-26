@@ -17,7 +17,7 @@ from .workflows import _check_json_limits, _expanded_inputs, _spec
 
 FORMAT = "frameweave-workflow"
 MAX_BYTES = 2 * 1024 * 1024
-TYPES = {"text", "integer", "number", "boolean", "select", "image"}
+TYPES = {"text", "integer", "number", "boolean", "select", "image", "audio"}
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 RESERVED = {"__proto__", "prototype", "constructor"}
 MODEL_INPUTS = {"ckpt_name", "unet_name", "clip_name", "vae_name", "lora_name", "clip_name1", "clip_name2"}
@@ -151,12 +151,12 @@ def scalar(value):
 
 def validate_value(field, value, *, template=False):
     kind, label = field["type"], field["label"]
-    if kind in {"text", "image"}:
-        if not isinstance(value, str) or len(value) > (1024 if kind == "image" else 64000):
+    if kind in {"text", "image", "audio"}:
+        if not isinstance(value, str) or len(value) > (1024 if kind in {"image", "audio"} else 64000):
             raise ValueError(f"{label} 的文本类型或长度无效")
         if not value.strip() and field.get("required") and not template:
             raise ValueError(f"请填写 {label}")
-        if kind == "image" and value:
+        if kind in {"image", "audio"} and value:
             safe_relative(value)
     elif kind == "boolean":
         if type(value) is not bool:
@@ -195,7 +195,7 @@ def normalize_fields(fields, prompt):
             raise ValueError("工作流包不支持此参数类型")
         field = {"id": field_id, "label": text(item.get("label"), "参数名称", 120),
                  "node_id": node_id, "input": name, "type": kind,
-                 "required": item.get("required", kind == "image") is True}
+                 "required": item.get("required", kind in {"image", "audio"}) is True}
         if kind == "select":
             options = item.get("options")
             if not isinstance(options, list) or not 1 <= len(options) <= 512 or any(not scalar(v) or (isinstance(v, str) and len(v) > 2048) for v in options):
@@ -211,7 +211,7 @@ def normalize_fields(fields, prompt):
             if field.get("min", -math.inf) > field.get("max", math.inf):
                 raise ValueError("数值下限不能大于上限")
         default = item.get("default", prompt[node_id]["inputs"][name])
-        if kind == "image":
+        if kind in {"image", "audio"}:
             default, field["required"] = "", True
             prompt[node_id]["inputs"][name] = ""
         field["default"] = validate_value(field, default, template=True)
@@ -233,6 +233,9 @@ def normalize_document(document):
         if node["class_type"] in {"LoadImage", "LoadImageMask"} and "image" in node["inputs"]:
             if not any(field["node_id"] == node_id and field["input"] == "image" and field["type"] == "image" for field in fields):
                 raise ValueError("参考图节点必须开放图片上传参数，才能在其他设备上使用工作流包")
+        if node["class_type"] == "LoadAudio" and "audio" in node["inputs"]:
+            if not any(field["node_id"] == node_id and field["input"] == "audio" and field["type"] == "audio" for field in fields):
+                raise ValueError("参考音频节点必须开放音频上传参数，才能在其他设备上使用工作流包")
     result = {"format": FORMAT, "version": 1, "name": text(document.get("name"), "工作流包名称", 120),
               "description": text(document.get("description", ""), "说明", 2000, empty=True),
               "prompt": prompt, "fields": fields}
@@ -273,10 +276,13 @@ def inspect_document(document, info=None):
             if node["class_type"] in {"LoadImage", "LoadImageMask"} and name == "image":
                 kind, value = "image", ""
                 prompt[node_id]["inputs"][name] = ""
+            if meta.get("audio_upload") or (name == "audio" and (node["class_type"] == "LoadAudio" or "AUDIO" in schema.get("output", [])) and isinstance(value, str)):
+                kind, value = "audio", ""
+                prompt[node_id]["inputs"][name] = ""
             label = polarity.get(node_id, labels.get(name, name)) if name == "text" else labels.get(name, name)
             field = {"id": "f_" + hashlib.sha256((node_id + "\0" + name).encode()).hexdigest()[:16],
                      "label": f"{label} · {node_id}", "node_id": node_id, "input": name,
-                     "type": kind, "default": value, "required": kind == "image",
+                     "type": kind, "default": value, "required": kind in {"image", "audio"},
                      "recommended": name in labels and name not in MODEL_INPUTS}
             if kind == "select":
                 field["options"] = options

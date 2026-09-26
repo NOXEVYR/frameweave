@@ -5,7 +5,7 @@ export const NODE_TYPES = ['prompt', 'reference', 'generation', 'result'];
 export const KINDS = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'qwen21_t2i', 'qwen21_edit', 'api', 'package'];
 const copy = value => JSON.parse(JSON.stringify(value));
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
-const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image'];
+const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image', 'audio'];
 const RESERVED_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 const fieldId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value) && !RESERVED_FIELDS.has(value);
 
@@ -315,6 +315,11 @@ export function parseGraph(text) {
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
     if (node.type === 'generation') {
+      if (Object.hasOwn(node.data, 'refine')) {
+        const value = node.data.refine;
+        if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.enabled !== 'boolean') throw new Error('二次重绘参数无效');
+        data.refine = packageValues(value);
+      }
       if (Object.hasOwn(node.data, 'packageFields')) data.packageFields = packageFields(node.data.packageFields);
       if (!Number.isSafeInteger(data.seed) || data.seed < 0) throw new Error('随机种子必须是 0 到 9007199254740991 之间的整数');
       if (Object.hasOwn(node.data, 'loras')) data.loras = loraStack(node.data.loras, data.kind);
@@ -344,7 +349,7 @@ export function parseGraph(text) {
     }
     if (node.type === 'result') {
       if (!Array.isArray(data.outputs)) data.outputs = [];
-      data.outputs = data.outputs.filter(item => item && ['image', 'video'].includes(item.type) && typeof item.url === 'string').slice(0, 32);
+      data.outputs = data.outputs.filter(item => item && ['image', 'video', 'audio'].includes(item.type) && typeof item.url === 'string').slice(0, 32);
     }
     return { id: node.id, type: node.type, x: node.x, y: node.y, data };
   });

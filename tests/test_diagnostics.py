@@ -73,6 +73,18 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("PrivateProject", result["repair_prompt"])
         self.assertTrue(any(row["status"] == "error" for row in result["checks"]))
 
+    def test_missing_real_model_file_is_exactly_reported_without_path_leak(self):
+        model_name = "checkpoints/not-present.safetensors"
+        info = fixture()
+        info["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"] = [[model_name]]
+        result = diagnose({"model_roots": [str(self.root / "missing-root")]}, info,
+                          {"online": True, "system": {"comfyui_version": "0.35.1"}},
+                          {"kind": "sdxl", "models": {"checkpoint": model_name}}, catalog(info))
+        missing = next(row for row in result["checks"] if row["id"].startswith("root."))
+        self.assertEqual(missing["status"], "missing")
+        self.assertNotIn(str(self.root), result["repair_prompt"])
+        self.assertEqual(result["schema_evidence"]["backend_version"], "0.35.1")
+
     def test_ref_mode_checks_reference_node_instead_of_first_last_node(self):
         info = {name: {} for name in ("UNETLoader", "CLIPLoader", "VAELoader", "MiniMaxH3ImageToVideo", "SaveVideo")}
         result = diagnose({}, info, {"online": True}, {"kind": "h3_ref"}, {})
@@ -205,7 +217,29 @@ class DiagnosticsTests(unittest.TestCase):
         result = self.diagnose({"kind": "krea"}, info=info)
         self.assertEqual(next(row for row in result["checks"] if row["id"] == "schema.clip_type")["status"], "missing")
         result = self.diagnose({"kind": "h3_t2v", "fps": 30})
-        self.assertEqual(next(row for row in result["checks"] if row["id"] == "workflow.schema")["status"], "error")
+        issue = next(row for row in result["checks"] if row["id"] == "workflow.schema")
+        self.assertEqual(issue["status"], "error")
+        self.assertIn("fps", issue["detail"])
+        self.assertIn("MiniMaxH3ImageToVideo", issue["detail"])
+
+    def test_new_schema_interface_candidate_is_evidenced_but_never_substituted(self):
+        info = {"NewSchemaNode": {"input": {"required": {"count": ["INT", {"min": 1, "max": 10}]},
+                                              "optional": {"mode": [["fast", "quality"], {}]}},
+                                  "output": ["INT"]},
+                "Consumer": {"input": {"required": {"value": ["INT"]}}, "output": ["STRING"]}}
+        graph = {"private-node-id": {"class_type": "OldPluginNode", "inputs": {"count": 3, "mode": "fast"}},
+                 "consumer-id": {"class_type": "Consumer", "inputs": {"value": ["private-node-id", 0]}}}
+        status = {"online": True, "system": {"comfyui_version": "0.36.0"}}
+        result = diagnose({}, info, status, {"kind": "api", "prompt": graph}, catalog(info))
+        self.assertEqual(result["schema_evidence"]["backend_version"], "0.36.0")
+        candidate = next(item for item in result["alternatives"] if item["node_index"] == 1)
+        self.assertEqual(candidate["candidates"], ["NewSchemaNode"])
+        self.assertTrue(candidate["interface_compatible"])
+        self.assertEqual(candidate["semantic_compatibility"], "unknown")
+        self.assertFalse(candidate["auto_substitute"])
+        self.assertIn("count", str(result["schema_evidence"]))
+        self.assertNotIn("private-node-id", result["repair_prompt"])
+        self.assertIn("语义未知", result["repair_prompt"])
 
     def test_unknown_runtime_does_not_falsely_report_missing_torch_or_cuda(self):
         result = diagnose({}, fixture(), {"online": True}, {"kind": "sdxl"}, catalog(fixture()))

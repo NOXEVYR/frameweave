@@ -29,9 +29,105 @@ def _filenames(info, node, field):
     return [x for x in _options(info.get(node, {}), field) if isinstance(x, str)]
 
 
+def _input_fields(schema):
+    result = {}
+    if not isinstance(schema, dict):
+        return result
+    inputs = schema.get("input", {})
+    if not isinstance(inputs, dict):
+        return result
+    for group in ("required", "optional"):
+        values = inputs.get(group, {})
+        if isinstance(values, dict):
+            result.update(values)
+    return result
+
+
+def _sdxl_clip_options(object_info):
+    schema = object_info.get("DualCLIPLoader", {})
+    fields = _input_fields(schema)
+    missing = []
+    for field in ("clip_name1", "clip_name2", "type"):
+        if field not in fields:
+            missing.append(f"DualCLIPLoader.{field}")
+    types = _options(schema, "type")
+    if "sdxl" not in types:
+        missing.append("DualCLIPLoader.type=sdxl")
+    if "CLIP" not in schema.get("output", []):
+        missing.append("DualCLIPLoader.output:CLIP")
+    clip_name1 = _filenames(object_info, "DualCLIPLoader", "clip_name1")
+    clip_name2 = _filenames(object_info, "DualCLIPLoader", "clip_name2")
+    if not clip_name1:
+        missing.append("DualCLIPLoader.clip_name1.options")
+    if not clip_name2:
+        missing.append("DualCLIPLoader.clip_name2.options")
+    return {"available": not missing, "types": types,
+            "clip_name1": clip_name1, "clip_name2": clip_name2,
+            **({"reason": "缺少兼容的 SDXL 双编码器加载器：" + ", ".join(missing)} if missing else {})}
+
+
+def _refine_capability(object_info):
+    specs = {
+        "LatentUpscale": ({"samples": "LATENT", "width": "INT", "height": "INT",
+                           "upscale_method": "COMBO", "crop": "COMBO"}, "LATENT"),
+        "KSampler": ({"model": "MODEL", "seed": "INT", "steps": "INT", "cfg": "FLOAT",
+                      "sampler_name": "COMBO", "scheduler": "COMBO", "positive": "CONDITIONING",
+                      "negative": "CONDITIONING", "latent_image": "LATENT", "denoise": "FLOAT"}, "LATENT"),
+        "VAEDecode": ({"samples": "LATENT", "vae": "VAE"}, "IMAGE"),
+        "SaveImage": ({"images": "IMAGE"}, None),
+    }
+    missing = []
+    for node, (required, output_type) in specs.items():
+        schema = object_info.get(node)
+        if not isinstance(schema, dict):
+            missing.append(node)
+            continue
+        fields = _input_fields(schema)
+        missing.extend(f"{node}.{field}" for field in sorted(required.keys() - fields.keys()))
+        for field, expected in required.items():
+            if field not in fields:
+                continue
+            try:
+                kind, meta = _spec(fields[field])
+                actual = _type_names(kind)
+                if kind == "COMFY_MATCHTYPE_V3":
+                    actual = _type_names(meta.get("template", {}).get("allowed_types", "*"))
+                supported = (bool(actual & {"COMBO", "COMFY_DYNAMICCOMBO_V3"}) if expected == "COMBO"
+                             else expected in actual or "*" in actual)
+            except (TypeError, ValueError):
+                supported = False
+            if not supported:
+                missing.append(f"{node}.{field}:{expected}")
+        if output_type and output_type not in schema.get("output", []):
+            missing.append(f"{node}.output:{output_type}")
+    upscale = object_info.get("LatentUpscale", {})
+    methods = _options(upscale, "upscale_method")
+    crops = _options(upscale, "crop")
+    if not methods:
+        missing.append("LatentUpscale.upscale_method.options")
+    if not crops:
+        missing.append("LatentUpscale.crop.options")
+    save = object_info.get("SaveImage", {})
+    if save and save.get("output_node") is not True:
+        missing.append("SaveImage.output_node")
+    return {"available": not missing, "missing": sorted(set(missing)),
+            "upscale_methods": methods, "crop_options": crops}
+
+
 def _known_family(filename, role):
     name = filename.replace("\\", "/").lower()
     base = name.rsplit("/", 1)[-1]
+    if role in {"sdxl_clip_l", "sdxl_clip_g"}:
+        if "clip_l" in base:
+            return "sdxl_clip_l"
+        if "clip_g" in base:
+            return "sdxl_clip_g"
+        if re.search(r"qwen[-_]?3[-_]?vl[-_]?8b", base):
+            return "qwen21"
+        if re.search(r"qwen[-_]?3[-_]?vl[-_]?4b", base):
+            return "krea"
+        if "minimax_h3" in name:
+            return "h3"
     if "minimax_h3" in name or "/minimaxh3/" in name:
         return "h3"
     if role in {"dit", "vae", "lora"} and re.search(r"qwen[-_]?image[-_]?2[._]1", base):
@@ -66,7 +162,8 @@ def _known_family(filename, role):
 
 def _check_family(filename, role, kind):
     known = _known_family(filename, role)
-    expected = ("h3" if kind.startswith("h3_") else "sdxl" if kind == "sdxl_i2i"
+    expected = (role if role in {"sdxl_clip_l", "sdxl_clip_g"} else
+                "h3" if kind.startswith("h3_") else "sdxl" if kind in {"sdxl", "sdxl_i2i"}
                 else "qwen21" if kind in {"qwen21_t2i", "qwen21_edit"} else kind)
     compatible = {expected}
     if kind == "krea" and role == "vae":
@@ -86,6 +183,8 @@ def catalog(object_info: dict) -> dict:
         "checkpoint": _filenames(info, "CheckpointLoaderSimple", "ckpt_name"),
         "dit": _filenames(info, "UNETLoader", "unet_name"),
         "text_encoder": _filenames(info, "CLIPLoader", "clip_name"),
+        "sdxl_clip_l": _filenames(info, "DualCLIPLoader", "clip_name1"),
+        "sdxl_clip_g": _filenames(info, "DualCLIPLoader", "clip_name2"),
         "vae": _filenames(info, "VAELoader", "vae_name"),
         "lora": [name for node in ("LoraLoader", "LoraLoaderModelOnly", "LoraLoaderBypassModelOnly")
                  for name in _filenames(info, node, "lora_name")],
@@ -94,6 +193,8 @@ def catalog(object_info: dict) -> dict:
         "checkpoint": {"checkpoint", "checkpoints"},
         "dit": {"diffusion", "diffusion_models", "unet"},
         "text_encoder": {"textencoder", "text_encoders", "clip"},
+        "sdxl_clip_l": {"textencoder", "text_encoders", "clip"},
+        "sdxl_clip_g": {"textencoder", "text_encoders", "clip"},
         "vae": {"vae"},
         "lora": {"lora", "loras"},
     }
@@ -104,14 +205,18 @@ def catalog(object_info: dict) -> dict:
         folders = set(parts[:-1])
         if folders & {"embeddings", "embedding", "clip_vision", "controlnet", "upscale_models", "background_removal"}:
             return False
+        base = parts[-1]
+        if role == "sdxl_clip_l" and "clip_g" in base:
+            return False
+        if role == "sdxl_clip_g" and "clip_l" in base:
+            return False
         found = folders & known_folders
         if found:
             return bool(found & folder_roles[role])
-        base = parts[-1]
         if "vae" in base or base in {"ae.safetensors", "taesd", "taesdxl"}:
             return role == "vae"
         if any(token in base for token in ("qwen3vl", "text_encoder", "t5xxl", "umt5", "clip_l", "clip_g")):
-            return role == "text_encoder"
+            return role in {"text_encoder", "sdxl_clip_l", "sdxl_clip_g"}
         if any(token in base for token in ("lora", "turbo_4step", "turbo_8step")):
             return role == "lora"
         if any(token in base for token in ("minimax_h3_fl2va", "minimax_h3_ref2va", "krea2", "flux1", "flux2", "wan2")):
@@ -156,6 +261,8 @@ def generation_options(object_info: dict) -> dict:
     result = {"samplers": _options(object_info.get("KSampler", {}), "sampler_name"),
               "schedulers": _options(object_info.get("KSampler", {}), "scheduler"),
               "lora_loaders": {}, "model_families": {}}
+    result["sdxl_clip"] = _sdxl_clip_options(object_info)
+    result["refine"] = _refine_capability(object_info)
     for node in ("LoraLoader", "LoraLoaderModelOnly", "LoraLoaderBypassModelOnly"):
         if node not in object_info:
             continue
@@ -456,6 +563,42 @@ def _model(models, role, available, tokens=(), preferred=()):
         "pruned" in name.lower(), "library/" not in name.replace("\\", "/").lower(), len(name), name.lower()))
 
 
+def _normalize_refine(request, kind, object_info, width, height, steps):
+    if "refine" not in request:
+        return None
+    value = request["refine"]
+    if not isinstance(value, dict):
+        raise ValueError("refine 必须为对象")
+    allowed = {"enabled", "width", "height", "steps", "denoise", "upscale_method"}
+    if set(value) - allowed:
+        raise ValueError("refine 只支持 enabled、width、height、steps、denoise、upscale_method")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("refine.enabled 必须为布尔值")
+    if not enabled:
+        return None
+    if kind not in {"sdxl", "sdxl_i2i"}:
+        raise ValueError("二次重绘目前只支持 SDXL 文生图和图生图")
+    capability = _refine_capability(object_info)
+    if not capability["available"]:
+        raise ValueError("当前后端缺少高清二次重绘所需节点或字段：" + ", ".join(capability["missing"]))
+    refine_width = _number(value, "width", min(width * 2, 8192), 32, 8192, True)
+    refine_height = _number(value, "height", min(height * 2, 8192), 32, 8192, True)
+    if refine_width % 8 or refine_height % 8:
+        raise ValueError("二次重绘宽高必须为 8 的倍数")
+    refine_steps = _number(value, "steps", min(steps, 20), 1, 1000, True)
+    refine_denoise = _number(value, "denoise", 0.3, 0, 1)
+    methods = capability["upscale_methods"]
+    method = value.get("upscale_method", "bislerp" if "bislerp" in methods else methods[0])
+    if not isinstance(method, str) or method not in methods:
+        raise ValueError("refine.upscale_method 不在当前后端支持列表中")
+    crops = capability["crop_options"]
+    crop = "disabled" if "disabled" in crops else crops[0]
+    return {"enabled": True, "width": refine_width, "height": refine_height,
+            "steps": refine_steps, "denoise": refine_denoise,
+            "upscale_method": method, "crop": crop}
+
+
 def compile_workflow(request: dict, object_info: dict) -> dict:
     if not isinstance(request, dict) or not isinstance(object_info, dict):
         raise ValueError("请求和节点能力必须是对象")
@@ -480,10 +623,15 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
     models = request.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models 必须是模型角色对象")
-    if qwen21 and any(role not in {"dit", "text_encoder", "vae", "lora"} for role in models):
-        raise ValueError("Qwen Image 2.1 models 只支持 dit、text_encoder、vae 和 model-only LoRA")
     h3 = kind.startswith("h3_")
     sdxl = kind in {"sdxl", "sdxl_i2i"}
+    external_clip_roles = {"sdxl_clip_l", "sdxl_clip_g"}
+    if not sdxl and any(role in models for role in external_clip_roles):
+        raise ValueError("外置 SDXL CLIP 只支持 SDXL 文生图和图生图")
+    if sdxl and ({"clip_l", "clip_g", "text_encoder"} & models.keys()):
+        raise ValueError("SDXL 外置编码器请使用 models.sdxl_clip_l 与 models.sdxl_clip_g 成对选择")
+    if qwen21 and any(role not in {"dit", "text_encoder", "vae", "lora"} for role in models):
+        raise ValueError("Qwen Image 2.1 models 只支持 dit、text_encoder、vae 和 model-only LoRA")
     width = _number(request, "width", 736 if h3 else 1024, 32, 8192, True)
     height = _number(request, "height", 416 if h3 else 1024, 32, 8192, True)
     alignment = 32 if h3 or qwen21 else 16 if kind == "krea" else 8
@@ -546,6 +694,9 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         raise ValueError("SDXL 图生图必须提供一张输入图")
     if sdxl and len(refs) > 1:
         raise ValueError("SDXL 图生图只使用一张输入图")
+    refine = _normalize_refine(request, kind, object_info, width, height, steps)
+    if refine:
+        summary["refine"] = {key: value for key, value in refine.items() if key != "crop"}
 
     if sdxl:
         checkpoint = _model(models, "checkpoint", available, ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"))
@@ -553,6 +704,20 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         summary["models"]["checkpoint"] = checkpoint
         model = graph.add("CheckpointLoaderSimple", ckpt_name=checkpoint)
         clip, vae = [model[0], 1], [model[0], 2]
+        clip_l = models.get("sdxl_clip_l")
+        clip_g = models.get("sdxl_clip_g")
+        if bool(clip_l) != bool(clip_g):
+            raise ValueError("SDXL 外置 CLIP-L 和 CLIP-G 必须成对选择")
+        if clip_l and clip_g:
+            clip_capability = _sdxl_clip_options(object_info)
+            if not clip_capability["available"]:
+                raise ValueError(clip_capability["reason"])
+            clip_l = _model(models, "sdxl_clip_l", available)
+            clip_g = _model(models, "sdxl_clip_g", available)
+            _check_family(clip_l, "sdxl_clip_l", kind)
+            _check_family(clip_g, "sdxl_clip_g", kind)
+            clip = graph.add("DualCLIPLoader", clip_name1=clip_l, clip_name2=clip_g, type="sdxl")
+            summary["models"].update(sdxl_clip_l=clip_l, sdxl_clip_g=clip_g)
         if models.get("vae"):
             vae_name = _model(models, "vae", available)
             _check_family(vae_name, "vae", kind)
@@ -740,6 +905,15 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         sampled = graph.add("KSampler", model=model, seed=seed, steps=steps, cfg=cfg,
                             sampler_name=sampler, scheduler=scheduler, positive=conditioning,
                             negative=negative_conditioning, latent_image=latent, denoise=denoise)
+        if refine:
+            upscaled = graph.add("LatentUpscale", samples=sampled, upscale_method=refine["upscale_method"],
+                                 width=refine["width"], height=refine["height"], crop=refine["crop"])
+            sampled = graph.add("KSampler", model=model, seed=seed, steps=refine["steps"], cfg=cfg,
+                                sampler_name=sampler, scheduler=scheduler, positive=conditioning,
+                                negative=negative_conditioning, latent_image=upscaled,
+                                denoise=refine["denoise"])
+            if refine["width"] * refine["height"] > 1024 * 1024:
+                warnings.append("二次重绘超过约百万像素，显存与耗时会明显增加；实际可运行性取决于所选模型和后端。")
         decoded = graph.add("VAEDecode", samples=sampled, vae=vae)
         graph.add("SaveImage", images=decoded, filename_prefix="FrameWeave/image")
     validate_prompt(graph.nodes, object_info)

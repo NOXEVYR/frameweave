@@ -7,6 +7,7 @@ import { filterJobs, filterPackages } from './library.mjs';
 import { placeFragment } from './canvas-layout.mjs';
 import { selectionBounds, copySelection, pasteSelection, moveSelection, arrangeSelection, clampMenuPosition } from './canvas-actions.mjs';
 import { createGenerationStudio } from './generation-studio.mjs';
+import { createWorkspaceTools } from './workspace-tools.mjs';
 import { createWorkflowCanvas } from './workflow-canvas.mjs';
 
 const $ = selector => document.querySelector(selector);
@@ -173,7 +174,7 @@ function save(immediate = false) {
       localStorage.setItem(STORAGE_KEY, serializeGraph(graph, viewport));
       localStorage.setItem(JOB_MAP_KEY, JSON.stringify(jobNodes));
       localStorage.setItem(TITLE_STORAGE_KEY, projectTitle);
-      $('#save-state').textContent = '已保存到本机';
+      $('#save-state').textContent = '浏览器草稿已保存';
     } catch { $('#save-state').textContent = '存储已满，请导出'; }
   };
   if (immediate) write(); else saveTimer = setTimeout(write, 500);
@@ -340,12 +341,12 @@ function clearAiConnection() { $('#mcpUrl').value = ''; $('#mcpConfig').textCont
 function outputMedia(output, className, controls = false) {
   const url = mediaURL(output.url);
   if (!url) return el('div', 'media-error', '此媒体地址不可用。请从本地任务重新载入。');
-  const media = el(output.type === 'video' ? 'video' : 'img', className);
+  const media = el(['video', 'audio'].includes(output.type) ? output.type : 'img', className);
   media.src = url;
-  if (output.type === 'video') { media.controls = controls; media.preload = 'metadata'; media.playsInline = true; }
+  if (['video', 'audio'].includes(output.type)) { media.controls = controls || output.type === 'audio'; media.preload = 'metadata'; media.playsInline = true; }
   else { media.alt = output.filename || '本地生成结果'; media.loading = 'lazy'; }
   media.addEventListener('error', () => { if (media.isConnected && media.hasAttribute('src')) media.replaceWith(el('div', 'media-error', '媒体文件不可用。导入的画布不包含原始媒体，请重新导入素材或检查本地输出。')); }, { once: true });
-  if (!controls) media.addEventListener('click', event => { event.stopPropagation(); preview(output); });
+  if (!controls && output.type !== 'audio') media.addEventListener('click', event => { event.stopPropagation(); preview(output); });
   return media;
 }
 function releaseMedia(root) {
@@ -583,14 +584,15 @@ function renderPackageInputs(wrap, node) {
       control.append(input, el('span', '', label));
     } else if (type === 'select') {
       control = field(label, String((definition.options || []).findIndex(option => Object.is(option, value))), selectedIndex => change(definition.options[Number(selectedIndex)]), { select: (definition.options || []).map((option, index) => ({ value: String(index), label: String(option) })) });
-    } else if (type === 'image') {
-      control = field(label, value, change, { help: '上传 PNG / JPG / WebP，或使用后端已有的相对文件名。' });
-      const input = el('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.hidden = true;
-      const upload = button('选择本地参考图', 'button quiet compact', () => input.click());
+    } else if (type === 'image' || type === 'audio') {
+      control = field(label, value, change, { help: type === 'audio' ? '上传 WAV / MP3 / FLAC / OGG，最大 20 MiB。' : '上传 PNG / JPG / WebP，或使用后端已有的相对文件名。' });
+      const input = el('input'); input.type = 'file'; input.accept = type === 'audio' ? '.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp'; input.hidden = true;
+      const upload = button(type === 'audio' ? '选择参考音频' : '选择本地参考图', 'button quiet compact', () => input.click());
       input.addEventListener('change', () => {
         const file = input.files?.[0]; input.value = ''; if (!file) return;
         upload.disabled = true;
-        uploadImage(file).then(uploaded => {
+        const operation = type === 'audio' ? (async () => { if (file.size > 20 * 1024 * 1024) throw new Error('参考音频最大 20 MiB'); const bytes = new Uint8Array(await file.arrayBuffer()); let raw = ''; for (let i = 0; i < bytes.length; i += 8192) raw += String.fromCharCode(...bytes.subarray(i, i + 8192)); return api('/api/upload-audio', { data: btoa(raw) }); })() : uploadImage(file);
+        operation.then(uploaded => {
           if (!getNode(node.id)) return;
           change(uploaded.name); renderInspector(); toast('参考图已保存到本地推理服务');
         }).catch(reportError).finally(() => { upload.disabled = false; });
@@ -683,13 +685,13 @@ function renderPackageDraft() {
   $('#package-field-count').textContent = `${packageDraft.fields.filter(item => item.selected).length} / ${packageDraft.fields.length} 个输入`;
   for (const item of packageDraft.fields) {
     const row = el('div', `package-field-row${item.selected ? ' included' : ''}`);
-    const select = el('input'); select.type = 'checkbox'; select.checked = item.selected; select.disabled = fieldType(item) === 'image'; select.setAttribute('aria-label', `暴露 ${item.label || item.input}`);
+    const select = el('input'); select.type = 'checkbox'; select.checked = item.selected; select.disabled = ['image', 'audio'].includes(fieldType(item)); select.setAttribute('aria-label', `暴露 ${item.label || item.input}`);
     if (select.disabled) select.title = '图像输入必须开放，使用者运行时需上传自己的参考图';
     select.addEventListener('change', () => { item.selected = select.checked; row.classList.toggle('included', item.selected); $('#package-field-count').textContent = `${packageDraft.fields.filter(field => field.selected).length} / ${packageDraft.fields.length} 个输入`; });
     const body = el('div', 'package-field-body');
     const input = el('input'); input.type = 'text'; input.maxLength = 100; input.value = item.label; input.setAttribute('aria-label', `输入名称 ${item.node_id}.${item.input}`); input.addEventListener('change', () => { item.label = input.value.trim() || item.input; input.value = item.label; });
     body.append(input, el('span', 'package-mapping', `节点 ${item.node_id} → ${item.input} · ${fieldType(item)}${item.recommended ? ' · 推荐' : ''}`));
-    const preview = item.type === 'image' ? '运行时选择参考图' : item.default === undefined ? '没有默认值' : String(item.default).slice(0, 120);
+    const preview = ['image', 'audio'].includes(item.type) ? '运行时选择参考媒体' : item.default === undefined ? '没有默认值' : String(item.default).slice(0, 120);
     body.append(el('span', 'field-help package-default', `默认：${preview}`)); row.append(select, body); list.append(row);
   }
   if (!packageDraft.fields.length) list.append(el('p', 'model-note', '没有可暴露的基础输入。仍可保存为使用固定参数的工作流包。'));
@@ -697,7 +699,7 @@ function renderPackageDraft() {
 async function inspectPackageDocument(document, name = '', sourceJSON = '') {
   const result = await api('/api/packages/inspect', sourceJSON ? { source_json: sourceJSON } : { document });
   if (!result.prompt || !Array.isArray(result.fields)) throw new Error('本地服务未返回有效的工作流输入定义');
-  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: fieldType(item) === 'image' || document.format === 'frameweave-workflow' || item.recommended !== false })) };
+  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: ['image', 'audio'].includes(fieldType(item)) || document.format === 'frameweave-workflow' || item.recommended !== false })) };
   $('#package-name').value = name || result.name || '新建工作流包'; $('#package-description').value = result.description || '';
   if (sourceJSON && document.format === 'frameweave-workflow') {
     packageDraft.sourceJSON = sourceJSON;
@@ -1079,6 +1081,7 @@ async function useBackend(url) {
   if ($('#diagnostics-dialog').open) await runDiagnostics(getNode(diagnosticNodeId) || selectedGeneration());
 }
 function openSettings(modelRoots = null) {
+  workspaceTools.refreshSettings();
   $('#auto-update').checked = Boolean(settings.auto_update);
   updateCenter.refresh();
   $('#engine-autostart').checked = Boolean(settings.auto_start_engine);
@@ -1096,13 +1099,20 @@ function renderEnvironment() {
   $('#environment-status').textContent = `发现 ${online.length} 个可用服务 · ${(environment.installations || []).length} 个安装目录 · ${Math.round(Number(environment.elapsed_ms) || 0)} ms${environment.scanned_at ? ` · ${String(environment.scanned_at).replace('T', ' ').slice(0, 19)}` : ''}`;
   $('#discovery-banner').hidden = engine.online || !alternatives.length;
   if (!engine.online && alternatives.length) $('#discovery-message').textContent = `自动发现 ${alternatives.length} 个可用本地引擎，当前地址尚未连接`;
+  const probes = el('details', 'environment-probes');
+  probes.append(el('summary', '', '其他常用端口的探测结果 · 未启用不代表环境缺失'));
   for (const candidate of environment.candidates || []) {
-    const row = el('div', `environment-card${candidate.online ? ' available' : ''}`);
-    const body = el('div', 'environment-card-body'); body.append(el('strong', '', candidate.online ? '可用推理服务' : '暂未连接'), el('span', 'inline-code', candidate.url), el('span', 'field-help', [candidate.source, candidate.version ? `ComfyUI ${candidate.version}` : ''].filter(Boolean).join(' · ')));
     const active = candidate.url === settings.backend_url;
+    const optional = !active && !candidate.online && candidate.classification === 'probe_only';
+    const title = candidate.online ? active ? '当前生成引擎 · 已连接' : '其他可用推理引擎' : optional ? '备用探测端口 · 未发现服务' : active ? '当前生成引擎 · 连接失败' : '发现的引擎 · 暂不可访问';
+    const row = el('div', `environment-card${candidate.online ? ' available' : ''}`), body = el('div', 'environment-card-body');
+    body.append(el('strong', '', title), el('span', 'inline-code', candidate.url), el('span', 'field-help', [candidate.source, candidate.version ? `ComfyUI ${candidate.version}` : ''].filter(Boolean).join(' · ')));
+    if (!candidate.online) body.append(el('span', 'field-help', candidate.detail || ({refused:'此地址没有服务接受连接，请检查引擎是否启动与端口是否一致。',timeout:'服务响应超时，请查看引擎日志及启动状态。',non_comfy:'端口有响应，但不是可确认的 ComfyUI 接口。',identity_unknown:'端口有响应，尚不能确认服务身份。'}[candidate.offline_reason] || '此端口没有返回可确认的推理服务。')));
+    if (optional) body.append(el('span', 'field-help', '仅用于自动发现；当前引擎可用时，无需安装或启动此端口。'));
     const action = button(active ? '当前地址' : '使用此后端', 'button quiet compact', () => useBackend(candidate.url)); action.disabled = active || !candidate.online || hasActiveJobs();
-    if (hasActiveJobs() && !active) action.title = '有活动任务，完成或取消后可切换'; row.append(body, action); target.append(row);
+    if (hasActiveJobs() && !active) action.title = '有活动任务，完成或取消后可切换'; row.append(body); if (!optional) row.append(action); (optional ? probes : target).append(row);
   }
+  if (probes.children.length > 1) target.append(probes);
   for (const installation of environment.installations || []) {
     const row = el('div', 'environment-card');
     const body = el('div', 'environment-card-body'); body.append(el('strong', '', installation.source || '本地安装'), el('span', 'inline-code path-text', installation.root));
@@ -1137,9 +1147,9 @@ async function runDiagnostics(node = selectedGeneration(), scan = false) {
   $('#diagnostic-summary').textContent = `正在检查${node ? `「${node.data.title}」的` : ''}节点、模型与输入…`;
   $('#diagnostic-refresh').disabled = true; workflowChecks = []; workflowRepair = ''; renderDiagnosticChecks();
   try {
-    const payload = node ? generationPayload(graph, node.id) : { kind: 'h3_t2v' };
+    const payload = !canvasIsActive() ? studio.diagnosticsRequest?.() : node ? generationPayload(graph, node.id) : null;
     const discovery = scan || !environment ? scanEnvironment() : Promise.resolve(environment);
-    const [inspection, discoveryResult] = await Promise.allSettled([api('/api/diagnostics', payload), discovery]);
+    const [inspection, discoveryResult] = await Promise.allSettled([payload ? api('/api/diagnostics', payload) : Promise.resolve({ checks: [], summary: '已检查本地服务与硬件。选择生成方式或工作流后，可继续检查对应的节点、模型和输入。', repair_prompt: '' }), discovery]);
     if (inspection.status === 'rejected') throw inspection.reason;
     const result = inspection.value;
     workflowChecks = Array.isArray(result.checks) ? result.checks : []; workflowRepair = result.repair_prompt || '';
@@ -1461,7 +1471,7 @@ document.addEventListener('keydown', event => {
   else if (command && event.key.toLowerCase() === 'd') { event.preventDefault(); try { duplicateSelection(); } catch (error) { reportError(error); } }
   else if (command && event.key.toLowerCase() === 'c') { event.preventDefault(); copyCanvasSelection(); }
   else if (command && event.key.toLowerCase() === 'v') { event.preventDefault(); try { pasteCanvasSelection(); } catch (error) { reportError(error); } }
-  else if (command && event.key.toLowerCase() === 's') { event.preventDefault(); exportProject(); }
+  else if (command && event.key.toLowerCase() === 's') { event.preventDefault(); workspaceTools.openCanvases().catch(reportError); }
   else if (command && event.key.toLowerCase() === 'a') { event.preventDefault(); selected = new Set(graph.nodes.map(node => node.id)); renderSelection(); renderInspector(); }
   else if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); deleteSelection(); }
   else if (event.key === 'F2') { event.preventDefault(); renameCanvasSelection(); }
@@ -1510,7 +1520,7 @@ bind('#export-diagnostics', () => { downloadJSON(publicChecksReport(diagnosticCh
 bind('#settings-button', () => openSettings());
 bind('#packages-button', openPackages); bind('#import-package', () => $('#package-input').click()); bind('#refresh-packages', loadPackages);
 bind('#package-current-node', packageCurrentNode);
-bind('#package-select-recommended', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = fieldType(item) === 'image' || item.recommended !== false; }); renderPackageDraft(); } });
+bind('#package-select-recommended', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = ['image', 'audio'].includes(fieldType(item)) || item.recommended !== false; }); renderPackageDraft(); } });
 bind('#package-select-all', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = true; }); renderPackageDraft(); } });
 $('#package-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
@@ -1533,7 +1543,7 @@ $('#package-editor-form').addEventListener('submit', event => {
 $('#settings-form').addEventListener('submit', event => {
   event.preventDefault();
   (async () => {
-    const next = { auto_update: $('#auto-update').checked, auto_start_engine: $('#engine-autostart').checked, backend_url: $('#backend-url').value.trim(), model_roots: $('#model-roots').value.split('\n').map(line => line.trim()).filter(Boolean), comfy_roots: $('#comfy-roots').value.split('\n').map(line => line.trim()).filter(Boolean) };
+    const next = { performance_profile: $('#performance-profile').value, auto_update: $('#auto-update').checked, auto_start_engine: $('#engine-autostart').checked, backend_url: $('#backend-url').value.trim(), model_roots: $('#model-roots').value.split('\n').map(line => line.trim()).filter(Boolean), comfy_roots: $('#comfy-roots').value.split('\n').map(line => line.trim()).filter(Boolean) };
     await pollJobs(); if (next.backend_url !== settings.backend_url && hasActiveJobs()) throw new Error('有活动任务，完成或取消后才能切换推理服务。');
     const result = await api('/api/settings', next);
     settings = result.settings || next;
@@ -1599,10 +1609,12 @@ async function initialize() {
 const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { if (hasActiveJobs() || workflowCanvas.isRunning() || studio.hasPending()) throw new Error('请等待生成与画布调度完成，并查询待确认提交后再退出。'); save(true); } });
 const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
 initializeCanvasActions();
-studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText });
+studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
 workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError,
   connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });
 workflowCanvas.init();
+const workspaceTools = createWorkspaceTools({ api, workflow: () => workflowCanvas, title: () => projectTitle, setTitle: title => { setProjectTitle(title); save(true); }, jobs: () => jobs, settings: () => settings, refreshJobs: pollJobs, outputMedia, mediaURL, reuseJob, toast, reportError });
+workspaceTools.init();
 initialize();

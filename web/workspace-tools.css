@@ -1,0 +1,22 @@
+.modal.framed-modal { padding: 0; overflow: hidden; max-height: calc(100dvh - 32px); max-width: calc(100vw - 24px); }
+.modal.framed-modal[open], .modal.framed-modal > form { display: flex; flex-direction: column; min-height: 0; }
+.modal.framed-modal > form { overflow: hidden; }
+.framed-modal .modal-heading { flex: 0 0 auto; margin: 0; padding: 20px 26px; background: #fff; border-bottom: 1px solid #dbe2ec; z-index: 2; gap: 18px; }
+.framed-modal .modal-heading .close-button { flex-shrink: 0; min-width: 40px; min-height: 40px; }
+.framed-modal .modal-scroll { padding: 22px 26px; overflow: auto; min-height: 0; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.framed-modal .diagnostic-list, .framed-modal .package-field-list { max-height: none; overflow: visible; }
+.workspace-library-modal { width: 920px; }
+.workspace-library-row { display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #dbe2ec; }
+.workspace-library-row > div { min-width: 0; overflow-wrap: anywhere; }
+.workspace-library-row button { flex: 0 0 auto; }
+.workspace-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 20px; margin-top: 20px; }
+.workspace-result { min-width: 0; padding: 14px; border: 1px solid #dbe2ec; border-radius: 14px; overflow-wrap: anywhere; background: #f8fafc; }
+.workspace-result-media { width: 100%; max-height: 250px; object-fit: contain; display: block; margin-bottom: 12px; }
+audio.workspace-result-media { min-height: 54px; }
+.workspace-result .wrap-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.workspace-settings { padding: 0 0 20px; margin-bottom: 20px; border-bottom: 1px solid #dbe2ec; }
+.workspace-settings select { width: 100%; }
+.environment-probes { padding: 14px; border: 1px dashed #cbd5e1; border-radius: 12px; }
+.environment-probes summary { cursor: pointer; color: #566881; }
+.environment-probes .environment-card { margin-top: 12px; }
+@media (max-width: 780px) { .framed-modal .modal-heading, .framed-modal .modal-scroll { padding: 16px; } .top-actions { flex-wrap: wrap; } .project-actions { flex-wrap: wrap; } }

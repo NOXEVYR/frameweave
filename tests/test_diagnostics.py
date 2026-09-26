@@ -114,6 +114,8 @@ class DiagnosticsTests(unittest.TestCase):
                  {"kind": "krea"}, {"kind": "krea", "references": ["first.png"]},
                  {"kind": "krea", "references": ["first.png"], "denoise": .7, "negative": "blur"},
                  {"kind": "sdxl", "references": ["first.png"], "lora": "loras/turbo.safetensors"},
+                 {"kind": "sdxl_i2i", "references": ["first.png"], "denoise": .4,
+                  "loras": [{"name": "loras/turbo.safetensors", "strength_model": .5, "strength_clip": .2}]},
                  {"kind": "sdxl"}]
         for case in cases:
             with self.subTest(case=case):
@@ -123,6 +125,16 @@ class DiagnosticsTests(unittest.TestCase):
                 actual = {row["name"].removeprefix("节点 · ") for row in result["checks"] if row["category"] == "node"}
                 expected = {node["class_type"] for node in graph.values()}
                 self.assertEqual(actual, expected)
+
+    def test_i2i_missing_input_and_loader_specific_lora_are_not_ready(self):
+        result = self.diagnose({"kind": "sdxl_i2i"})
+        self.assertFalse(result["ready"])
+        self.assertEqual(next(row for row in result["checks"] if row["id"] == "input.references")["status"], "missing")
+        info = fixture()
+        info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0].append("loras/only_model.safetensors")
+        result = self.diagnose({"kind": "sdxl", "loras": [{"name": "loras/only_model.safetensors"}]}, info=info)
+        self.assertFalse(result["ready"])
+        self.assertTrue(any(row["id"].startswith("model.lora") and row["status"] == "missing" for row in result["checks"]))
 
     def test_h3_decode_fallback_requires_complete_native_decode_set(self):
         info = fixture()

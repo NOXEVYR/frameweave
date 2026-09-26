@@ -39,7 +39,15 @@
 
 AI 提交的任务与界面使用相同记录。打开 **生成队列 → 放入画布**可创建结果节点，或用**复用参数**创建可编辑生成节点。再次点击定位到已有节点，不会重新生成。MCP 不直接操作浏览器中的拖拽、框选和节点排版。
 
+0.7.0 的包分析与导入允许使用 `source_json` 原文字符串，与 `document` 对象二选一；导出返回该原文，供调用方无损保存。原文导出再导入可保留包身份，避免 JSON 数值重序列化改变内容 ID。仍按 2 MiB 和现有结构规则验证，不执行脚本。
+
+画布组合调度在客户端完成，MCP 仍为以上 14 个工具。供本机程序调用的 `POST /api/jobs/{job_id}/image-input` 接收 `{ "output_index": 0 }`（仅图片输出的零起始索引），使用当前启动的 `X-FW-Token`。它只接受本客户端在同一后端完成并登记的图片，验证媒体后上传到后端输入目录；返回 `name` 可填入下游包的图片字段。此接口不提交生成，不接受任意文件路径或 URL，单张最大 20 MiB。
+
 ## 去重与故障
+
+0.6.0 新增原生 `kind=sdxl_i2i`（恰好一张参考图），支持 `loras:[{name,strength_model,strength_clip}]` 最多 4 层。SDXL 可分别设置 MODEL/CLIP 强度；H3/Krea 只支持 MODEL（CLIP 省略或 0）。旧 `lora/models.lora` 与 `lora_strength` 保留兼容；显式 `loras:[]` 关闭旧选择。
+
+`fw_jobs` 可使用 `request_id` 查询持久提交记录，与 `job_id` 互斥。查询 `not_found` 仅表示尚无持久记录，原 HTTP 可能仍在预检；不得生成新请求 ID 盲重试。独立工作台使用受 CSRF 校验的 `POST /api/generate` 和 `POST /api/requests/query`，与 MCP 共享防重日志。本轮没有实现跨应用配对或按项目作用域隔离。
 
 `fw_generate` 必须带 `request_id`，推荐由调用方生成 UUID。同一次操作，包括连接中断后的重试，始终使用相同 ID 和相同参数。正常再次创作使用新的 ID；`fw_retry` 则带原任务 ID 和本次重试的独立请求 ID。
 

@@ -75,6 +75,25 @@ class MCPHTTPTests(unittest.TestCase):
                 status, _, _ = self.rpc("tools/list", headers={"Authorization": auth, "X-FW-Token": self.app.csrf})
                 self.assertEqual(status, 403)
 
+    def test_raw_package_transport_preserves_identity_over_mcp_http_without_generation(self):
+        inspected = self.tool("fw_package_inspect", {"source_json": json.dumps(API_JOB["prompt"])})
+        self.assertFalse(inspected["isError"], inspected)
+        draft = inspected["structuredContent"]
+        draft["prompt"]["1"]["inputs"].update(cfg=7.0, denoise=1.0)
+        imported = self.tool("fw_package_import", {"source_json": json.dumps(draft)})
+        self.assertFalse(imported["isError"], imported)
+        package_id = imported["structuredContent"]["id"]
+        exported = self.tool("fw_package_export", {"package_id": package_id})["structuredContent"]
+        self.assertIn('"denoise":1.0', exported["source_json"])
+        again = self.tool("fw_package_import", {"source_json": exported["source_json"]})
+        self.assertFalse(again["isError"], again)
+        self.assertEqual(again["structuredContent"]["id"], package_id)
+        status, _, _ = self.rpc("tools/call", {"name": "fw_package_import", "arguments": {
+            "source_json": exported["source_json"]}}, headers={"Authorization": ""})
+        self.assertEqual(status, 403)
+        self.assertEqual(len(self.app.packages.list()), 1)
+        self.assertEqual(self.backend.calls, [])
+
     def test_host_origin_and_cross_site_are_rejected(self):
         for headers in ({"Host": "attacker.test"}, {"Origin": "https://attacker.test"}, {"Sec-Fetch-Site": "cross-site"}):
             self.assertEqual(self.rpc("tools/list", headers=headers)[0], 403)

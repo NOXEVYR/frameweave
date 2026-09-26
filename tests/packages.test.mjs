@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { packageValues, fieldType, defaultValues, coerceFieldValue, validateValues, parsePackageDocument, publicChecksReport, redactLocalText } from '../web/packages.mjs';
-import { createNode, createDemo, generationPayload, serializeGraph, parseGraph, canConnect } from '../web/graph.mjs';
+import { createNode, createDemo, connect, generationPayload, serializeGraph, parseGraph, canConnect } from '../web/graph.mjs';
 
 test('workflow package nodes round-trip typed values and retain package identity', () => {
   const graph = { nodes: [createNode('generation', 30, 50, { kind: 'package', package_id: 'p-original', title: '海报生成', packageValues: { text: '清晨花园', seed: 42, enabled: false } })], edges: [] };
@@ -76,4 +76,108 @@ test('public diagnostics retain unknown states and drop machine paths and unexpe
   assert.equal(redactLocalText('配置 /home/alex/private-models，已跳过').includes('alex'), false);
   assert.equal(redactLocalText('配置 \\\\host\\share\\model.bin').includes('host'), false);
   assert.equal(redactLocalText('模型 G:/AI/my files/model.safetensors').includes('my files'), false);
+});
+
+const ports = () => [
+  { id: 'scene', label: '画面描述', type: 'text' },
+  { id: 'negative', label: '负向提示词', type: 'text' },
+  { id: 'reference', label: '参考图片', type: 'image' },
+  { id: 'seed', label: '种子', type: 'integer' },
+];
+
+function packageCanvas() {
+  const prompt = createNode('prompt', 0, 0, { text: '清晨的纸上小鸟 🐦', negative: '低质量，文字' });
+  const reference = createNode('reference', 0, 250, { name: 'input/bird.png' });
+  const packaged = createNode('generation', 400, 0, { kind: 'package', package_id: 'p-scene', packageFields: ports(), packageValues: { scene: 'form prompt', negative: 'form negative', seed: 0 } });
+  return { nodes: [prompt, reference, packaged], edges: [] };
+}
+
+test('package ports preserve safe metadata and reject invalid, duplicate or reserved field definitions', () => {
+  const graph = packageCanvas(), node = graph.nodes[2];
+  node.data.packageFields[0].node_id = 'internal-node';
+  node.data.packageFields[0].input = 'text';
+  node.data.packageFields[0].script = 'never evaluate';
+  const restored = parseGraph(serializeGraph(graph));
+  assert.deepEqual(restored.nodes[2].data.packageFields, ports());
+  const valid = { id: 'a'.repeat(80), label: 'l'.repeat(120), type: 'text' };
+  node.data.packageFields = [valid];
+  assert.deepEqual(parseGraph(serializeGraph(graph)).nodes[2].data.packageFields, [valid]);
+  const invalid = [null, {}, Array.from({ length: 65 }, (_, n) => ({ id: `f${n}`, label: 'field', type: 'text' })),
+    [{ ...valid, id: 'a'.repeat(81) }], [{ ...valid, id: '中文' }], [{ ...valid, id: '__proto__' }],
+    [{ ...valid, id: 'constructor' }], [{ ...valid, id: 'prototype' }], [{ ...valid, id: 'space id' }],
+    [{ ...valid, label: 'l'.repeat(121) }], [{ ...valid, label: '' }], [{ ...valid, label: null }],
+    [{ ...valid, type: 'script' }], [{ ...valid, type: {} }], [valid, valid]];
+  for (const fields of invalid) {
+    node.data.packageFields = fields;
+    assert.throws(() => parseGraph(serializeGraph(graph)), /工作流包/);
+  }
+  node.data.packageFields = ['text', 'integer', 'number', 'boolean', 'select', 'image'].map((type, i) => ({ id: `f${i}`, label: type, type }));
+  assert.equal(parseGraph(serializeGraph(graph)).nodes[2].data.packageFields.length, 6);
+});
+
+test('one prompt can connect positive and negative text to different package inputs without merging them', () => {
+  const graph = packageCanvas(), [prompt, reference, node] = graph.nodes;
+  connect(graph, prompt.id, node.id, { targetField: 'scene', sourceField: 'text' });
+  connect(graph, prompt.id, node.id, { targetField: 'negative', sourceField: 'negative' });
+  connect(graph, reference.id, node.id, { targetField: 'reference', sourceField: 'image', outputIndex: 0 });
+  const request = generationPayload(graph, node.id);
+  assert.deepEqual(request, { kind: 'package', package_id: 'p-scene', values: {
+    scene: prompt.data.text, negative: prompt.data.negative, reference: reference.data.name, seed: 0,
+  } });
+  assert.equal(node.data.packageValues.scene, 'form prompt');
+  prompt.data.negative = '';
+  assert.equal(generationPayload(graph, node.id).values.negative, '');
+  const text = serializeGraph(graph), restored = parseGraph(text);
+  assert.equal(serializeGraph(restored), text);
+  assert.deepEqual(generationPayload(restored, node.id), generationPayload(graph, node.id));
+});
+
+test('package connections enforce declared types, single field ownership and source selectors', () => {
+  const graph = packageCanvas(), [prompt, reference, node] = graph.nodes;
+  for (const options of [{ targetField: 'reference' }, { targetField: 'seed' }, { targetField: 'missing' },
+    { targetField: 'scene', sourceField: 'image' }, { targetField: 'scene', outputIndex: 1 }]) {
+    assert.equal(canConnect(graph, prompt.id, node.id, options).ok, false);
+  }
+  assert.equal(canConnect(graph, reference.id, node.id, { targetField: 'scene' }).ok, false);
+  assert.equal(canConnect(graph, reference.id, node.id, { targetField: 'reference', sourceField: 'negative' }).ok, false);
+  reference.data.mediaType = 'video';
+  assert.equal(canConnect(graph, reference.id, node.id, { targetField: 'reference' }).ok, false);
+  reference.data.mediaType = 'image';
+  connect(graph, prompt.id, node.id, { targetField: 'scene' });
+  assert.equal(canConnect(graph, prompt.id, node.id, { targetField: 'negative' }).ok, true);
+  const second = createNode('prompt', 0, 500); graph.nodes.push(second);
+  assert.match(canConnect(graph, second.id, node.id, { targetField: 'scene' }).reason, /已有连接/);
+  const raw = JSON.parse(serializeGraph(graph));
+  raw.edges.push({ id: 'other-edge', source: second.id, target: node.id, targetField: 'scene' });
+  assert.throws(() => parseGraph(raw), /已有连接/);
+  assert.throws(() => generationPayload(raw, node.id), /已有连接/);
+});
+
+test('package image ports use uploaded references and explicit edge images, never filenames derived from URLs', () => {
+  const graph = packageCanvas(), reference = graph.nodes[1], node = graph.nodes[2];
+  connect(graph, reference.id, node.id, { targetField: 'reference' });
+  reference.data.name = ''; reference.data.url = '/api/media/looks-like-an-image.png';
+  assert.throws(() => generationPayload(graph, node.id), /图片待准备/);
+  for (const value of ['../secret.png', './secret.png', '/tmp/secret.png', 'https://example.test/image.png', 'C:\\secret.png', 'x\0.png', 'x'.repeat(1025)]) {
+    reference.data.name = value;
+    assert.throws(() => generationPayload(graph, node.id), /相对名称/);
+  }
+  graph.edges = [];
+  const result = createNode('result', 0, 500, { jobId: 'old-job', outputs: [{ type: 'image', url: '/api/media/private', filename: 'old.png' }] });
+  graph.nodes.push(result);
+  connect(graph, result.id, node.id, { targetField: 'reference', outputIndex: 2 });
+  const edge = graph.edges[0];
+  assert.throws(() => generationPayload(graph, node.id), /等待上游/);
+  assert.throws(() => generationPayload(graph, node.id, { edgeImages: { [result.id]: 'wrong-binding.png' } }), /等待上游/);
+  assert.throws(() => generationPayload(graph, node.id, { edgeImages: { [edge.id]: '/api/media/private' } }), /相对名称/);
+  assert.throws(() => generationPayload(graph, node.id, { edgeImages: Object.create({ [edge.id]: 'inherited.png' }) }), /等待上游/);
+  assert.equal(generationPayload(graph, node.id, { edgeImages: { [edge.id]: 'uploads/current.png' } }).values.reference, 'uploads/current.png');
+});
+
+test('cached package fields never enter native generation or API request payloads', () => {
+  const graph = createDemo(), node = graph.nodes[1];
+  node.data.packageFields = ports();
+  assert.equal(Object.hasOwn(generationPayload(graph, node.id), 'packageFields'), false);
+  node.data.kind = 'api'; node.data.apiPrompt = { '1': { class_type: 'Test', inputs: { text: 'hello' } } };
+  assert.deepEqual(generationPayload(graph, node.id), { kind: 'api', prompt: node.data.apiPrompt });
 });

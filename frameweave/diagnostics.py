@@ -6,7 +6,7 @@ import struct
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from .workflows import (_check_family, _check_json_limits, _expanded_inputs, _model,
+from .workflows import (_check_family, _check_json_limits, _expanded_inputs, _lora_specs, _model,
                         _number, _options, _reference_names, _reference_roles,
                         _spec, compile_workflow, validate_prompt)
 
@@ -108,7 +108,7 @@ def _request(request):
         raise ValueError("检测请求必须是对象")
     _check_json_limits(request)
     kind = request.get("kind", "h3_t2v")
-    if not isinstance(kind, str) or kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "api"}:
+    if not isinstance(kind, str) or kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "api"}:
         raise ValueError("不支持的检测模式")
     models = request.get("models", {})
     if not isinstance(models, dict) or any(key not in ROLES for key in models):
@@ -122,6 +122,7 @@ def _request(request):
     if len(refs) > 9 or any(len(ref) > 1024 for ref in refs):
         raise ValueError("参考图最多 9 张，每个相对名称不超过 1024 字符")
     _reference_roles(request, kind, refs)
+    _lora_specs(request, kind)
     _number(request, "denoise", 1, 0, 1)
     for key, minimum, maximum, integer in (("width", 32, 8192, True), ("height", 32, 8192, True),
             ("steps", 1, 1000, True), ("seed", 0, 2**64 - 1, True), ("cfg", 0, 100, False),
@@ -150,16 +151,17 @@ def _selections(kind, models, request, model_catalog):
     """Use the compiler's model chooser, including its preferred quantization."""
     available = {role: [name for name in model_catalog.get(role, []) if isinstance(name, str)] for role in ROLES}
     h3 = kind.startswith("h3_")
-    lora = request.get("lora") or models.get("lora")
+    loras = _lora_specs(request, kind)
+    sdxl = kind in {"sdxl", "sdxl_i2i"}
     if kind == "api":
         return []
-    choices = [("checkpoint", ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"), ())] if kind == "sdxl" else [
-        ("dit", ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",), ("pruned",) if h3 and not lora else ()),
+    choices = [("checkpoint", ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"), ())] if sdxl else [
+        ("dit", ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",), ("pruned",) if h3 and not loras else ()),
         ("text_encoder", ("minimax_h3",) if h3 else ("qwen3vl_4b",), ("nvfp4",) if h3 else ()),
         ("vae", ("minimax_h3_video_vae",) if h3 else ("qwen_image_vae",), ())]
     if h3:
         choices.append(("audio_vae", ("minimax_h3_audio_vae",), ()))
-    elif kind == "sdxl" and models.get("vae"):
+    elif sdxl and models.get("vae"):
         choices.append(("vae", (), ()))
     selected = []
     for role, tokens, preferred in choices:
@@ -168,8 +170,8 @@ def _selections(kind, models, request, model_catalog):
         except ValueError:
             name = models.get(role)
         selected.append((role, name, available[role]))
-    if lora:
-        selected.append(("lora", lora, available["lora"]))
+    for item in loras:
+        selected.append(("lora", item["name"], available["lora"]))
     return selected
 
 
@@ -178,12 +180,13 @@ def _dependencies(kind, request, refs, selections, info):
     if kind == "api":
         return []
     h3 = kind.startswith("h3_")
-    needed = {"CheckpointLoaderSimple"} if kind == "sdxl" else {"UNETLoader", "CLIPLoader", "VAELoader"}
+    sdxl = kind in {"sdxl", "sdxl_i2i"}
+    needed = {"CheckpointLoaderSimple"} if sdxl else {"UNETLoader", "CLIPLoader", "VAELoader"}
     models = dict((role, name) for role, name, _ in selections)
-    if kind == "sdxl" and models.get("vae"):
+    if sdxl and models.get("vae"):
         needed.add("VAELoader")
     if models.get("lora"):
-        if kind == "sdxl":
+        if sdxl:
             needed.add("LoraLoader")
         else:
             quantized = any(token in (models.get("dit") or "").lower() for token in ("int8", "fp8", "nvfp4", "gguf"))
@@ -203,7 +206,7 @@ def _dependencies(kind, request, refs, selections, info):
         needed |= {"KSampler", "VAEDecode", "SaveImage"}
         needed |= {"Krea2OstrisEditModelPatch", "TextEncodeKrea2OstrisEdit"} if kind == "krea" and refs else {"CLIPTextEncode"}
         needed.add("ConditioningZeroOut" if kind == "krea" and not negative else "CLIPTextEncode")
-        if refs and (kind == "sdxl" or request.get("denoise", 1) < 1):
+        if refs and (sdxl or request.get("denoise", 1) < 1):
             needed |= {"ImageScale", "VAEEncode"}
         else:
             needed.add("EmptySD3LatentImage" if kind == "krea" else "EmptyLatentImage")
@@ -291,6 +294,10 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
 
     selections = _selections(kind, models, request, model_catalog)
     needed = _dependencies(kind, request, refs, selections, info)
+    if kind != "api" and online:
+        loader = next((name for name in needed if name in {"LoraLoader", "LoraLoaderModelOnly", "LoraLoaderBypassModelOnly"}), None)
+        selections = [(role, name, _options(info.get(loader, {}), "lora_name") if role == "lora" else candidates)
+                      for role, name, candidates in selections]
     if kind == "api":
         needed = sorted({node["class_type"] for node in prompt.values()})
         if not prompt:
@@ -311,7 +318,7 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
             repair=detail + (f"；所需节点：{node}" if kind != "api" else "；API 自定义节点名称请在本地检查面板核对"))
 
     if kind != "api":
-        limits = {"h3_t2v": (0, 0), "h3_i2v": (1, 2), "h3_ref": (1, 9), "krea": (0, 3), "sdxl": (0, 1)}
+        limits = {"h3_t2v": (0, 0), "h3_i2v": (1, 2), "h3_ref": (1, 9), "krea": (0, 3), "sdxl": (0, 1), "sdxl_i2i": (1, 1)}
         minimum, maximum = limits[kind]
         if not minimum <= len(refs) <= maximum or (request.get("denoise", 1) < 1 and not refs):
             add("input.references", "input", "参考图数量", "missing" if len(refs) < minimum or not refs else "error",
@@ -352,7 +359,7 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
             continue
         try:
             safe_relative(selected)
-            if kind != "api" and role != "lora":
+            if kind != "api":
                 _check_family(selected, role, kind)
             if kind.startswith("h3_") and role == "lora" and ((kind == "h3_ref" and "fl2v" in selected.lower()) or (kind != "h3_ref" and "ref2v" in selected.lower())):
                 raise ValueError("LoRA 架构不相容")

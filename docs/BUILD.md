@@ -12,7 +12,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name PrismCanvas --icon assets/frameweave.ico --add-data "web;web" launch.py
 ```
 
-将生成的 EXE 与 README、MIGRATION、LICENSE、THIRD_PARTY、PYTHON-LICENSE.txt 和 docs 放在同一个 `PrismCanvas-0.5.0/` 根目录下打包。源码包只包含明确允许的项目文件，不包含 venv、缓存、测试数据、用户工作流包库、模型、配置、日志或输入媒体。MCP 已在主程序中，不需单独守护进程或额外 SDK。
+将生成的 EXE 与 README、MIGRATION、LICENSE、THIRD_PARTY、PYTHON-LICENSE.txt 和 docs 放在同一个 `PrismCanvas-0.7.0/` 根目录下打包。源码包只包含明确允许的项目文件，不包含 venv、缓存、测试数据、用户工作流包库、模型、配置、日志或输入媒体。MCP 已在主程序中，不需单独守护进程或额外 SDK。0.7.0 通过仓库 releases/ 目录分发 Windows x64 与源码包；公开下载入口见 README。
 
 官方构建选项：[PyInstaller 使用文档](https://pyinstaller.org/en/stable/usage.html)。PyInstaller 的许可包含允许发布构建产物的例外；独立二进制仍需附带其所含 Python 运行库的许可说明。
 

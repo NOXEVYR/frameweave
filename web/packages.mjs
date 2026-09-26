@@ -111,7 +111,7 @@ export function publicChecksReport(checks = [], knownPaths = [], options = {}) {
   const states = ['ok', 'missing', 'error', 'warning', 'unknown'];
   const counts = Object.fromEntries(states.map(state => [state, 0]));
   for (const check of checks) counts[states.includes(check.status) ? check.status : 'unknown']++;
-  const mode = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'krea', 'api', 'package'].includes(options.mode) ? options.mode : 'unknown';
+  const mode = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'api', 'package'].includes(options.mode) ? options.mode : 'unknown';
   return {
     checked_at: new Date().toISOString(), mode, counts,
     ready: checks.length > 0 && !counts.missing && !counts.error && !counts.unknown,

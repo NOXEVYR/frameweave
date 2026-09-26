@@ -264,6 +264,48 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["packages"][0]["id"], saved["package"]["id"])
 
+    def test_package_raw_transport_preserves_float_id_without_backend_calls(self):
+        status, _, draft = self.post("/api/packages/inspect", {"source_json": json.dumps(API_JOB["prompt"])})
+        self.assertEqual(status, 200, draft)
+        draft["prompt"]["1"]["inputs"]["cfg"] = 7.0
+        draft["prompt"]["1"]["inputs"]["denoise"] = 1.0
+        status, _, saved = self.post("/api/packages", {"source_json": json.dumps(draft)})
+        self.assertEqual(status, 200, saved)
+        package_id = saved["package"]["id"]
+        status, _, exported = self.post(f"/api/packages/{package_id}/export")
+        self.assertEqual(status, 200, exported)
+        self.assertIn('"denoise":1.0', exported["source_json"])
+        self.assertEqual(json.loads(exported["source_json"]), exported["document"])
+        status, _, inspected = self.post("/api/packages/inspect", {"source_json": exported["source_json"]})
+        self.assertEqual(status, 200, inspected)
+        status, _, imported = self.post("/api/packages", {"source_json": exported["source_json"]})
+        self.assertEqual(status, 200, imported)
+        self.assertEqual(imported["package"]["id"], package_id)
+        self.assertEqual(len(self.app.packages.list()), 1)
+        self.assertEqual(self.backend.calls, [])
+
+    def test_package_raw_transport_rejects_invalid_carriers_and_preserves_csrf(self):
+        for path in ("/api/packages/inspect", "/api/packages"):
+            for payload in ({"source_json": []}, {"source_json": "[]"}, {"source_json": "{"},
+                            {"source_json": '{"x":1,"x":2}'},
+                            {"source_json": "{}", "document": API_JOB["prompt"]}):
+                with self.subTest(path=path, payload=payload):
+                    self.assertEqual(self.post(path, payload)[0], 400)
+                    self.assertEqual(self.post(path, payload, csrf=False)[0], 403)
+            self.assertEqual(self.post(path, {"source_json": "{}"}, headers={"Origin": "https://other.test"})[0], 403)
+            self.assertEqual(self.post(path, {"source_json": "{}"}, headers={"Host": "other.test"})[0], 403)
+        self.assertEqual(self.app.packages.list(), [])
+        self.assertEqual(self.backend.calls, [])
+
+    def test_package_raw_transport_rejects_oversized_utf8_source(self):
+        source = '{"name":"' + "图" * (1024 * 1024) + '"}'
+        for path in ("/api/packages/inspect", "/api/packages"):
+            status, _, result = self.post(path, {"source_json": source})
+            self.assertEqual(status, 400, result)
+            self.assertIn("2 MiB", result["error"])
+        self.assertEqual(self.app.packages.list(), [])
+        self.assertEqual(self.backend.calls, [])
+
     def test_package_endpoints_reject_invalid_inputs_and_cross_site_writes(self):
         for path, body in (("/api/packages/inspect", {"document": []}),
                            ("/api/packages/inspect", {"document": {"nodes": [], "links": []}}),

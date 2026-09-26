@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from frameweave.workflows import capabilities, catalog, compile_workflow, validate_prompt
+from frameweave.workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
 
 def schema(required, output, optional=None, output_node=False):
@@ -124,6 +124,73 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(nodes(result, "KSampler")[0]["denoise"], 0.6)
         self.assertEqual(len(nodes(result, "SaveImage")), 1)
 
+    def test_explicit_image_to_image_uses_scaled_source_and_selected_denoise(self):
+        result = self.compile("sdxl_i2i", references=["first.png"], denoise=0.35, width=768, height=512)
+        self.assertEqual(nodes(result, "LoadImage")[0]["image"], "first.png")
+        self.assertEqual(nodes(result, "ImageScale")[0]["width"], 768)
+        self.assertEqual(nodes(result, "ImageScale")[0]["height"], 512)
+        self.assertEqual(len(nodes(result, "VAEEncode")), 1)
+        self.assertEqual(nodes(result, "KSampler")[0]["denoise"], 0.35)
+        self.assertEqual(nodes(result, "KSampler")[0]["cfg"], 7)
+        self.assertFalse(nodes(result, "EmptyLatentImage"))
+        self.assertEqual(result["summary"]["kind"], "sdxl_i2i")
+        for refs in ([], ["first.png", "last.png"]):
+            with self.subTest(refs=refs), self.assertRaises(ValueError):
+                self.compile("sdxl_i2i", references=refs)
+        del self.info["ImageScale"]
+        self.assertFalse(capabilities(self.info)["sdxl_i2i"])
+        with self.assertRaisesRegex(ValueError, "ImageScale"):
+            self.compile("sdxl_i2i", references=["first.png"])
+
+    def test_lora_chain_connects_model_and_clip_in_order(self):
+        self.info["LoraLoader"]["input"]["required"]["lora_name"][0].append("loras/second.safetensors")
+        items = [{"name": "loras/turbo.safetensors", "strength_model": 0.8, "strength_clip": 0.4},
+                 {"name": "loras/second.safetensors", "strength_model": 0.3, "strength_clip": 0}]
+        result = self.compile("sdxl", loras=items)
+        chain = [(key, node["inputs"]) for key, node in result["prompt"].items() if node["class_type"] == "LoraLoader"]
+        self.assertEqual(len(chain), 2)
+        self.assertEqual(chain[1][1]["model"], [chain[0][0], 0])
+        self.assertEqual(chain[1][1]["clip"], [chain[0][0], 1])
+        self.assertEqual(nodes(result, "KSampler")[0]["model"], [chain[1][0], 0])
+        self.assertEqual(nodes(result, "CLIPTextEncode")[0]["clip"], [chain[1][0], 1])
+        self.assertEqual(result["summary"]["loras"], items)
+        self.assertEqual(nodes(result, "LoraLoader")[1]["strength_clip"], 0)
+
+    def test_lora_stack_overrides_legacy_and_checks_loader_specific_options(self):
+        result = self.compile("sdxl", lora="unavailable.safetensors", loras=[])
+        self.assertFalse(nodes(result, "LoraLoader"))
+        result = self.compile("sdxl", lora="loras/turbo.safetensors", lora_strength=0.6)
+        self.assertEqual(nodes(result, "LoraLoader")[0]["strength_clip"], 0.6)
+        self.info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0].append("loras/model_only.safetensors")
+        self.assertIn("loras/model_only.safetensors", catalog(self.info)["lora"])
+        with self.assertRaisesRegex(ValueError, "选项"):
+            self.compile("sdxl", loras=[{"name": "loras/model_only.safetensors"}])
+        options = generation_options(self.info)
+        self.assertNotIn("loras/model_only.safetensors", options["lora_loaders"]["LoraLoader"]["names"])
+        self.assertEqual(options["samplers"], ["euler", "heun"])
+
+    def test_lora_validation_rejects_bad_shapes_and_incompatible_families(self):
+        for value in (None, {}, ["name"], [{"name": ""}], [{"name": "loras/turbo.safetensors", "extra": True}],
+                      [{"name": "loras/turbo.safetensors", "strength_model": float("nan")}],
+                      [{"name": "loras/turbo.safetensors", "strength_model": 11}],
+                      [{"name": "loras/turbo.safetensors"}] * 5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.compile("sdxl", loras=value)
+        with self.assertRaisesRegex(ValueError, "model-only"):
+            self.compile("krea", loras=[{"name": "loras/turbo.safetensors", "strength_clip": 0.5}])
+        name = "loras/flux_character.safetensors"
+        self.info["LoraLoader"]["input"]["required"]["lora_name"][0].append(name)
+        with self.assertRaisesRegex(ValueError, "不相容"):
+            self.compile("sdxl", loras=[{"name": name}])
+
+    def test_model_only_lora_chain_and_backend_strength_bounds(self):
+        result = self.compile("h3_t2v", loras=[{"name": "loras/turbo.safetensors", "strength_model": 0.5}] * 2)
+        self.assertEqual(len(nodes(result, "LoraLoaderBypassModelOnly")), 2)
+        self.assertTrue(all(item["strength_clip"] == 0 for item in result["summary"]["loras"]))
+        self.info["LoraLoader"]["input"]["required"]["strength_model"][1]["max"] = 1
+        with self.assertRaisesRegex(ValueError, "数值范围"):
+            self.compile("sdxl", loras=[{"name": "loras/turbo.safetensors", "strength_model": 2}])
+
     def test_missing_plugin_fails_before_submission(self):
         del self.info["TextEncodeKrea2OstrisEdit"]
         with self.assertRaisesRegex(ValueError, "TextEncodeKrea2OstrisEdit"):
@@ -135,7 +202,8 @@ class WorkflowTests(unittest.TestCase):
                      "Library/MiniMaxH3/VAE/minimax_h3_video_vae.safetensors",
                      "Library/MiniMaxH3/VAE/minimax_h3_audio_vae.safetensors",
                      "Library/MiniMaxH3/LoRA/Acceleration/turbo.safetensors"]
-        for node, field in [("UNETLoader", "unet_name"), ("CLIPLoader", "clip_name"), ("VAELoader", "vae_name"), ("LoraLoaderModelOnly", "lora_name")]:
+        for node, field in [("UNETLoader", "unet_name"), ("CLIPLoader", "clip_name"), ("VAELoader", "vae_name"),
+                            ("LoraLoaderModelOnly", "lora_name"), ("LoraLoader", "lora_name"), ("LoraLoaderBypassModelOnly", "lora_name")]:
             self.info[node]["input"]["required"][field] = [all_names]
         result = catalog(self.info)
         self.assertEqual(result["dit"], all_names[:1])
@@ -145,7 +213,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["lora"], all_names[4:])
 
     def test_capabilities_follow_node_and_clip_support(self):
-        self.assertEqual(capabilities(self.info), {"h3": True, "sdxl": True, "krea": True})
+        self.assertEqual(capabilities(self.info), {"h3": True, "sdxl": True, "sdxl_i2i": True, "krea": True})
         del self.info["MiniMaxH3ImageToVideo"]
         self.assertFalse(capabilities(self.info)["h3"])
         self.info["CLIPLoader"]["input"]["required"]["type"] = [["minimax"]]

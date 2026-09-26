@@ -2,7 +2,7 @@
 /* PrismCanvas design tokens and base controls. */
 :root {
   font-family:"Segoe UI","Microsoft YaHei UI",sans-serif;
-  font-size:13px;
+  font-size:15px;
   font-synthesis:none;
   color-scheme:light;
   --bg:#eef0f2;
@@ -495,7 +495,7 @@ select {
   left:0;
   top:0;
   transform-origin:0 0;
-  will-change:transform
+  will-change:auto
 }
 .connections {
   position:absolute;

@@ -1,2 +1,2 @@
-9eca42041ac98f845bf0ebc46950b1fcb14d5956dec13e8e69a2d0a8dab6f704  PrismCanvas-v0.5.0-Windows-x64.zip
-433785bc9bfc14cfbaa5d08e540ef3e8d062eedf6665752fe703203be9d38160  PrismCanvas-v0.5.0-source.zip
+bb9d0b1604131aea45e51c1566d83db5a6501c3a4af876a9c8028d6cdc0a6d02  PrismCanvas-v0.7.0-Windows-x64.zip
+ce8b2f54405bc9276b4d82000534fc4eed19b6a7d3593212d08801d72a3bca47  PrismCanvas-v0.7.0-source.zip

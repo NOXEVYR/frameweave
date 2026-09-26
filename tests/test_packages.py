@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from frameweave.packages import MAX_METADATA_BYTES, PackageStore, apply_values, inspect_document, normalize_document
+from frameweave.packages import (MAX_BYTES, MAX_METADATA_BYTES, PackageStore, apply_values,
+                                inspect_document, normalize_document, parse_source_json, transport_document)
 
 
 def sample():
@@ -37,6 +38,64 @@ class PackageTests(unittest.TestCase):
         self.assertNotIn("id", document)
         self.assertNotIn("created_at", document)
         self.assertNotIn("prompt", self.store.list()[0])
+
+    def test_raw_transport_preserves_existing_float_identity_across_client_json_roundtrip(self):
+        document = sample()
+        document["prompt"]["1"]["inputs"].update(cfg=7.0, denoise=1.0, offset=-0.0)
+        first = self.store.save(document)
+        original_bytes = (self.store.directory / (first["id"] + ".json")).read_bytes()
+        exported = self.store.export_transport(first["id"])
+        self.assertIn('"cfg":7.0', exported["source_json"])
+        # Transport serialization only escapes the string; it never parses its numbers.
+        carrier = json.loads(json.dumps({"source_json": exported["source_json"]}))
+        another = PackageStore(self.root / "another")
+        imported = another.save(transport_document(carrier))
+        self.assertEqual(imported["id"], first["id"])
+        self.assertEqual((another.directory / (first["id"] + ".json")).read_bytes(), original_bytes)
+        changed = copy.deepcopy(exported["document"])
+        changed["prompt"]["1"]["inputs"].update(cfg=7, denoise=1, offset=0)
+        self.assertNotEqual(another.save(changed)["id"], first["id"])
+        self.assertEqual(self.store.get(first["id"])["id"], first["id"])
+
+    def test_raw_export_omits_local_metadata_and_image_defaults(self):
+        draft = inspect_document({"1": {"class_type": "LoadImage", "inputs": {"image": "private-image.png"}}})
+        package = self.store.save(draft)
+        self.store.update_metadata(package["id"], {"favorite": True, "archived": True})
+        exported = self.store.export_transport(package["id"])
+        self.assertEqual(json.loads(exported["source_json"]), exported["document"])
+        for value in ("created_at", "updated_at", "favorite", "archived", "private-image.png", str(self.root)):
+            self.assertNotIn(value, exported["source_json"])
+
+    def test_raw_input_checks_utf8_byte_length_before_parse(self):
+        for value in ('{"x":"' + "a" * MAX_BYTES + '"}', '{"x":"' + "图" * (MAX_BYTES // 2) + '"}'):
+            with self.assertRaisesRegex(ValueError, "2 MiB"):
+                parse_source_json(value)
+        self.assertEqual(parse_source_json('{"x":"图"}'), {"x": "图"})
+
+    def test_raw_input_rejects_ambiguous_invalid_and_excessive_json(self):
+        for value in (None, {}, "", "[]", "null", '{"a":1,"a":2}', '{"a":NaN}',
+                      '{"a":1e400}', '{"a":9007199254740992}', '{"a":"\\ud800"}',
+                      '{"a":"\ud800"}', '{"a":' + "[" * 70 + "0" + "]" * 70 + "}"):
+            with self.subTest(value=repr(value)[:80]), self.assertRaises(ValueError):
+                parse_source_json(value)
+
+    def test_raw_carrier_is_exclusive_and_legacy_objects_are_preserved(self):
+        document = sample()
+        self.assertIs(transport_document({"document": document}), document)
+        self.assertIs(transport_document(document, allow_bare=True), document)
+        for payload in ({}, {"source_json": "{}", "document": document},
+                        {"source_json": "{}", "name": "ambiguous"}, {"other": document}):
+            with self.assertRaises(ValueError):
+                transport_document(payload)
+
+    def test_raw_export_still_rejects_tampered_stored_content(self):
+        package = self.store.save(sample())
+        path = self.store.directory / (package["id"] + ".json")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["prompt"]["1"]["inputs"]["seed"] = 43
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "内容已变化"):
+            self.store.export_transport(package["id"])
 
     def test_user_values_modify_only_bound_inputs_without_mutating_template(self):
         document = sample()

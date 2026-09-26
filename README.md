@@ -6,25 +6,29 @@
 
 以钴蓝、杏桃与暖灰构建的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；重点是 MiniMax H3 视频、Krea 2 / SDXL 图片控制、缺失项检查和可复现工作流。
 
-> **0.5.0**：采用 E04 棱光切片图标，显示名称更新为「棱光 PrismCanvas」，重新组织项目工作条、创作工具、画布与参数面板。保留 AI 可调用的 14 个 MCP 工具、任务放入画布和节点空位布局。生成计算由用户已有的本地 ComfyUI 后端完成；客户端不包含模型、PyTorch 或 CUDA。Windows x64 便携版与源码见下方下载入口。
+> **0.7.0**：整套工作流可作为节点组合，连接提示词、参考图和上游图片输出；支持按依赖顺序运行、原请求恢复和整套画布集合导入导出。保留独立文生图、图生图、视频生成页面、详细模型/LoRA 参数、清晰缩放和 14 个 MCP 工具。生成计算由本地 ComfyUI 完成，客户端不包含模型、PyTorch 或 CUDA。Windows x64 便携版和源码见下方下载入口。
 
-![棱光 0.5.0 图片与视频工作台](docs/screenshot-v0.5.0.png)
+详见 [工作流组合指南](docs/WORKFLOW_PACKAGES.md)和[画布与独立生成工作台](docs/WORKSPACES.md)。
+
+![棱光 0.7.0 工作流组合画布](docs/screenshot-v0.7.0-workflows.png)
+
+截图使用隔离测试目录、示例包与空结果视图，不是实际推理结果；[查看独立生成工作台](docs/screenshot-v0.7.0-studio.png)。
 
 品牌改名不迁移数据：Python 包、API 标识、画布和工作流格式仍采用 FrameWeave，默认数据目录与浏览器存储键保留。现有画布、工作流包与 AI 连接配置继续兼容；便携包的入口是 `PrismCanvas.exe`。详见 [品牌与兼容说明](docs/BRAND.md)。
 
 ## 开始使用
 
-**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.5.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.5.0-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
+**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.7.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.7.0-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
 
 新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/NOXEVYR/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 
-Windows 用户完整解压 0.5.0 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
+Windows 用户完整解压 0.7.0 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
 
 1. 启动你的本地 ComfyUI 推理服务。
 2. 棱光启动后自动发现本机后端，点击使用发现的服务；也可在右上角设置填写地址，例如 `http://127.0.0.1:8188`。
 3. 添加已有模型根目录。棱光读取模型，不移动、下载或删除模型。
 4. 点击“检查环境”，核实节点、模型角色、文件结构与待补齐项。
-5. 创建提示词和生成节点，连线后调整参数，先试样，再提升规格。
+5. 使用左侧文生图 / 图生图 / 视频生成页面详细调参，或在画布双击新建节点与连接；先试样，再提升规格。
 
 源码运行只需要 Python 3.11+：
 
@@ -37,6 +41,8 @@ python launch.py
 ## 工作流包：填信息，生成图片或视频
 
 在顶栏打开“工作流包”，导入 ComfyUI API JSON，或把当前已配置的 H3 / Krea / SDXL 生成节点封装成包。选择需要开放的提示词、种子、尺寸、步数等参数，保存后得到画布上的表单节点；填写信息即可提交生成，输出进入原有队列和结果预览。
+
+0.7.0 可把多套包放在同一画布，通过端口明确连接文本或图片输入，例如“文生图 → 图生图 → H3 图生视频”。点击“运行所选及上游”顺序执行，失败时停止下游；刷新或响应丢失后按原请求查询恢复。“工作流集合”可将画布和所需包定义一起保存、恢复，导入不触发生成。
 
 参考图作为必填图片输入重新上传。包以带版本的 JSON 保存 API 图与参数映射，不包含模型、脚本或原始媒体；导出文件可分享，同一包重新导入能恢复画布关联。导入包本身不会启动生成。普通 ComfyUI 画布 JSON 需要先导出 API 格式。
 
@@ -69,7 +75,7 @@ python launch.py
 
 ## 本地数据与空间
 
-Windows 配置、工作流包和任务复现图保存在 `%LOCALAPPDATA%/FrameWeave`，画布保存在本机浏览器站点存储。视频、图像仍由后端保存在其输出目录；客户端按块传输预览，不重复缓存大视频。迁移时分别导出画布 JSON 和工作流包。
+Windows 配置、工作流包和任务复现图保存在 `%LOCALAPPDATA%/FrameWeave`，画布与当前组合运行记录保存在本机浏览器站点存储。视频、图像仍由后端保存在其输出目录；客户端按块传输预览，不重复缓存大视频。迁移时使用工作流集合保存布局和包定义，素材另行保存。
 
 关闭画布后，本地服务在约三分钟无访问后退出。后台生成不随窗口关闭而终止，重新打开可恢复本客户端任务记录。
 

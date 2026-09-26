@@ -43,6 +43,52 @@ def encoded(value):
     return content
 
 
+def parse_source_json(source):
+    """Keep numeric tokens intact across clients whose JSON numbers lose .0."""
+    if not isinstance(source, str):
+        raise ValueError("source_json 须为 JSON 原文字符串")
+    try:
+        if len(source) > MAX_BYTES or len(source.encode("utf-8")) > MAX_BYTES:
+            raise ValueError("工作流包原文最大为 2 MiB")
+    except UnicodeEncodeError:
+        raise ValueError("工作流包原文须为有效 Unicode 文本") from None
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("工作流包 JSON 不能包含重复键")
+            result[key] = value
+        return result
+
+    def constant(_):
+        raise ValueError("工作流包 JSON 数字必须有限")
+
+    try:
+        document = json.loads(source, object_pairs_hook=pairs, parse_constant=constant)
+        encoded(document)
+    except (UnicodeError, RecursionError):
+        raise ValueError("工作流包 JSON 文本无效或嵌套过深") from None
+    if not isinstance(document, dict):
+        raise ValueError("工作流包原文须包含 JSON 对象")
+    return document
+
+
+def transport_document(payload, *, allow_bare=False):
+    """Read the explicit raw carrier, preserving legacy object entry points."""
+    if not isinstance(payload, dict):
+        raise ValueError("工作流包请求须为 JSON 对象")
+    if "source_json" in payload:
+        if set(payload) != {"source_json"}:
+            raise ValueError("source_json 须单独提供，不能同时提供 document 或其他字段")
+        return parse_source_json(payload["source_json"])
+    if allow_bare:
+        return payload
+    if set(payload) != {"document"}:
+        raise ValueError("请提供 document 或 source_json，且只选择一种")
+    return payload["document"]
+
+
 def text(value, label, maximum, empty=False):
     if not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip()):
         raise ValueError(f"{label}须为不超过 {maximum} 字符的文本")
@@ -374,3 +420,7 @@ class PackageStore:
 
     def export(self, package_id):
         return normalize_document(self.get(package_id))
+
+    def export_transport(self, package_id):
+        document = self.export(package_id)
+        return {"document": document, "source_json": encoded(document).decode("utf-8")}

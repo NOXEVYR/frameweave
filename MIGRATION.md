@@ -14,4 +14,6 @@ v0.2.0 的 [Windows 便携包](https://raw.githubusercontent.com/NOXEVYR/portfol
 
 2026-09-25：0.5.0 同步到本仓库，README 下载入口切换到 `PrismCanvas-v0.5.0-*` 归档；保留既有历史文件和仓库地址。此次同步使用仓库 `releases/` 目录，不等同于新建 GitHub Release 附件。
 
+2026-09-26：0.7.0 继续同步到 `NOXEVYR/frameweave` 的 `main` 与 `releases/` 目录，首页下载入口更新，0.5.0 及更早的已发布文件保留。此次未新建 GitHub Release 附件。
+
 [返回 README](README.md) · [返回项目总览](https://github.com/NOXEVYR/portfolio)

@@ -368,6 +368,40 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(self.app.packages.list(), [])
         self.assertEqual(self.prompts(), [])
 
+    def test_package_source_json_preserves_float_identity_and_export_legacy_shape(self):
+        draft = self.call("fw_package_inspect", {"source_json": json.dumps(API_JOB["prompt"])})["structuredContent"]
+        draft["prompt"]["1"]["inputs"].update(cfg=7.0, denoise=1.0)
+        package = self.call("fw_package_import", {"source_json": json.dumps(draft)})["structuredContent"]
+        exported = self.call("fw_package_export", {"package_id": package["id"]})["structuredContent"]
+        self.assertIn("prompt", exported)
+        self.assertIn('"denoise":1.0', exported["source_json"])
+        for args in ({"source_json": exported["source_json"]}, {"document": exported}):
+            imported = self.call("fw_package_import", args)
+            self.assertFalse(imported["isError"], imported)
+            self.assertEqual(imported["structuredContent"]["id"], package["id"])
+        self.assertEqual(self.backend.calls, [])
+
+    def test_package_source_json_schema_and_manual_exclusivity_match(self):
+        for tool_name in ("fw_package_import", "fw_package_inspect"):
+            schema = automation.TOOLS_BY_NAME[tool_name]["inputSchema"]
+            self.assertEqual(schema["oneOf"], [{"required": ["document"]}, {"required": ["source_json"]}])
+            for args in ({}, {"source_json": "{}", "document": {}}, {"source_json": []},
+                         {"source_json": "[]"}, {"source_json": '{"x":1,"x":2}'},
+                         {"source_json": '{"x":NaN}'}, {"source_json": '{"x":"\\ud800"}'}):
+                with self.subTest(tool=tool_name, args=args):
+                    self.assertTrue(self.call(tool_name, args)["isError"])
+        self.assertEqual(self.app.packages.list(), [])
+        self.assertEqual(self.backend.calls, [])
+
+    def test_package_source_json_does_not_bypass_nested_schema_validation(self):
+        draft = self.call("fw_package_inspect", {"document": API_JOB["prompt"]})["structuredContent"]
+        for change in ({"version": True}, {"version": 1.0}, {"format": "script"}):
+            self.assertTrue(self.call("fw_package_import", {"source_json": json.dumps({**draft, **change})})["isError"])
+        draft["fields"][0]["required"] = "true"
+        self.assertTrue(self.call("fw_package_import", {"source_json": json.dumps(draft)})["isError"])
+        self.assertEqual(self.app.packages.list(), [])
+        self.assertEqual(self.backend.calls, [])
+
     def test_job_query_recipe_retry_and_owned_cancel(self):
         job = self.generate()["structuredContent"]
         self.assertEqual(self.call("fw_jobs", {"job_id": job["id"]})["structuredContent"]["id"], job["id"])

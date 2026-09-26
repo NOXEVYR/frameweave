@@ -62,7 +62,7 @@ def _known_family(filename, role):
 
 def _check_family(filename, role, kind):
     known = _known_family(filename, role)
-    expected = "h3" if kind.startswith("h3_") else kind
+    expected = "h3" if kind.startswith("h3_") else "sdxl" if kind == "sdxl_i2i" else kind
     compatible = {expected}
     if kind == "krea" and role == "vae":
         compatible.add("qwen_image")
@@ -82,8 +82,8 @@ def catalog(object_info: dict) -> dict:
         "dit": _filenames(info, "UNETLoader", "unet_name"),
         "text_encoder": _filenames(info, "CLIPLoader", "clip_name"),
         "vae": _filenames(info, "VAELoader", "vae_name"),
-        "lora": _filenames(info, "LoraLoaderModelOnly", "lora_name")
-        or _filenames(info, "LoraLoader", "lora_name"),
+        "lora": [name for node in ("LoraLoader", "LoraLoaderModelOnly", "LoraLoaderBypassModelOnly")
+                 for name in _filenames(info, node, "lora_name")],
     }
     folder_roles = {
         "checkpoint": {"checkpoint", "checkpoints"},
@@ -135,9 +135,28 @@ def capabilities(object_info: dict) -> dict:
     return {
         "h3": h3_common <= present and h3_decode and "minimax" in _options(object_info.get("CLIPLoader", {}), "type"),
         "sdxl": image_common | {"CheckpointLoaderSimple", "EmptyLatentImage"} <= present,
+        "sdxl_i2i": image_common | {"CheckpointLoaderSimple", "LoadImage", "ImageScale", "VAEEncode"} <= present,
         "krea": image_common | {"UNETLoader", "CLIPLoader", "VAELoader", "EmptySD3LatentImage", "ConditioningZeroOut"} <= present
         and "krea2" in _options(object_info.get("CLIPLoader", {}), "type"),
     }
+
+
+def generation_options(object_info: dict) -> dict:
+    """Only expose options actually declared by this backend, never invented files."""
+    result = {"samplers": _options(object_info.get("KSampler", {}), "sampler_name"),
+              "schedulers": _options(object_info.get("KSampler", {}), "scheduler"),
+              "lora_loaders": {}, "model_families": {}}
+    for node in ("LoraLoader", "LoraLoaderModelOnly", "LoraLoaderBypassModelOnly"):
+        if node not in object_info:
+            continue
+        result["lora_loaders"][node] = {"names": _filenames(object_info, node, "lora_name"),
+                                        "strength_clip": node == "LoraLoader"}
+    dual = object_info.get("MiniMaxH3DualClockSamplerT8", {})
+    result["h3_dual_clock"] = {"samplers": _options(dual, "sampler_name"),
+                                "schedulers": _options(dual, "scheduler")}
+    for role, names in catalog(object_info).items():
+        result["model_families"][role] = {name: _known_family(name, role) or "unknown" for name in names}
+    return result
 
 
 def _expanded_inputs(schema, values):
@@ -343,6 +362,33 @@ def _reference_names(request):
     return references
 
 
+def _lora_specs(request, kind):
+    """Normalize legacy single LoRA and explicit, ordered multi-LoRA requests."""
+    sdxl = kind in {"sdxl", "sdxl_i2i"}
+    if "loras" in request:
+        values = request["loras"]
+        if not isinstance(values, list) or len(values) > 4:
+            raise ValueError("loras 必须为最多 4 项的列表")
+    else:
+        name = request.get("lora") or request.get("models", {}).get("lora")
+        strength = request.get("lora_strength", 1.0)
+        values = [{"name": name, "strength_model": strength,
+                   "strength_clip": strength if sdxl else 0}] if name else []
+    result = []
+    for item in values:
+        if not isinstance(item, dict) or set(item) - {"name", "strength_model", "strength_clip"}:
+            raise ValueError("LoRA 项只支持 name、strength_model、strength_clip")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 1024:
+            raise ValueError("LoRA name 必须为 1–1024 字符的名称")
+        model_strength = _number(item, "strength_model", 1, -10, 10)
+        clip_strength = _number(item, "strength_clip", 1 if sdxl else 0, -10, 10)
+        if not sdxl and clip_strength != 0:
+            raise ValueError("H3 / Krea 当前仅支持 model-only LoRA；strength_clip 必须省略或为 0")
+        result.append({"name": name, "strength_model": model_strength, "strength_clip": clip_strength})
+    return result
+
+
 def _reference_roles(request, kind, references):
     roles = request.get("reference_roles")
     if roles is None:
@@ -398,7 +444,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             prompt = prompt["prompt"]
         validate_prompt(prompt, object_info)
         return {"prompt": copy.deepcopy(prompt), "summary": {"kind": kind, "nodes": len(prompt), "warnings": []}}
-    if kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl"}:
+    if kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i"}:
         raise ValueError("不支持的生成类型")
     positive, negative = request.get("positive", ""), request.get("negative", "")
     if not isinstance(positive, str) or not positive.strip() or not isinstance(negative, str):
@@ -409,6 +455,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
     if not isinstance(models, dict):
         raise ValueError("models 必须是模型角色对象")
     h3 = kind.startswith("h3_")
+    sdxl = kind in {"sdxl", "sdxl_i2i"}
     width = _number(request, "width", 736 if h3 else 1024, 32, 8192, True)
     height = _number(request, "height", 416 if h3 else 1024, 32, 8192, True)
     alignment = 32 if h3 else 16 if kind == "krea" else 8
@@ -416,7 +463,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         raise ValueError(f"宽高必须为 {alignment} 的倍数")
     seed = _number(request, "seed", 0, 0, 2**64 - 1, True)
     steps = _number(request, "steps", 20 if kind != "krea" else 8, 1, 1000, True)
-    cfg = _number(request, "cfg", 1.0 if kind != "sdxl" else 7.0, 0, 100)
+    cfg = _number(request, "cfg", 7.0 if sdxl else 1.0, 0, 100)
     denoise = _number(request, "denoise", 1.0, 0, 1)
     refs = _reference_names(request)
     roles = _reference_roles(request, kind, refs)
@@ -431,7 +478,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         warnings.append("ComfyUI KSampler 的 CFG=0 使用负向条件，不跟随正向提示词。")
     elif cfg == 1 and negative.strip():
         warnings.append("CFG=1 不启用额外负向引导；反向提示词不会参与标准 KSampler 的引导。")
-    lora = request.get("lora") or models.get("lora")
+    loras = _lora_specs(request, kind)
     if denoise < 1 and not refs:
         raise ValueError("低于 1 的 denoise 需要输入图片")
     if kind == "h3_t2v" and refs:
@@ -442,10 +489,12 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         raise ValueError("参考生视频需要 1–9 张参考图")
     if kind == "krea" and len(refs) > 3:
         raise ValueError("Krea2 图像编辑最多使用 3 张参考图")
-    if kind == "sdxl" and len(refs) > 1:
+    if kind == "sdxl_i2i" and len(refs) != 1:
+        raise ValueError("SDXL 图生图必须提供一张输入图")
+    if sdxl and len(refs) > 1:
         raise ValueError("SDXL 图生图只使用一张输入图")
 
-    if kind == "sdxl":
+    if sdxl:
         checkpoint = _model(models, "checkpoint", available, ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"))
         _check_family(checkpoint, "checkpoint", kind)
         summary["models"]["checkpoint"] = checkpoint
@@ -458,7 +507,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             summary["models"]["vae"] = vae_name
     else:
         dit_tokens = ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",)
-        dit = _model(models, "dit", available, dit_tokens, ("pruned",) if h3 and not lora else ())
+        dit = _model(models, "dit", available, dit_tokens, ("pruned",) if h3 and not loras else ())
         text_encoder = _model(models, "text_encoder", available, ("minimax_h3",) if h3 else ("qwen3vl_4b",),
                               ("nvfp4",) if h3 else ())
         vae_name = _model(models, "vae", available, ("minimax_h3_video_vae",) if h3 else ("qwen_image_vae",))
@@ -468,14 +517,14 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         model = graph.add("UNETLoader", unet_name=dit, weight_dtype="default")
         clip = graph.add("CLIPLoader", clip_name=text_encoder, type="minimax" if h3 else "krea2")
         vae = graph.add("VAELoader", vae_name=vae_name)
-    if lora:
-        if not isinstance(lora, str) or lora not in available["lora"]:
+    for item in loras:
+        lora = item["name"]
+        if lora not in available["lora"]:
             raise ValueError("所选 LoRA 未被后端列出")
-        strength = _number(request, "lora_strength", 1.0, -10, 10)
-        summary["models"]["lora"] = lora
-        if kind == "sdxl":
+        _check_family(lora, "lora", kind)
+        if sdxl:
             model = graph.add("LoraLoader", model=model, clip=clip, lora_name=lora,
-                              strength_model=strength, strength_clip=strength)
+                              strength_model=item["strength_model"], strength_clip=item["strength_clip"])
             clip = [model[0], 1]
         else:
             quantized = any(token in summary["models"]["dit"].lower() for token in ("int8", "fp8", "nvfp4", "gguf"))
@@ -487,7 +536,11 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             loader = "LoraLoaderBypassModelOnly" if quantized and "LoraLoaderBypassModelOnly" in object_info else "LoraLoaderModelOnly"
             if quantized and loader == "LoraLoaderModelOnly":
                 warnings.append("量化基模使用后端原生 LoRA 加载器，具体权重组合需生成验证。")
-            model = graph.add(loader, model=model, lora_name=lora, strength_model=strength)
+            model = graph.add(loader, model=model, lora_name=lora, strength_model=item["strength_model"])
+    if len(loras) == 1:
+        summary["models"]["lora"] = loras[0]["name"]  # Old clients still display one selected LoRA.
+    if loras:
+        warnings.append("LoRA 文件名与节点校验不能证明权重兼容；多 LoRA 组合的效果和显存需求需实际生成验证。")
     images = [graph.add("LoadImage", image=name) for name in refs]
     sampler = request.get("sampler", "euler")
     scheduler = request.get("scheduler", "simple")
@@ -519,7 +572,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             warnings.append("此画布超过约百万像素，16 GB 显存不保证可运行。")
         if not math.isclose(frames / 24, seconds):
             warnings.append(f"H3 按 17n+5 对齐为 {frames} 帧，实际 {frames / 24:.3f} 秒。")
-        if steps < 16 and not lora:
+        if steps < 16 and not loras:
             warnings.append("当前未应用加速 LoRA；低步数仅供预览，画质与音质未保证。")
         audio_name = _model(models, "audio_vae", available, ("minimax_h3_audio_vae",))
         _check_family(audio_name, "audio_vae", kind)
@@ -590,7 +643,7 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             negative_conditioning = graph.add("ConditioningZeroOut", conditioning=conditioning)
         else:
             negative_conditioning = graph.add("CLIPTextEncode", clip=clip, text=negative)
-        if images and (kind == "sdxl" or denoise < 1):
+        if images and (sdxl or denoise < 1):
             image = graph.add("ImageScale", image=images[0], upscale_method="lanczos", width=width, height=height, crop="center")
             latent = graph.add("VAEEncode", pixels=image, vae=vae)
         else:
@@ -603,5 +656,5 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         graph.add("SaveImage", images=decoded, filename_prefix="FrameWeave/image")
     validate_prompt(graph.nodes, object_info)
     summary.update(nodes=len(graph.nodes), sampler=sampler, scheduler=scheduler,
-                   references=len(refs), reference_roles=roles)
+                   references=len(refs), reference_roles=roles, denoise=denoise, loras=loras)
     return {"prompt": graph.nodes, "summary": summary}

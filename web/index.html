@@ -9,11 +9,13 @@
   <title>棱光 PrismCanvas · 影像创作工作台</title>
   <link rel="icon" type="image/svg+xml" href="/brand.svg">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/studio.css">
+  <link rel="stylesheet" href="/workflow-canvas.css">
   <script type="module" src="/app.js"></script>
 </head>
-<body>
+<body data-workspace="canvas">
   <header class="topbar">
-    <a class="brand" href="/" aria-label="棱光 PrismCanvas 首页"><img class="brand-mark" src="/brand.svg" width="44" height="44" alt=""><span>棱光<small>PrismCanvas</small></span><span class="alpha">0.5.0</span></a>
+    <a class="brand" href="/" aria-label="棱光 PrismCanvas 首页"><img class="brand-mark" src="/brand.svg" width="44" height="44" alt=""><span>棱光<small>PrismCanvas</small></span><span class="alpha">0.7.0</span></a>
     <div class="brand-caption">把灵感，展开成画面。<span>LOCAL CREATIVE STUDIO</span></div>
     <div class="top-actions">
       <button class="engine-status" id="engine-status" title="查看本地推理环境"><span class="status-dot"></span><span id="engine-label">连接本地引擎…</span></button>
@@ -23,9 +25,17 @@
     </div>
   </header>
   <main class="workbench">
+    <nav class="app-navigation" aria-label="工作区">
+      <span class="app-nav-label">创作空间</span>
+      <button type="button" data-workspace="canvas" class="workspace-nav active" aria-pressed="true"><span aria-hidden="true">◈</span>画布</button>
+      <button type="button" data-workspace="txt2img" class="workspace-nav" aria-pressed="false"><span aria-hidden="true">✦</span>文生图</button>
+      <button type="button" data-workspace="img2img" class="workspace-nav" aria-pressed="false"><span aria-hidden="true">▧</span>图生图</button>
+      <button type="button" data-workspace="video" class="workspace-nav" aria-pressed="false"><span aria-hidden="true">▷</span>视频生成</button>
+      <div class="app-nav-foot">PRISMCANVAS<br>LOCAL STUDIO</div>
+    </nav>
     <div class="workspace-bar">
       <div class="workspace-heading"><span class="workspace-label">工作台</span><span class="workspace-slash" aria-hidden="true">/</span><div class="project-name"><span class="project-indicator" aria-hidden="true"></span><span id="project-title">未命名画布</span></div><span class="save-state" id="save-state">本地自动保存</span></div>
-      <div class="project-actions"><button class="button quiet compact" id="open-project" title="导入画布 JSON"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg><span>导入画布</span></button><button class="button compact" id="save-project" title="导出画布 JSON"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg><span>导出画布</span></button></div>
+      <div class="project-actions"><button class="button quiet compact" id="toggle-inspector" title="展开或收起节点属性与队列">属性 / 队列</button><button class="button quiet compact" id="open-project" title="导入画布 JSON"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg><span>导入画布</span></button><button class="button compact" id="save-project" title="导出画布 JSON"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg><span>导出画布</span></button></div>
     </div>
     <nav class="toolrail" aria-label="画布工具">
       <span class="rail-label">工具</span>
@@ -54,6 +64,7 @@
       <div class="canvas-footer"><div class="history-controls"><button id="undo" class="footer-button" title="撤销 Ctrl+Z" aria-label="撤销"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m8 5-5 5 5 5M3 10h11a6 6 0 0 1 0 12" transform="translate(0 -3)"/></svg></button><button id="redo" class="footer-button" title="重做 Ctrl+Shift+Z" aria-label="重做"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m16 5 5 5-5 5m5-5H10a6 6 0 0 0 0 12" transform="translate(0 -3)"/></svg></button><span class="footer-separator"></span><span id="node-count">3 个节点</span></div><div class="canvas-hint" id="canvas-hint">滚轮缩放 · 空白拖动 · Shift 框选</div><div class="zoom-controls"><button class="footer-button" id="zoom-out" aria-label="缩小">−</button><button class="zoom-value" id="zoom-reset" title="恢复 100%">100%</button><button class="footer-button" id="zoom-in" aria-label="放大">+</button><button class="footer-button fit-icon" id="fit-view" aria-label="适配全部节点" title="适配画布 F"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg></button></div></div>
       <button class="minimap" id="minimap-button" title="点击缩略图适配画布" aria-label="缩略图，点击适配画布"><canvas id="minimap" width="300" height="170"></canvas><span>OVERVIEW</span></button>
     </section>
+    <section id="studio-root" aria-label="独立生成工作台" hidden></section>
     <aside class="inspector" aria-label="节点属性与任务">
       <div class="inspector-heading"><span class="eyebrow">CONTROL ROOM</span><strong>让每一帧，都可控。</strong></div>
       <div class="inspector-tabs" role="tablist" aria-label="属性和任务"><button class="tab active" id="tab-properties" role="tab" aria-selected="true" aria-controls="properties-panel">节点属性</button><button class="tab" id="tab-jobs" role="tab" aria-selected="false" aria-controls="jobs-panel">生成队列 <span id="job-count">0</span></button></div>

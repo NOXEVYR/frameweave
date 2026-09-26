@@ -1,20 +1,25 @@
-import { createNode, createDemo, connect, removeNodes, duplicateNodes, generationPayload, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
+import { createNode, createDemo, connect, removeNodes, generationPayload, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
 import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, redactLocalText, publicChecksReport } from './packages.mjs';
 import { filterJobs, filterPackages } from './library.mjs';
 import { placeFragment } from './canvas-layout.mjs';
+import { selectionBounds, copySelection, pasteSelection, moveSelection, arrangeSelection, clampMenuPosition } from './canvas-actions.mjs';
+import { createGenerationStudio } from './generation-studio.mjs';
+import { createWorkflowCanvas } from './workflow-canvas.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
 const JOB_MAP_KEY = 'frameweave.jobs.v1';
 const RETRY_REQUESTS_KEY = 'frameweave.retry-requests.v1';
-const KIND_NAMES = { h3_t2v: 'H3 · 文生视频', h3_i2v: 'H3 · 首尾帧视频', h3_ref: 'H3 · 参考生成视频', sdxl: 'SDXL · 图片生成', krea: 'Krea 2 · 图片生成', api: 'ComfyUI · API 工作流', package: '工作流包 · 填写即生成' };
+const CANVAS_ID_KEY = 'frameweave.canvas.identity.v1';
+let canvasIdentity = '';
+const KIND_NAMES = { h3_t2v: 'H3 · 文生视频', h3_i2v: 'H3 · 首尾帧视频', h3_ref: 'H3 · 参考生成视频', sdxl: 'SDXL · 文生图', sdxl_i2i: 'SDXL · 图生图', krea: 'Krea 2 · 图片生成', api: 'ComfyUI · API 工作流', package: '工作流包 · 填写即生成' };
 const STATUS_NAMES = { queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', cancelled: '已取消' };
 const canvas = $('#canvas');
 const world = $('#world');
 const nodesLayer = $('#nodes');
 const edgesLayer = $('#connections');
 let graph = createDemo();
-let viewport = { x: 60, y: 160, scale: 0.8 };
+let viewport = { x: 60, y: 110, scale: 1 };
 let selected = new Set([graph.nodes[1].id]);
 let selectedEdge = null;
 let history = [];
@@ -51,6 +56,14 @@ const retryRequests = new Map();
 const reusing = new Set();
 const organizingPackages = new Set();
 let draftEditing = null;
+let canvasClipboard = null;
+let pasteOffset = 0;
+let nodeMenu = null;
+let keyboardMoveBefore = null;
+let studio = null;
+let workflowCanvas = null;
+let edgeScale = null;
+let edgeCanvasVisible = null;
 const clone = value => JSON.parse(JSON.stringify(value));
 
 function el(tag, className, text) {
@@ -88,7 +101,10 @@ async function api(path, body) {
   try {
     const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-FW-Token': csrf }, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal });
     const result = await response.json().catch(() => ({ error: `服务返回无效数据 (${response.status})` }));
-    if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+    if (!response.ok) {
+      const error = new Error(result.error || `请求失败 (${response.status})`);
+      error.status = response.status; error.payload = result; throw error;
+    }
     return result;
   } catch (error) {
     if (error.name === 'AbortError') throw new Error('本地服务响应超时，请检查引擎状态后重试。');
@@ -96,9 +112,20 @@ async function api(path, body) {
   } finally { clearTimeout(timeout); }
 }
 function getNode(id) { return graph.nodes.find(node => node.id === id); }
+function ensureCanvasIdentity() {
+  if (!canvasIdentity) { try { canvasIdentity = localStorage.getItem(CANVAS_ID_KEY) || ''; } catch {} canvasIdentity ||= crypto.randomUUID(); }
+  return canvasIdentity;
+}
+function currentCanvasIdentity() { const identity = ensureCanvasIdentity(); localStorage.setItem(CANVAS_ID_KEY, identity); return identity; }
+function replaceCanvasIdentity() { const next = crypto.randomUUID(); localStorage.setItem(CANVAS_ID_KEY, next); canvasIdentity = next; jobNodes = {}; }
 function singleSelected() { return selected.size === 1 ? getNode([...selected][0]) : null; }
 function selectedGeneration() { const node = singleSelected(); return node?.type === 'generation' ? node : graph.nodes.find(item => item.type === 'generation'); }
-function snapshot() { return JSON.stringify(graph); }
+function snapshot() { return JSON.stringify({ graph, canvasIdentity: ensureCanvasIdentity(), jobNodes }); }
+function restoreSnapshot(value) {
+  const state = JSON.parse(value);
+  localStorage.setItem(CANVAS_ID_KEY, state.canvasIdentity);
+  canvasIdentity = state.canvasIdentity; graph = state.graph; jobNodes = state.jobNodes || {};
+}
 function pushHistory(before) {
   if (before === snapshot()) return;
   history.push(before);
@@ -108,6 +135,7 @@ function pushHistory(before) {
   updateHistory();
 }
 function mutate(action, options = {}) {
+  finishKeyboardMove();
   const before = snapshot();
   action();
   if (draftEditing) {
@@ -132,16 +160,18 @@ function save(immediate = false) {
   if (immediate) write(); else saveTimer = setTimeout(write, 500);
 }
 function undo() {
+  finishKeyboardMove();
   if (!history.length) return;
-  future.push(snapshot());
-  graph = JSON.parse(history.pop());
+  const before = snapshot(); restoreSnapshot(history.at(-1));
+  history.pop(); future.push(before);
   selected = new Set([...selected].filter(id => getNode(id)));
   renderAll(); save();
 }
 function redo() {
+  finishKeyboardMove();
   if (!future.length) return;
-  history.push(snapshot());
-  graph = JSON.parse(future.pop());
+  const before = snapshot(); restoreSnapshot(future.at(-1));
+  future.pop(); history.push(before);
   selected = new Set([...selected].filter(id => getNode(id)));
   renderAll(); save();
 }
@@ -151,14 +181,24 @@ function viewPoint(clientX, clientY) {
   return { x: (clientX - rect.left - viewport.x) / viewport.scale, y: (clientY - rect.top - viewport.y) / viewport.scale };
 }
 function applyViewport() {
-  world.style.transform = `translate(${viewport.x}px,${viewport.y}px) scale(${viewport.scale})`;
+  // Native layout zoom rerasterizes text at its displayed size. GPU scaling of
+  // the entire world can reuse a low-resolution texture on HiDPI WebView2.
+  if (globalThis.CSS?.supports('zoom', '1')) {
+    world.style.zoom = String(viewport.scale);
+    world.style.transform = `translate(${viewport.x / viewport.scale}px,${viewport.y / viewport.scale}px)`;
+  } else world.style.transform = `translate(${viewport.x}px,${viewport.y}px) scale(${viewport.scale})`;
   canvas.style.backgroundSize = `${22 * viewport.scale}px ${22 * viewport.scale}px`;
   canvas.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`;
   $('#zoom-reset').textContent = `${Math.round(viewport.scale * 100)}%`;
-  drawMinimap();
+  // Translation moves the existing SVG with its nodes. Only scale/visibility
+  // changes need fresh pixel-rounded port centers; rebuilding on every pan
+  // would replace thousands of paths unnecessarily on larger canvases.
+  const visible = canvas.offsetParent !== null;
+  if (edgeScale !== viewport.scale || edgeCanvasVisible !== visible) renderEdges();
+  else drawMinimap();
 }
 function zoom(factor, x = canvas.clientWidth / 2, y = canvas.clientHeight / 2) {
-  const next = Math.max(.2, Math.min(2, viewport.scale * factor));
+  const next = Math.max(.2, Math.min(3, viewport.scale * factor));
   viewport.x = x - (x - viewport.x) / viewport.scale * next;
   viewport.y = y - (y - viewport.y) / viewport.scale * next;
   viewport.scale = next;
@@ -187,15 +227,17 @@ function centerOnNode(node) {
   viewport.y = Math.max(112, (canvas.clientHeight - size.height * viewport.scale) / 2) - node.y * viewport.scale;
   applyViewport(); save();
 }
-function bounds() {
-  if (!graph.nodes.length) return { minX: 0, minY: 0, maxX: 800, maxY: 500 };
-  return graph.nodes.reduce((box, node) => { const size = nodeSize(node); return { minX: Math.min(box.minX, node.x), minY: Math.min(box.minY, node.y), maxX: Math.max(box.maxX, node.x + size.width), maxY: Math.max(box.maxY, node.y + size.height) }; }, { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+function bounds(nodes = graph.nodes) {
+  return selectionBounds(nodes, nodeSize) || { minX: 0, minY: 0, maxX: 800, maxY: 500 };
 }
-function fitView() {
-  const box = bounds();
+function fitView(onlySelected = false) {
+  onlySelected = onlySelected === true;
+  const nodes = onlySelected ? graph.nodes.filter(node => selected.has(node.id)) : graph.nodes;
+  if (onlySelected && !nodes.length) { toast('先选择需要查看的节点'); return; }
+  const box = bounds(nodes);
   const availableWidth = Math.max(100, canvas.clientWidth - 90);
   const availableHeight = Math.max(100, canvas.clientHeight - 240);
-  viewport.scale = Math.min(1.1, Math.max(.2, Math.min(availableWidth / (box.maxX - box.minX), availableHeight / (box.maxY - box.minY))));
+  viewport.scale = Math.min(1, Math.max(.2, Math.min(availableWidth / (box.maxX - box.minX), availableHeight / (box.maxY - box.minY))));
   viewport.x = (canvas.clientWidth - (box.maxX - box.minX) * viewport.scale) / 2 - box.minX * viewport.scale;
   viewport.y = 132 - box.minY * viewport.scale + Math.max(0, (availableHeight - (box.maxY - box.minY) * viewport.scale) / 3);
   applyViewport(); save();
@@ -222,12 +264,28 @@ function drawMinimap() {
 }
 function edgePath(a, b) { const spread = Math.max(65, Math.abs(b.x - a.x) * .45); return `M ${a.x} ${a.y} C ${a.x + spread} ${a.y}, ${b.x - spread} ${b.y}, ${b.x} ${b.y}`; }
 function svgElement(tag, attributes) { const element = document.createElementNS('http://www.w3.org/2000/svg', tag); Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, String(value))); return element; }
+function portPoint(node, direction) {
+  const port = document.getElementById(`fw-node-${node.id}`)?.querySelector(`.port.${direction}`);
+  if (port?.getClientRects().length) {
+    const rect = port.getBoundingClientRect();
+    return viewPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  }
+  return { x: node.x + (direction === 'output' ? nodeSize(node).width : 0), y: node.y + 74.5 };
+}
 function renderEdges() {
+  edgeScale = viewport.scale;
+  edgeCanvasVisible = canvas.offsetParent !== null;
   edgesLayer.replaceChildren();
+  const anchors = new Map();
+  const anchor = (node, direction) => {
+    const key = `${node.id}:${direction}`;
+    if (!anchors.has(key)) anchors.set(key, portPoint(node, direction));
+    return anchors.get(key);
+  };
   for (const edge of graph.edges) {
     const from = getNode(edge.source), to = getNode(edge.target);
     if (!from || !to) continue;
-    const a = { x: from.x + nodeSize(from).width, y: from.y + 74.5 }, b = { x: to.x, y: to.y + 74.5 };
+    const a = anchor(from, 'output'), b = anchor(to, 'input');
     const path = edgePath(a, b);
     const hit = svgElement('path', { d: path, class: 'edge-hit', 'data-edge-id': edge.id });
     hit.addEventListener('click', event => { event.stopPropagation(); selectedEdge = edge.id; selected.clear(); renderSelection(); renderEdges(); renderInspector(); });
@@ -235,7 +293,7 @@ function renderEdges() {
   }
   if (connecting) {
     const node = getNode(connecting.source);
-    if (node) edgesLayer.append(svgElement('path', { d: edgePath({ x: node.x + nodeSize(node).width, y: node.y + 74.5 }, connecting.point), class: 'edge-draft' }));
+    if (node) edgesLayer.append(svgElement('path', { d: edgePath(anchor(node, 'output'), connecting.point), class: 'edge-draft' }));
   }
   drawMinimap();
 }
@@ -292,12 +350,14 @@ function preview(output) {
 function port(node, direction) {
   const element = button('', `port ${direction}${connecting?.source === node.id && direction === 'output' ? ' armed' : ''}`, () => {
     if (direction === 'output') {
-      connecting = { source: node.id, point: { x: node.x + nodeSize(node).width + 80, y: node.y + 74.5 } };
+      const point = portPoint(node, 'output');
+      connecting = { source: node.id, point: { x: point.x + 80, y: point.y } };
       canvas.classList.add('connecting');
       $('#canvas-hint').textContent = '点击目标输入端口连接 · Esc 取消';
       renderEdges(); renderSelection();
     } else if (connecting) {
       const source = connecting.source;
+      if (node.data.kind === 'package') { cancelConnection(); return workflowCanvas.connectNodes(source, node.id); }
       mutate(() => connect(graph, source, node.id));
       cancelConnection(); toast('节点已连接');
     } else toast('先点击来源节点的右侧输出端口');
@@ -305,12 +365,12 @@ function port(node, direction) {
   element.dataset.port = direction;
   return element;
 }
-function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '滚轮缩放 · 空白拖动 · Shift 框选'; renderEdges(); renderSelection(); }
+function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '双击新建 · 滚轮缩放 · 空格平移 · Shift 框选'; renderEdges(); renderSelection(); }
 function renderNodes() {
   const remaining = new Map([...nodesLayer.children].map(card => [card.dataset.nodeId, card]));
   graph.nodes.forEach((node, index) => {
     const previous = remaining.get(node.id); remaining.delete(node.id);
-    const signature = JSON.stringify([node.data, index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => getNode(edge.source)?.data), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
+    const signature = JSON.stringify([node.data, index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => [edge, getNode(edge.source)?.data]), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
     if (previous && previous._node === node && (previous._signature === signature || previous.contains(document.activeElement))) {
       previous.style.left = `${node.x}px`; previous.style.top = `${node.y}px`; previous.classList.toggle('selected', selected.has(node.id));
       if (nodesLayer.children[index] !== previous) nodesLayer.insertBefore(previous, nodesLayer.children[index] || null);
@@ -332,19 +392,27 @@ function renderNodes() {
       const footer = el('div', 'node-footer'); footer.append(el('span', '', `${node.data.text.length} 字 · 可连接多个生成节点`), button('复制提示词 ↗', 'node-action', () => copyText(node.data.text))); card.append(footer, port(node, 'output'));
     } else if (node.type === 'generation') {
       const pack = node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null;
-      const labels = el('div', 'port-label'); labels.append(el('span', '', node.data.kind === 'package' ? 'INPUT / 右侧表单' : 'INPUT / 提示词与参考'), el('span', '', 'OUTPUT'));
+      const labels = el('div', 'port-label'); labels.append(el('span', '', node.data.kind === 'package' ? 'INPUT / 连线与表单' : 'INPUT / 提示词与参考'), el('span', '', 'OUTPUT'));
       body.append(labels, el('span', 'model-chip', node.data.kind === 'package' ? '可复用工作流包' : node.data.kind.startsWith('h3') ? 'MiniMax H3 · 本地推理' : node.data.kind === 'api' ? 'API 工作流 · 高级' : `${node.data.kind === 'krea' ? 'Krea 2' : 'SDXL'} · 本地推理`));
       const summary = el('div', 'generation-summary');
       const stats = node.data.kind === 'package' ? [['工作流', pack?.name || '待导入对应包'], ['可填输入', pack?.fields?.length ?? '—'], ['执行', '本地引擎'], ['操作', '填写 → 生成']] : node.data.kind === 'api' ? [['工作流', '已导入 API'], ['节点', Object.keys(node.data.apiPrompt || {}).length], ['执行', '本地引擎'], ['编辑', '原始 JSON']] : [['尺寸', `${node.data.width} × ${node.data.height}`], ['模式', node.data.kind.startsWith('h3') ? `${node.data.seconds}s · ${node.data.fps}fps` : '静态图像'], ['采样步数', node.data.steps], ['种子', node.data.seed]];
       stats.forEach(([name, value]) => { const stat = el('div', 'stat'); stat.append(el('span', '', name), el('strong', '', value)); summary.append(stat); });
       body.append(summary);
       let prompt = ''; try { prompt = generationPayload(graph, node.id).positive; } catch { /* API import has no prompt yet. */ }
-      body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '选择此节点，在右侧填写输入，然后开始生成。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
+      body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '连接提示词或上游图片，也可在右侧填写输入。运行时自动完成上游依赖。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
+      if (pack) {
+        const inputs = el('div', 'node-workflow-inputs');
+        for (const definition of pack.fields.filter(f => ['text', 'image'].includes(f.type)).slice(0, 6)) {
+          const link = workflowCanvas?.describeInput(node.id, definition);
+          inputs.append(el('span', '', `${link ? '●' : '○'} ${definition.label}${link ? ` ← ${getNode(link.edge.source)?.data.title || '来源'}` : ''}`));
+        }
+        body.append(inputs);
+      }
       const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id); run.dataset.runNode = node.id;
       body.append(run); card.append(body);
       const footer = el('div', 'node-footer');
       const status = el('span', 'node-status', '○ 等待提交'); status.dataset.nodeStatus = node.id;
-      footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer); if (node.data.kind !== 'package') card.append(port(node, 'input')); card.append(port(node, 'output'));
+      footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer, port(node, 'input'), port(node, 'output'));
     } else if (node.type === 'reference') {
       if (node.data.url) body.append(outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.name }, 'reference-media'));
       else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '选择参考图片'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此图片' : 'PNG · JPG · WebP · 最大 20 MiB')); body.append(drop); }
@@ -363,7 +431,7 @@ function renderNodes() {
         const caption = el('div', 'output-caption'), state = el('span', '', '未生成'); state.dataset.resultStatus = node.data.jobId;
         caption.append(el('span', '', 'OUTPUT / 本地媒体'), state); body.append(caption);
       }
-      card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', 'IMAGE / VIDEO')); card.append(footer, port(node, 'input'));
+      card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', 'IMAGE / VIDEO')); card.append(footer, port(node, 'input'), port(node, 'output'));
     }
     if (previous) { releaseMedia(previous); previous.replaceWith(card); }
     if (nodesLayer.children[index] !== card) nodesLayer.insertBefore(card, nodesLayer.children[index] || null);
@@ -371,13 +439,16 @@ function renderNodes() {
   remaining.forEach(card => { releaseMedia(card); card.remove(); });
   $('#node-count').textContent = `${graph.nodes.length} 个节点`;
   $('#canvas-empty').hidden = !!graph.nodes.length;
+  updateCanvasActions();
   updateNodeJobStatus();
+  workflowCanvas?.refresh();
   requestAnimationFrame(renderEdges);
 }
 function renderSelection() {
   document.querySelectorAll('.node').forEach(node => node.classList.toggle('selected', selected.has(node.dataset.nodeId)));
   document.querySelectorAll('.port.output').forEach(element => element.classList.toggle('armed', connecting?.source === element.closest('.node').dataset.nodeId));
   drawMinimap();
+  updateCanvasActions();
 }
 function editNode(id, key, value, refreshInspector = false) { mutate(() => { const node = getNode(id); if (node) node.data[key] = value; }, { inspector: refreshInspector }); }
 function bindDraft(input, change, number = false) {
@@ -430,22 +501,29 @@ function field(label, value, onChange, options = {}) {
 function section(container, label, index) { const heading = el('div', 'section-label'); heading.append(el('span', '', label), el('span', 'section-index', index)); container.append(heading); }
 function catalog(key, kind) {
   let values = engine.models?.[key] || (key === 'checkpoint' ? engine.models?.checkpoints : []) || [];
+  if (key === 'lora' && engine.generation_options?.lora_loaders) {
+    const loaders = engine.generation_options.lora_loaders;
+    const names = kind.startsWith('sdxl') ? ['LoraLoader'] : ['LoraLoaderModelOnly', 'LoraLoaderBypassModelOnly'];
+    values = names.flatMap(name => loaders[name]?.names || []);
+  }
   values = values.map(value => typeof value === 'string' ? value : value?.name).filter(Boolean);
+  values = [...new Set(values)];
   const lower = value => value.toLowerCase().replaceAll('\\', '/');
+  const prefer = predicate => [...values.filter(predicate), ...values.filter(value => !predicate(value))];
   if (kind.startsWith('h3')) {
-    if (key === 'dit') return values.filter(value => /h3/i.test(value) && (kind === 'h3_ref' ? /ref/i.test(value) : /fl2v|fl2va|t2v/i.test(value)) && !/lora|turbo_4step|turbo_8step/i.test(value));
-    if (key === 'text_encoder') return values.filter(value => /minimax_h3|qwen3vl[_-]?32b|qwen3[_-]vl[_-]?32b/.test(lower(value)));
-    if (key === 'vae') return values.filter(value => /minimax_h3.*video|h3.*video.*vae|h3.*vae.*video/.test(lower(value)));
-    if (key === 'audio_vae') return values.filter(value => /h3.*audio|audio.*h3/.test(lower(value)));
-    if (key === 'lora') return values.filter(value => /h3/.test(lower(value)) && !(kind === 'h3_ref' ? /fl2v/.test(lower(value)) : /ref2v/.test(lower(value))));
+    if (key === 'dit') return prefer(value => /h3/i.test(value) && (kind === 'h3_ref' ? /ref/i.test(value) : /fl2v|fl2va|t2v/i.test(value)) && !/lora|turbo_4step|turbo_8step/i.test(value));
+    if (key === 'text_encoder') return prefer(value => /minimax_h3|qwen3vl[_-]?32b|qwen3[_-]vl[_-]?32b/.test(lower(value)));
+    if (key === 'vae') return prefer(value => /minimax_h3.*video|h3.*video.*vae|h3.*vae.*video/.test(lower(value)));
+    if (key === 'audio_vae') return prefer(value => /h3.*audio|audio.*h3/.test(lower(value)));
+    if (key === 'lora') return prefer(value => /h3/.test(lower(value)) && !(kind === 'h3_ref' ? /fl2v/.test(lower(value)) : /ref2v/.test(lower(value))));
   }
   if (kind === 'krea') {
-    if (key === 'dit') return values.filter(value => /krea2|krea_2/.test(lower(value)) && !/lora/.test(lower(value)));
-    if (key === 'text_encoder') return values.filter(value => /qwen3vl[_-]?4b|qwen3[_-]vl[_-]?4b/.test(lower(value)));
-    if (key === 'vae') return values.filter(value => /qwen_image|qwen.*vae/.test(lower(value)));
-    if (key === 'lora') return values.filter(value => /krea/.test(lower(value)));
+    if (key === 'dit') return prefer(value => /krea2|krea_2/.test(lower(value)) && !/lora/.test(lower(value)));
+    if (key === 'text_encoder') return prefer(value => /qwen3vl[_-]?4b|qwen3[_-]vl[_-]?4b/.test(lower(value)));
+    if (key === 'vae') return prefer(value => /qwen_image|qwen.*vae/.test(lower(value)));
+    if (key === 'lora') return prefer(value => /krea/.test(lower(value)));
   }
-  if (kind === 'sdxl' && key === 'lora') return values.filter(value => /sdxl|pony|illustrious|noob|\bxl\b/.test(lower(value)));
+  if (kind.startsWith('sdxl') && key === 'lora') return prefer(value => /sdxl|pony|illustrious|noob|\bxl\b/.test(lower(value)));
   return values;
 }
 function modelField(node, label, key) {
@@ -500,6 +578,14 @@ function renderPackageInputs(wrap, node) {
     }
     control.dataset.packageField = definition.id;
     const mapping = el('span', 'field-help package-mapping', `节点 ${definition.node_id} · ${definition.input}`); control.append(mapping);
+    if (['text', 'image'].includes(type)) {
+      const connected = workflowCanvas?.describeInput(node.id, definition), connections = el('div', 'workflow-field-link');
+      if (connected) {
+        control.querySelectorAll('input,textarea,select,button').forEach(input => { input.disabled = true; });
+        connections.append(el('span', '', `已连接：${connected.text}；运行时使用连线值`), button('断开', 'button quiet', () => mutate(() => { graph.edges = graph.edges.filter(e => e.id !== connected.edge.id); })));
+      } else connections.append(el('span', '', '可从画布连接输入'), button('连接来源', 'button quiet', () => workflowCanvas.connectNodes('', node.id, definition.id)));
+      control.append(connections);
+    }
     wrap.append(control);
   }
 }
@@ -507,6 +593,12 @@ async function loadPackages() {
   const result = await api('/api/packages');
   packages = Array.isArray(result.packages) ? result.packages : [];
   packagesLoaded = true;
+  let changed = false;
+  for (const node of graph.nodes.filter(n => n.data.kind === 'package')) {
+    const pack = packages.find(p => p.id === node.data.package_id);
+    if (pack) { const fields = pack.fields.map(({ id, label, type }) => ({ id, label, type })); if (JSON.stringify(node.data.packageFields) !== JSON.stringify(fields)) { node.data.packageFields = fields; changed = true; } }
+  }
+  if (changed) save();
   renderPackageLibrary(); renderNodes();
   if (singleSelected()?.data?.kind === 'package' && !$('#properties-panel').contains(document.activeElement)) renderInspector();
 }
@@ -546,19 +638,20 @@ async function openPackages() {
   try { await loadPackages(); } catch (error) { $('#package-list').replaceChildren(el('p', 'model-note', error.message)); throw error; }
 }
 function addPackageNode(pack) {
+  studio?.open('canvas');
   const box = bounds(), origin = { x: graph.nodes.length ? box.maxX + 72 : 80, y: singleSelected()?.y ?? 80 };
-  const node = addNode('generation', { title: pack.name, kind: 'package', package_id: pack.id, packageValues: defaultValues(pack.fields || []) }, origin);
+  const node = addNode('generation', { title: pack.name, kind: 'package', package_id: pack.id, packageValues: defaultValues(pack.fields || []), packageFields: (pack.fields || []).map(({ id, label, type }) => ({ id, label, type })) }, origin);
   viewport.x = canvas.clientWidth / 2 - (node.x + 152) * viewport.scale;
   viewport.y = 150 - node.y * viewport.scale; applyViewport(); save();
   $('#packages-dialog').close(); $('#package-editor-dialog').close();
   switchTab('properties'); renderInspector();
-  toast('已添加工作流包，在右侧填写输入后开始生成');
+  toast('已添加工作流节点，可连接提示词、参考图或其他工作流的图片输出');
   return node;
 }
 async function exportPackage(id) {
   const result = await api(`/api/packages/${encodeURIComponent(id)}/export`, {});
   if (!result.document) throw new Error('本地服务没有返回工作流包');
-  downloadJSON(result.document, `frameweave-workflow-${id}.json`);
+  downloadJSON(result.source_json || result.document, `frameweave-workflow-${id}.json`);
   toast('已导出工作流与输入定义，不包含模型或素材文件');
 }
 function renderPackageDraft() {
@@ -578,18 +671,22 @@ function renderPackageDraft() {
   }
   if (!packageDraft.fields.length) list.append(el('p', 'model-note', '没有可暴露的基础输入。仍可保存为使用固定参数的工作流包。'));
 }
-async function inspectPackageDocument(document, name = '') {
-  const result = await api('/api/packages/inspect', { document });
+async function inspectPackageDocument(document, name = '', sourceJSON = '') {
+  const result = await api('/api/packages/inspect', sourceJSON ? { source_json: sourceJSON } : { document });
   if (!result.prompt || !Array.isArray(result.fields)) throw new Error('本地服务未返回有效的工作流输入定义');
   packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: fieldType(item) === 'image' || document.format === 'frameweave-workflow' || item.recommended !== false })) };
   $('#package-name').value = name || result.name || '新建工作流包'; $('#package-description').value = result.description || '';
+  if (sourceJSON && document.format === 'frameweave-workflow') {
+    packageDraft.sourceJSON = sourceJSON;
+    packageDraft.originalEditor = stableStringify({ name: $('#package-name').value.trim(), description: $('#package-description').value.trim(), fields: packageDraft.fields });
+  }
   $('#package-inspection-note').textContent = '保存只建立本地工作流包；每次运行前会按当前后端重新校验节点、参数与模型。';
   renderPackageDraft(); $('#packages-dialog').close(); $('#package-editor-dialog').showModal();
 }
 async function inspectPackageFile(file) {
   if (file.size > PACKAGE_LIMIT) throw new Error('工作流包 / API JSON 最大为 2 MiB');
-  const document = parsePackageDocument(await file.text());
-  await inspectPackageDocument(document, document.format === 'frameweave-workflow' ? '' : file.name.replace(/\.json$/i, ''));
+  const sourceJSON = await file.text(), document = parsePackageDocument(sourceJSON);
+  await inspectPackageDocument(document, document.format === 'frameweave-workflow' ? '' : file.name.replace(/\.json$/i, ''), sourceJSON);
 }
 async function packageCurrentNode() {
   const node = selectedGeneration();
@@ -620,10 +717,12 @@ function renderInspector() {
     section(wrap, '生成模式', '01 / MODEL');
     wrap.append(field('模型与任务', node.data.kind, kind => {
       if (kind === 'package' && node.data.kind !== 'package') { renderInspector(); openPackages().catch(reportError); return; }
+      if (node.data.kind === 'package' && kind !== 'package' && graph.edges.some(edge => edge.target === node.id && edge.targetField)) { renderInspector(); throw new Error('此工作流已有输入连接，请先断开连接，再切换为其他生成模式'); }
       mutate(() => {
       node.data.kind = kind; node.data.title = KIND_NAMES[kind]; node.data.models = {};
+      if (Object.hasOwn(node.data, 'loras')) node.data.loras = [];
       if (kind === 'krea') { node.data.steps = 8; node.data.cfg = 1; node.data.width = 1024; node.data.height = 1024; }
-      else if (kind === 'sdxl') { node.data.steps = 25; node.data.cfg = 7; node.data.width = 1024; node.data.height = 1024; }
+      else if (kind.startsWith('sdxl')) { node.data.steps = 25; node.data.cfg = 7; node.data.width = 1024; node.data.height = 1024; }
       else if (kind.startsWith('h3')) { node.data.steps = 20; node.data.cfg = 1; node.data.width = 768; node.data.height = 448; }
       });
     }, { select: Object.entries(KIND_NAMES).map(([value, label]) => ({ value, label })) }));
@@ -657,10 +756,9 @@ function renderInspector() {
       schedule.append(field('采样器', node.data.sampler || 'euler', value => editNode(node.id, 'sampler', value), { select: ['euler', 'euler_ancestral', 'heun', 'dpmpp_2m', 'dpmpp_2m_sde', 'dpmpp_sde', 'uni_pc', 'ddim'] }), field('调度器', node.data.scheduler || 'simple', value => editNode(node.id, 'scheduler', value), { select: ['simple', 'normal', 'karras', 'exponential', 'sgm_uniform', 'beta'] }));
       wrap.append(schedule, field('去噪强度', node.data.denoise ?? 1, value => editNode(node.id, 'denoise', value), { number: true, min: 0, max: 1, step: .05, readonly: node.data.kind.startsWith('h3'), help: node.data.kind.startsWith('h3') ? 'H3 条件生成固定为 1' : '低于 1 时需要连接参考图' }));
       section(wrap, '模型文件', '05 / LOCAL ASSETS');
-      const modelFields = node.data.kind === 'sdxl' ? [['Checkpoint 主模型', 'checkpoint']] : [['DiT 主模型', 'dit'], ['文本编码器', 'text_encoder'], ['图像 / 视频 VAE', 'vae'], ...(node.data.kind.startsWith('h3') ? [['音频 VAE', 'audio_vae']] : [])];
+      const modelFields = node.data.kind.startsWith('sdxl') ? [['Checkpoint 主模型', 'checkpoint']] : [['DiT 主模型', 'dit'], ['文本编码器', 'text_encoder'], ['图像 / 视频 VAE', 'vae'], ...(node.data.kind.startsWith('h3') ? [['音频 VAE', 'audio_vae']] : [])];
       modelFields.forEach(([label, key]) => wrap.append(modelField(node, label, key)));
-      wrap.append(modelField(node, 'LoRA · 风格 / 加速', 'lora'));
-      wrap.append(field('LoRA 强度', node.data.lora_strength ?? 1, value => editNode(node.id, 'lora_strength', value), { number: true, min: -2, max: 2, step: .05 }));
+      renderLoraFields(wrap, node);
     }
     const actions = el('div', 'inspector-actions'); actions.append(button('检查缺失项', 'button quiet', () => runDiagnostics(node)), button('导出执行 JSON', 'button quiet', () => compileNode(node))); wrap.append(actions);
     const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id); run.dataset.runNode = node.id; wrap.append(run);
@@ -683,14 +781,56 @@ function renderInspector() {
   content.append(wrap);
 }
 function renderAll() { renderNodes(); renderInspector(); updateHistory(); applyViewport(); }
-function addNode(type, data = {}, position = null) {
+function revealInspector() {
+  if (document.body.classList.contains('canvas-focus') || !canvasIsActive()) return;
+  document.body.classList.add('inspector-open');
+  $('#toggle-inspector')?.setAttribute('aria-pressed', 'true');
+}
+function addNode(type, data = {}, position = null, anchored = false) {
   if (graph.nodes.length >= 500) throw new Error('当前画布已满，请先导出或整理节点。');
   const point = viewPoint(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2);
   const node = createNode(type, position?.x ?? point.x - 145, position?.y ?? point.y - 115, data);
-  placeNewNodes([node]);
+  // Explicit positions come from the node menu; keep the node anchored there.
+  if (!anchored) placeNewNodes([node]);
   mutate(() => { graph.nodes.push(node); selected = new Set([node.id]); selectedEdge = null; });
-  centerOnNode(node);
+  revealInspector();
+  if (!anchored) centerOnNode(node);
   return node;
+}
+function renderLoraFields(wrap, node) {
+  const clip = node.data.kind.startsWith('sdxl');
+  if (!Object.hasOwn(node.data, 'loras')) {
+    wrap.append(modelField(node, 'LoRA · 风格 / 加速', 'lora'));
+    wrap.append(field('LoRA 强度', node.data.lora_strength ?? 1, value => editNode(node.id, 'lora_strength', value), { number: true, min: -10, max: 10, step: .05 }));
+    wrap.append(button('使用多 LoRA · 分别调节强度', 'button quiet inspector-run', () => mutate(() => {
+      const name = node.data.models?.lora || '', strength = node.data.lora_strength ?? 1;
+      node.data.loras = name ? [{ name, strength_model: strength, ...(clip ? { strength_clip: strength } : {}) }] : [];
+    })));
+    return;
+  }
+  const values = catalog('lora', node.data.kind), stack = node.data.loras;
+  const container = el('div', 'inspector-lora-list'); container.setAttribute('aria-label', '节点 LoRA 叠加');
+  container.append(el('p', 'field-help', stack.length ? `按顺序应用 ${stack.length} / 4 个 LoRA。文件名推荐不代表权重兼容性已验证。` : '未启用 LoRA。空列表会禁用旧画布的单 LoRA 设置。'));
+  stack.forEach((item, index) => {
+    const row = el('section', 'inspector-lora-row'); row.dataset.loraIndex = String(index);
+    const choices = [...values]; if (!choices.includes(item.name)) choices.unshift(item.name);
+    const change = (key, value) => mutate(() => { node.data.loras[index] = { ...node.data.loras[index], [key]: value }; }, { inspector: false });
+    row.append(field(`LoRA ${index + 1} 文件`, item.name, value => change('name', value), { select: choices.map(value => ({ value, label: values.includes(value) ? value : `${value} · 当前后端未列出` })) }));
+    const strengths = el('div', 'field-grid');
+    strengths.append(field(`LoRA ${index + 1} 模型强度`, item.strength_model ?? 1, value => change('strength_model', value), { number: true, min: -10, max: 10, step: .05 }));
+    if (clip) strengths.append(field(`LoRA ${index + 1} 文本强度`, item.strength_clip ?? 1, value => change('strength_clip', value), { number: true, min: -10, max: 10, step: .05 }));
+    row.append(strengths, button(`移除 LoRA ${index + 1}`, 'text-link', () => mutate(() => { node.data.loras.splice(index, 1); })));
+    container.append(row);
+  });
+  const add = button('＋ 添加 LoRA', 'button quiet inspector-run', () => mutate(() => {
+    if (node.data.loras.length >= 4) return;
+    const name = values.find(value => !node.data.loras.some(item => item.name === value)) || values[0];
+    if (!name) return;
+    node.data.loras.push({ name, strength_model: 1, ...(clip ? { strength_clip: 1 } : {}) });
+  }));
+  add.disabled = stack.length >= 4 || !values.length; container.append(add);
+  if (!values.length) container.append(el('p', 'field-help', '连接本地引擎后可选择该模式加载器支持的 LoRA。现有选择会保留。'));
+  wrap.append(container);
 }
 function deleteSelection() {
   if (!selected.size && !selectedEdge) return;
@@ -700,7 +840,135 @@ function deleteSelection() {
   });
   toast('已删除，可使用 Ctrl+Z 撤销');
 }
-function duplicateSelection() { if (!selected.size) return; mutate(() => { selected = new Set(duplicateNodes(graph, selected)); }); }
+function duplicateSelection() {
+  if (!selected.size) return;
+  const copied = copySelection(graph, selected), box = bounds(copied.nodes);
+  if (graph.edges.length + copied.edges.length > 2000) throw new Error('复制后超过 2000 条连接，请先整理画布。');
+  const fragment = pasteSelection(copied, { x: box.minX + 44, y: box.minY + 44 }, graph.nodes.length);
+  mutate(() => { graph.nodes.push(...fragment.nodes); graph.edges.push(...fragment.edges); selected = new Set(fragment.nodes.map(node => node.id)); selectedEdge = null; });
+}
+
+function canvasIsActive() { return (!document.body.dataset.workspace || document.body.dataset.workspace === 'canvas') && canvas.offsetParent !== null; }
+function updateCanvasActions() {
+  const count = selected.size;
+  const copy = $('#canvas-copy'), paste = $('#canvas-paste'), fit = $('#canvas-fit-selection'), rename = $('#canvas-rename');
+  if (copy) copy.disabled = !count;
+  if (paste) paste.disabled = !canvasClipboard?.nodes.length;
+  if (fit) fit.disabled = !count;
+  if (rename) rename.disabled = count !== 1;
+  const arrange = $('#canvas-arrange');
+  if (arrange) { arrange.disabled = count < 2; [...arrange.options].forEach(option => { if (['horizontal', 'vertical'].includes(option.value)) option.disabled = count < 3; }); }
+  const label = $('#canvas-selection-count'); if (label) label.textContent = count ? `已选 ${count}` : '未选择';
+}
+function copyCanvasSelection() {
+  if (!selected.size) return;
+  canvasClipboard = copySelection(graph, selected); pasteOffset = 0;
+  updateCanvasActions(); toast(`已复制 ${canvasClipboard.nodes.length} 个节点和内部连接`);
+}
+function pasteCanvasSelection(position = null) {
+  if (!canvasClipboard?.nodes.length) { toast('请先复制画布节点'); return; }
+  if (graph.edges.length + canvasClipboard.edges.length > 2000) throw new Error('粘贴后超过 2000 条连接，请先整理画布。');
+  const box = bounds(canvasClipboard.nodes);
+  pasteOffset += 36;
+  const fragment = pasteSelection(canvasClipboard, position || { x: box.minX + pasteOffset, y: box.minY + pasteOffset }, graph.nodes.length);
+  mutate(() => { graph.nodes.push(...fragment.nodes); graph.edges.push(...fragment.edges); selected = new Set(fragment.nodes.map(node => node.id)); selectedEdge = null; });
+  toast(`已粘贴 ${fragment.nodes.length} 个节点，可撤销`);
+}
+function arrangeCanvasSelection(mode) {
+  const positions = arrangeSelection(graph.nodes.filter(node => selected.has(node.id)), mode, nodeSize);
+  if (!positions.length) return;
+  mutate(() => positions.forEach(position => Object.assign(getNode(position.id), position)));
+}
+function renameCanvasSelection() {
+  const node = singleSelected(); if (!node) { toast('请选择一个节点重命名'); return; }
+  closeNodeMenu();
+  let dialog = $('#canvas-rename-dialog');
+  if (!dialog) {
+    dialog = el('dialog', 'modal canvas-rename-dialog'); dialog.id = 'canvas-rename-dialog'; dialog.setAttribute('aria-label', '重命名节点');
+    const form = el('form'), heading = el('h2', '', '重命名节点'), label = el('label', 'field', '节点名称'), input = el('input');
+    input.id = 'canvas-rename-input'; input.required = true; input.maxLength = 100; input.autocomplete = 'off';
+    label.append(input);
+    const actions = el('div', 'modal-actions'), submit = el('button', 'button primary', '保存名称'); submit.type = 'submit';
+    actions.append(button('取消', 'button quiet', () => dialog.close()), submit); form.append(heading, label, actions); dialog.append(form); document.body.append(dialog);
+    form.addEventListener('submit', event => {
+      event.preventDefault(); const target = getNode(dialog.dataset.nodeId), title = input.value.trim();
+      if (!title || !target) return;
+      mutate(() => { target.data.title = title; }); dialog.close();
+    });
+    dialog.addEventListener('close', () => canvas.focus({ preventScroll: true }));
+  }
+  dialog.dataset.nodeId = node.id; $('#canvas-rename-input').value = node.data.title; dialog.showModal(); $('#canvas-rename-input').select();
+}
+function toggleCanvasFocus(force) {
+  const active = typeof force === 'boolean' ? force : !document.body.classList.contains('canvas-focus');
+  document.body.classList.toggle('canvas-focus', active);
+  const control = $('#canvas-focus'); if (control) { control.textContent = active ? '退出专注' : '专注画布'; control.setAttribute('aria-pressed', String(active)); }
+  requestAnimationFrame(applyViewport);
+}
+function closeNodeMenu(restoreFocus = false) {
+  if (nodeMenu) { nodeMenu.remove(); nodeMenu = null; }
+  if (restoreFocus) canvas.focus({ preventScroll: true });
+}
+function openNodeMenu(clientX, clientY, nodeId = null) {
+  closeNodeMenu();
+  if (nodeId && !selected.has(nodeId)) { selected = new Set([nodeId]); selectedEdge = null; renderSelection(); renderInspector(); }
+  if (nodeId) revealInspector();
+  const point = viewPoint(clientX, clientY);
+  point.x = Math.max(-1e7, Math.min(1e7, Math.round(point.x))); point.y = Math.max(-1e7, Math.min(1e7, Math.round(point.y)));
+  nodeMenu = el('div', 'canvas-node-menu'); nodeMenu.id = 'canvas-node-menu'; nodeMenu.setAttribute('role', 'menu'); nodeMenu.setAttribute('aria-label', nodeId ? '节点操作' : '新建节点');
+  nodeMenu.style.position = 'fixed'; nodeMenu.style.zIndex = '150';
+  nodeMenu.append(el('div', 'canvas-menu-heading', nodeId ? '节点操作' : '在此处新建节点'));
+  const item = (label, action, disabled = false) => {
+    const control = button(label, 'canvas-menu-item', () => { closeNodeMenu(); action(); }, label);
+    control.setAttribute('role', 'menuitem'); control.disabled = disabled; nodeMenu.append(control);
+  };
+  if (!nodeId) {
+    item('文本 / 提示词', () => addNode('prompt', {}, point, true));
+    item('参考图片', () => addNode('reference', {}, point, true));
+    item('H3 视频生成', () => addNode('generation', {}, point, true));
+    item('图片生成', () => addNode('generation', { title: 'SDXL 图片生成', kind: 'sdxl', width: 1024, height: 1024, steps: 25, cfg: 7 }, point, true));
+    item('结果预览', () => addNode('result', {}, point, true));
+    item('工作流包 · 添加到画布', () => openPackages().catch(reportError));
+    nodeMenu.append(el('hr', 'canvas-menu-divider'));
+  } else {
+    item('重命名 · F2', renameCanvasSelection, selected.size !== 1);
+    item('复制所选 · Ctrl+C', copyCanvasSelection);
+    item('创建副本 · Ctrl+D', duplicateSelection);
+    item('适配所选 · Shift+F', () => fitView(true));
+    item('删除所选 · Delete', deleteSelection);
+  }
+  item('粘贴节点 · Ctrl+V', () => pasteCanvasSelection(point), !canvasClipboard?.nodes.length);
+  nodeMenu.addEventListener('keydown', event => {
+    const controls = [...nodeMenu.querySelectorAll('button:not(:disabled)')];
+    if (event.key === 'Escape') { event.preventDefault(); closeNodeMenu(true); return; }
+    if (event.key === 'Tab') { closeNodeMenu(true); return; }
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault(); event.stopPropagation();
+      const index = controls.indexOf(document.activeElement), next = event.key === 'Home' ? 0 : event.key === 'End' ? controls.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + controls.length) % controls.length;
+      controls[next]?.focus();
+    }
+  });
+  document.body.append(nodeMenu);
+  nodeMenu.style.maxHeight = `${Math.max(100, window.innerHeight - 16)}px`; nodeMenu.style.overflowY = 'auto';
+  const position = clampMenuPosition({ x: clientX, y: clientY }, nodeMenu.getBoundingClientRect(), { width: window.innerWidth, height: window.innerHeight });
+  nodeMenu.style.left = `${position.x}px`; nodeMenu.style.top = `${position.y}px`;
+  nodeMenu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
+}
+function initializeCanvasActions() {
+  const bar = el('div', 'canvas-action-bar'); bar.id = 'canvas-actions'; bar.setAttribute('role', 'toolbar'); bar.setAttribute('aria-label', '画布编辑工具');
+  const add = button('＋ 新建节点', 'canvas-action-button', () => { const rect = add.getBoundingClientRect(); openNodeMenu(rect.left, rect.bottom + 8); });
+  const box = button('框选', 'canvas-action-button', () => { tool = tool === 'box' ? 'select' : 'box'; canvas.classList.remove('hand'); $('#tool-hand').classList.remove('active'); $('#tool-hand').setAttribute('aria-pressed', 'false'); $('#tool-select').classList.add('active'); $('#tool-select').setAttribute('aria-pressed', 'true'); box.setAttribute('aria-pressed', String(tool === 'box')); }); box.id = 'canvas-box-select'; box.setAttribute('aria-pressed', 'false');
+  const copy = button('复制', 'canvas-action-button', copyCanvasSelection); copy.id = 'canvas-copy';
+  const paste = button('粘贴', 'canvas-action-button', () => pasteCanvasSelection()); paste.id = 'canvas-paste';
+  const rename = button('重命名', 'canvas-action-button', renameCanvasSelection); rename.id = 'canvas-rename';
+  const arrange = el('select', 'canvas-arrange'); arrange.id = 'canvas-arrange'; arrange.setAttribute('aria-label', '对齐和分布所选节点');
+  [['', '对齐 / 分布'], ['left', '左对齐'], ['right', '右对齐'], ['top', '顶对齐'], ['bottom', '底对齐'], ['horizontal', '水平等距'], ['vertical', '垂直等距']].forEach(([value, label]) => { const option = el('option', '', label); option.value = value; arrange.append(option); });
+  arrange.addEventListener('change', () => { const value = arrange.value; arrange.value = ''; if (value) try { arrangeCanvasSelection(value); } catch (error) { reportError(error); } });
+  const fit = button('适配所选', 'canvas-action-button', () => fitView(true)); fit.id = 'canvas-fit-selection';
+  const focus = button('专注画布', 'canvas-action-button', () => toggleCanvasFocus()); focus.id = 'canvas-focus'; focus.setAttribute('aria-pressed', 'false');
+  const count = el('span', 'canvas-selection-count'); count.id = 'canvas-selection-count';
+  bar.append(add, box, copy, paste, rename, arrange, fit, focus, count); $('.canvas-topline').after(bar); updateCanvasActions();
+}
 function downloadJSON(value, filename) {
   const blob = new Blob([typeof value === 'string' ? value : stableStringify(value)], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob); const link = el('a'); link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
@@ -722,7 +990,7 @@ async function refreshEngine(showToast = false) {
   } catch (error) {
     engine.online = false; $('#engine-status').classList.remove('online'); $('#engine-status').classList.add('offline'); $('#engine-label').textContent = '本地服务不可用';
     if (showToast) throw error;
-  }
+  } finally { studio?.refresh(); }
 }
 function knownLocalPaths() {
   return [...(settings.model_roots || []), ...(settings.comfy_roots || []), ...(environment?.installations || []).flatMap(item => [item.root, typeof item.python === 'string' ? item.python : item.python?.path, ...(item.model_roots || [])])].filter(value => typeof value === 'string');
@@ -832,36 +1100,25 @@ async function runDiagnostics(node = selectedGeneration(), scan = false) {
   } finally { diagnosticBusy = false; $('#diagnostic-refresh').disabled = false; }
 }
 async function runNode(id) {
-  if (submitting.has(id)) return;
-  const node = getNode(id); if (!node) return;
-  const payload = generationPayload(graph, id);
-  if (payload.kind === 'package') {
-    const pack = packages.find(item => item.id === payload.package_id);
-    if (!pack) throw new Error('本机包库中没有对应工作流包，请先导入原来的包文件。');
-    payload.values = validateValues(pack.fields, payload.values);
-  } else if (payload.kind !== 'api' && !payload.positive.trim()) throw new Error('先连接提示词节点或填写正向提示词。');
-  submitting.add(id); document.querySelectorAll('[data-run-node]').forEach(element => { if (element.dataset.runNode === id) { element.disabled = true; element.textContent = '正在提交…'; } });
-  try {
-    const job = await api('/api/jobs', payload);
-    if (!job.id) throw new Error('服务没有返回任务 ID');
-    // A slow submission may finish after the user imported or deleted a canvas.
-    // Keep the accepted task visible without attaching it to stale graph objects.
-    if (getNode(id) === node) {
-      jobNodes[job.id] = id;
-      mutate(() => {
-        let targets = graph.edges.filter(edge => edge.source === id).map(edge => getNode(edge.target)).filter(item => item?.type === 'result');
-        if (!targets.length && graph.nodes.length < 500 && graph.edges.length < 2000) {
-          const result = createNode('result', node.x + nodeSize(node).width + 64, node.y, { title: `${node.data.title} · 结果` });
-          placeNewNodes([result]); graph.nodes.push(result); connect(graph, id, result.id); targets = [result];
-        }
-        targets.forEach(target => { target.data.jobId = job.id; target.data.outputs = clone(job.outputs || []); });
-      });
-    }
-    jobs.unshift({ ...job, elapsed: job.elapsed || 0, outputs: job.outputs || [] });
-    switchTab('jobs'); renderJobs(); save(true);
-    toast('任务已提交到本地引擎');
-    await pollJobs();
-  } finally { submitting.delete(id); document.querySelectorAll('[data-run-node]').forEach(element => { if (element.dataset.runNode === id) { element.disabled = false; element.textContent = '▷  开始生成'; } }); }
+  if (!getNode(id)) return;
+  return workflowCanvas.run([id]);
+}
+function acceptCanvasWorkflowJob(id, job) {
+  if (!job?.id) return;
+  const node = getNode(id);
+  if (node?.type === 'generation' && workflowCanvas.state()?.canvas_id === currentCanvasIdentity()) {
+    jobNodes[job.id] = id;
+    mutate(() => {
+      let targets = graph.edges.filter(edge => edge.source === id).map(edge => getNode(edge.target)).filter(item => item?.type === 'result');
+      if (!targets.length && graph.nodes.length < 500 && graph.edges.length < 2000) {
+        const result = createNode('result', node.x + nodeSize(node).width + 64, node.y, { title: `${node.data.title} · 结果` });
+        placeNewNodes([result]); graph.nodes.push(result); connect(graph, id, result.id); targets = [result];
+      }
+      targets.forEach(target => { target.data.jobId = job.id; target.data.outputs = clone(job.outputs || []); });
+    });
+  }
+  jobs = [{ ...job, elapsed: job.elapsed || 0, outputs: job.outputs || [] }, ...jobs.filter(item => item.id !== job.id)];
+  renderJobs(); save(true); pollJobs();
 }
 function duration(seconds) { seconds = Math.max(0, Math.floor(Number(seconds) || 0)); return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`; }
 function updateNodeJobStatus() {
@@ -1026,7 +1283,7 @@ async function pollJobs() {
     renderJobs();
     if (outputsChanged) { renderNodes(); if (singleSelected()?.type === 'result') renderInspector(); save(); }
   } catch { /* Keep the last known task list on a transient disconnect. Status shows connection health. */ }
-  finally { pollBusy = false; }
+  finally { pollBusy = false; studio?.refresh(); }
 }
 function switchTab(tab) {
   const properties = tab === 'properties';
@@ -1052,24 +1309,42 @@ async function uploadFile(file, target) {
   toast('素材已保存到本地');
 }
 
+canvas.addEventListener('dblclick', event => {
+  if (event.button !== 0 || event.target.closest('.node,button,input,textarea,select,video,a,[data-edge-id],.edge-line')) return;
+  event.preventDefault(); cancelConnection(); openNodeMenu(event.clientX, event.clientY);
+});
+canvas.addEventListener('contextmenu', event => {
+  if (event.target.closest('input,textarea,select,[contenteditable=true],video,a')) return;
+  event.preventDefault(); openNodeMenu(event.clientX, event.clientY, event.target.closest('.node')?.dataset.nodeId || null);
+});
+document.addEventListener('pointerdown', event => { if (nodeMenu && !nodeMenu.contains(event.target)) closeNodeMenu(); }, true);
+window.addEventListener('resize', () => closeNodeMenu());
 canvas.addEventListener('wheel', event => {
   if (event.target.closest('textarea,select') && !event.ctrlKey) return;
+  closeNodeMenu();
   event.preventDefault();
   const rect = canvas.getBoundingClientRect(); zoom(Math.exp(-event.deltaY * .0015), event.clientX - rect.left, event.clientY - rect.top);
 }, { passive: false });
 canvas.addEventListener('pointerdown', event => {
+  finishKeyboardMove();
   if (event.button !== 0 && event.button !== 1) return;
   const card = event.target.closest('.node');
   const interactive = event.target.closest('button,input,textarea,select,video,a');
   if (event.target.closest('[data-edge-id],.edge-line')) return;
+  if (card && event.button === 0 && !spaceDown && tool !== 'hand') {
+    revealInspector();
+    if (interactive && !selected.has(card.dataset.nodeId)) {
+      selected = new Set([card.dataset.nodeId]); selectedEdge = null; renderSelection(); renderInspector(); switchTab('properties');
+    }
+  }
   if (interactive && event.button !== 1 && !spaceDown) return;
   if (connecting && !card && event.button === 0) { cancelConnection(); return; }
   const point = viewPoint(event.clientX, event.clientY);
-  if (spaceDown || event.button === 1 || tool === 'hand' || !card && !event.shiftKey) {
+  if (spaceDown || event.button === 1 || tool === 'hand' || !card && !event.shiftKey && tool !== 'box') {
     pointer = { mode: 'pan', x: event.clientX, y: event.clientY, startX: viewport.x, startY: viewport.y, distance: 0 };
     canvas.classList.add('panning');
-  } else if (!card && event.shiftKey) {
-    const rect = canvas.getBoundingClientRect(); pointer = { mode: 'box', x: event.clientX - rect.left, y: event.clientY - rect.top, previous: new Set(selected) };
+  } else if (!card && (event.shiftKey || tool === 'box')) {
+    const rect = canvas.getBoundingClientRect(); pointer = { mode: 'box', x: event.clientX - rect.left, y: event.clientY - rect.top, previous: event.shiftKey ? new Set(selected) : new Set() };
     const box = $('#selection-box'); box.hidden = false; box.style.left = `${pointer.x}px`; box.style.top = `${pointer.y}px`; box.style.width = '0'; box.style.height = '0';
   } else if (card) {
     const id = card.dataset.nodeId;
@@ -1078,7 +1353,7 @@ canvas.addEventListener('pointerdown', event => {
     selectedEdge = null; renderSelection(); renderInspector(); switchTab('properties');
     if (event.target.closest('.node-header') && selected.has(id)) pointer = { mode: 'drag', start: point, before: snapshot(), positions: graph.nodes.filter(node => selected.has(node.id)).map(node => ({ id: node.id, x: node.x, y: node.y })) };
   }
-  if (pointer) { canvas.setPointerCapture(event.pointerId); event.preventDefault(); }
+  if (pointer) { canvas.focus({ preventScroll: true }); canvas.setPointerCapture(event.pointerId); event.preventDefault(); }
 });
 canvas.addEventListener('pointermove', event => {
   const point = viewPoint(event.clientX, event.clientY);
@@ -1087,7 +1362,7 @@ canvas.addEventListener('pointermove', event => {
   if (pointer.mode === 'pan') {
     viewport.x = pointer.startX + event.clientX - pointer.x; viewport.y = pointer.startY + event.clientY - pointer.y; pointer.distance = Math.abs(event.clientX - pointer.x) + Math.abs(event.clientY - pointer.y); applyViewport();
   } else if (pointer.mode === 'drag') {
-    for (const start of pointer.positions) { const node = getNode(start.id); node.x = Math.round(start.x + point.x - pointer.start.x); node.y = Math.round(start.y + point.y - pointer.start.y); const element = document.getElementById(`fw-node-${node.id}`); element.style.left = `${node.x}px`; element.style.top = `${node.y}px`; }
+    for (const position of moveSelection(pointer.positions, Math.round(point.x - pointer.start.x), Math.round(point.y - pointer.start.y))) { const node = getNode(position.id); Object.assign(node, position); const element = document.getElementById(`fw-node-${node.id}`); element.style.left = `${node.x}px`; element.style.top = `${node.y}px`; }
     renderEdges();
   } else {
     const rect = canvas.getBoundingClientRect(); const x = event.clientX - rect.left, y = event.clientY - rect.top;
@@ -1113,22 +1388,43 @@ canvas.addEventListener('drop', event => {
   event.preventDefault(); const files = [...event.dataTransfer.files];
   (async () => { for (const file of files) await uploadFile(file, null); })().catch(reportError);
 });
+function finishKeyboardMove() { if (keyboardMoveBefore !== null) { pushHistory(keyboardMoveBefore); keyboardMoveBefore = null; } }
 document.addEventListener('keydown', event => {
   const editing = event.target.closest('input,textarea,select,[contenteditable=true]');
-  if (event.key === 'Escape') { cancelConnection(); return; }
-  if (editing || document.querySelector('dialog[open]')) return;
+  if (event.defaultPrevented) return;
+  if (event.key === 'Escape') {
+    if (document.querySelector('dialog[open]')) return;
+    if (nodeMenu) closeNodeMenu(true);
+    else if (canvasIsActive()) { cancelConnection(); toggleCanvasFocus(false); }
+    return;
+  }
+  if (editing || document.querySelector('dialog[open]') || nodeMenu || !canvasIsActive()) return;
   const command = event.ctrlKey || event.metaKey;
+  const arrow = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key);
+  if (!arrow) finishKeyboardMove();
   if (event.code === 'Space') { event.preventDefault(); spaceDown = true; canvas.classList.add('hand'); }
   if (command && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); }
   else if (command && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); }
-  else if (command && event.key.toLowerCase() === 'd') { event.preventDefault(); duplicateSelection(); }
+  else if (command && event.key.toLowerCase() === 'd') { event.preventDefault(); try { duplicateSelection(); } catch (error) { reportError(error); } }
+  else if (command && event.key.toLowerCase() === 'c') { event.preventDefault(); copyCanvasSelection(); }
+  else if (command && event.key.toLowerCase() === 'v') { event.preventDefault(); try { pasteCanvasSelection(); } catch (error) { reportError(error); } }
   else if (command && event.key.toLowerCase() === 's') { event.preventDefault(); exportProject(); }
   else if (command && event.key.toLowerCase() === 'a') { event.preventDefault(); selected = new Set(graph.nodes.map(node => node.id)); renderSelection(); renderInspector(); }
   else if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); deleteSelection(); }
-  else if (event.key.toLowerCase() === 'f') { event.preventDefault(); fitView(); }
+  else if (event.key === 'F2') { event.preventDefault(); renameCanvasSelection(); }
+  else if (!command && event.key.toLowerCase() === 'f') { event.preventDefault(); fitView(event.shiftKey); }
+  else if (!command && event.key === '0') { event.preventDefault(); zoom(1 / viewport.scale); }
+  else if (!command && ['+', '='].includes(event.key)) { event.preventDefault(); zoom(1.15); }
+  else if (!command && event.key === '-') { event.preventDefault(); zoom(1 / 1.15); }
+  else if (arrow && !command && !event.altKey && selected.size) {
+    event.preventDefault(); if (keyboardMoveBefore === null) keyboardMoveBefore = snapshot();
+    const step = event.shiftKey ? 20 : 1, dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0, dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
+    moveSelection(graph.nodes.filter(node => selected.has(node.id)), dx, dy).forEach(position => Object.assign(getNode(position.id), position));
+    renderNodes(); save();
+  }
 });
-document.addEventListener('keyup', event => { if (event.code === 'Space') { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); } });
-window.addEventListener('blur', () => { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); });
+document.addEventListener('keyup', event => { if (event.key.startsWith('Arrow')) finishKeyboardMove(); if (event.code === 'Space') { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); } });
+window.addEventListener('blur', () => { finishKeyboardMove(); spaceDown = false; closeNodeMenu(); canvas.classList.toggle('hand', tool === 'hand'); });
 window.addEventListener('beforeunload', () => { save(true); releaseMedia(document); });
 window.addEventListener('pagehide', () => { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); if ($('#aiDialog').open) $('#aiDialog').close(); clearAiConnection(); document.querySelectorAll('video,audio').forEach(media => media.pause()); });
 document.addEventListener('visibilitychange', () => {
@@ -1142,14 +1438,14 @@ $('#aiDialog').addEventListener('close', clearAiConnection);
 bind('#aiConnectBtn', openAiConnection);
 bind('#copyMcpUrl', () => copyText($('#mcpUrl').value, '已复制 MCP 接入地址'));
 bind('#copyMcpConfig', () => copyText($('#mcpConfig').textContent, '已复制含本次接入令牌的配置，请仅粘贴到可信 AI 客户端'));
-bind('#tool-select', () => { tool = 'select'; canvas.classList.remove('hand'); $('#tool-select').classList.add('active'); $('#tool-hand').classList.remove('active'); $('#tool-select').setAttribute('aria-pressed', 'true'); $('#tool-hand').setAttribute('aria-pressed', 'false'); });
-bind('#tool-hand', () => { tool = 'hand'; canvas.classList.add('hand'); $('#tool-hand').classList.add('active'); $('#tool-select').classList.remove('active'); $('#tool-hand').setAttribute('aria-pressed', 'true'); $('#tool-select').setAttribute('aria-pressed', 'false'); });
+bind('#tool-select', () => { tool = 'select'; canvas.classList.remove('hand'); $('#tool-select').classList.add('active'); $('#tool-hand').classList.remove('active'); $('#tool-select').setAttribute('aria-pressed', 'true'); $('#tool-hand').setAttribute('aria-pressed', 'false'); $('#canvas-box-select')?.setAttribute('aria-pressed', 'false'); });
+bind('#tool-hand', () => { tool = 'hand'; canvas.classList.add('hand'); $('#tool-hand').classList.add('active'); $('#tool-select').classList.remove('active'); $('#tool-hand').setAttribute('aria-pressed', 'true'); $('#tool-select').setAttribute('aria-pressed', 'false'); $('#canvas-box-select')?.setAttribute('aria-pressed', 'false'); });
 bind('#add-prompt', () => addNode('prompt'));
 bind('#add-reference', () => chooseReference());
 bind('#add-video', () => addNode('generation'));
 bind('#add-image', () => addNode('generation', { title: 'SDXL 图片生成', kind: 'sdxl', width: 1024, height: 1024, steps: 25, cfg: 7 }));
 bind('#add-result', () => addNode('result'));
-bind('#load-demo', () => { mutate(() => { graph = createDemo(); selected = new Set([graph.nodes[1].id]); }); fitView(); });
+bind('#load-demo', () => { if (workflowCanvas.isRunning()) throw new Error('请先停止后续调度，再载入其他画布'); mutate(() => { replaceCanvasIdentity(); graph = createDemo(); selected = new Set([graph.nodes[1].id]); }); fitView(); });
 bind('#undo', undo); bind('#redo', redo); bind('#zoom-in', () => zoom(1.15)); bind('#zoom-out', () => zoom(1 / 1.15)); bind('#zoom-reset', () => zoom(1 / viewport.scale)); bind('#fit-view', fitView); bind('#minimap-button', fitView);
 bind('#save-project', exportProject); bind('#open-project', () => $('#project-input').click()); bind('#help-button', () => $('#help-dialog').showModal());
 bind('#tab-properties', () => switchTab('properties')); bind('#tab-jobs', () => switchTab('jobs'));
@@ -1173,7 +1469,9 @@ $('#package-editor-form').addEventListener('submit', event => {
     const fields = packageDraft.fields.filter(item => item.selected).map(({ selected: _selected, recommended: _recommended, ...definition }) => definition);
     $('#save-package').disabled = true;
     try {
-      const result = await api('/api/packages', { name: $('#package-name').value.trim(), description: $('#package-description').value.trim(), prompt: packageDraft.prompt, fields });
+      const name = $('#package-name').value.trim(), description = $('#package-description').value.trim();
+      const unchanged = packageDraft.sourceJSON && packageDraft.originalEditor === stableStringify({ name, description, fields: packageDraft.fields });
+      const result = await api('/api/packages', unchanged ? { source_json: packageDraft.sourceJSON } : { name, description, prompt: packageDraft.prompt, fields });
       if (!result.package?.id) throw new Error('本地服务没有返回有效的工作流包');
       await loadPackages(); addPackageNode(result.package); packageDraft = null;
     } finally { $('#save-package').disabled = false; }
@@ -1193,9 +1491,11 @@ $('#settings-form').addEventListener('submit', event => {
 $('#project-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
   (async () => {
+    if (workflowCanvas.isRunning()) throw new Error('请先停止后续调度，再导入其他画布');
     if (file.size > 8 * 1024 * 1024) throw new Error('画布 JSON 最大为 8 MiB。');
     const incoming = parseGraph(await file.text());
-    mutate(() => { graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; });
+    if (workflowCanvas.isRunning()) throw new Error('画布正在运行或导入，请等待当前操作完成');
+    mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; });
     projectTitle = file.name.replace(/\.json$/i, ''); $('#project-title').textContent = projectTitle; applyViewport(); save(true); toast('画布已导入。原画布可通过撤销恢复。');
   })().catch(reportError);
 });
@@ -1228,10 +1528,11 @@ async function initialize() {
     const cachedJobs = JSON.parse(localStorage.getItem(JOB_MAP_KEY) || '{}'); if (cachedJobs && typeof cachedJobs === 'object' && !Array.isArray(cachedJobs)) jobNodes = cachedJobs;
   } catch { toast('本地画布记录无效，已打开安全示例。可重新导入备份。', true); }
   renderAll();
-  if (!restored) requestAnimationFrame(fitView);
+  // A new canvas opens at native 100% text size; fitting is an explicit action.
   try {
     const bootstrap = await api('/api/bootstrap'); csrf = bootstrap.csrf; settings = { ...settings, ...bootstrap.settings };
     if (bootstrap.version) $('.alpha').textContent = bootstrap.version;
+    await studio.init();
     await refreshEngine(); renderInspector(); await pollJobs();
     loadPackages().catch(reportError);
     scanEnvironment().catch(error => toast(`自动环境发现未完成：${error.message}`, true));
@@ -1239,4 +1540,11 @@ async function initialize() {
   setInterval(() => { if (!document.hidden) pollJobs(); }, 1800);
   setInterval(() => { if (!document.hidden) refreshEngine(); }, 15000);
 }
+initializeCanvasActions();
+studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText });
+workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError,
+  connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
+  setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; }); projectTitle = title; $('#project-title').textContent = title; applyViewport(); save(true); },
+  onJob: acceptCanvasWorkflowJob });
+workflowCanvas.init();
 initialize();

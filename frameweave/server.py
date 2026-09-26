@@ -4,6 +4,7 @@ import base64
 import binascii
 import copy
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -11,25 +12,29 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
-from .automation import PROTOCOL_VERSIONS, dispatch as dispatch_mcp
+from .automation import (PROTOCOL_VERSIONS, SubmissionRejected, dispatch as dispatch_mcp,
+                         generate as guarded_generate, request_status)
 from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
-from .packages import PackageStore, apply_values, inspect_document
-from .workflows import capabilities, catalog, compile_workflow, validate_prompt
+from .packages import PackageStore, apply_values, inspect_document, transport_document
+from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
 MAX_JSON = 28 * 1024 * 1024
 TERMINAL = {"completed", "failed", "cancelled"}
 MAX_RUN = 4 * 1024 * 1024
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
                   "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
-                  "references", "reference_roles", "lora", "lora_strength", "shift_video",
+                  "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video",
                   "shift_audio", "ref_image_size", "package_id", "values"}
 
 
@@ -121,7 +126,8 @@ class App:
             models = catalog(info)
             models["checkpoints"] = models.get("checkpoint", [])
             return {"online": True, "backend_url": self.backend.url, "devices": stats.get("devices", []),
-                    "system": stats.get("system", {}), "capabilities": capabilities(info), "models": models}
+                    "system": stats.get("system", {}), "capabilities": capabilities(info), "models": models,
+                    "generation_options": generation_options(info)}
         except BackendError as exc:
             return {"online": False, "backend_url": self.backend.url, "devices": [], "capabilities": {}, "models": {}, "error": str(exc)}
 
@@ -194,7 +200,10 @@ class App:
             content = base64.b64decode(data["data"], validate=True)
         except (ValueError, binascii.Error):
             raise ValueError("图片编码无效") from None
-        if not 8 <= len(content) <= 20 * 1024 * 1024:
+        return self._upload_content(content)
+
+    def _upload_content(self, content, *, complete=False):
+        if not 8 <= len(content) <= MAX_IMAGE_BYTES:
             raise ValueError("参考图大小须在 8 字节到 20 MiB 之间")
         if content.startswith(b"\x89PNG\r\n\x1a\n"):
             ext, mime = ".png", "image/png"
@@ -204,8 +213,19 @@ class App:
             ext, mime = ".webp", "image/webp"
         else:
             raise ValueError("初版参考图支持 PNG、JPEG、WebP；不接受 SVG 或可执行内容")
+        if complete:
+            # Boundaries detect truncation without adding an image-decoder runtime.
+            # This is not a claim that all compressed image pixels were decoded.
+            valid_end = (content.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82") if ext == ".png"
+                         else content.endswith(b"\xff\xd9") if ext == ".jpg"
+                         else len(content) >= 20 and int.from_bytes(content[4:8], "little") + 8 == len(content))
+            if not valid_end:
+                raise ValueError("结果图片数据不完整，无法作为下游输入")
         name = "frameweave-" + uuid.uuid4().hex + ext
         result = self.backend.upload(name, content, mime)
+        if not isinstance(result, dict) or (complete and (not isinstance(result.get("name"), str)
+                or not result["name"] or result.get("type", "input") != "input")):
+            raise BackendError("后端没有返回有效的图片输入登记，无法交给下游节点")
         returned_name = result.get("name", name)
         subfolder = result.get("subfolder", "")
         url = self.register_media(returned_name, subfolder, "input")
@@ -213,6 +233,70 @@ class App:
         self.uploaded.add(backend_name)
         self.info_at = 0
         return {"name": backend_name, "url": url}
+
+    def image_input(self, job_id, data):
+        """Copy an owned completed result into the current backend's image inputs."""
+        if not isinstance(data, dict) or set(data) != {"output_index"} or type(data["output_index"]) is not int:
+            raise ValueError("图片结果复用需要整数 output_index，不接受 URL 或文件路径")
+        index = data["output_index"]
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                raise ValueError("任务不属于此客户端")
+            if job.get("status") != "completed":
+                raise ValueError("只能复用已完成任务的图片结果")
+            if job.get("backend") != self.backend.url:
+                raise ValueError("结果来自另一个后端，请先恢复原后端连接")
+            outputs = [output for output in job.get("outputs", [])
+                       if isinstance(output, dict) and output.get("type") == "image"]
+            if not 0 <= index < len(outputs):
+                raise ValueError("图片结果索引越界，或此任务没有图片输出")
+            output = outputs[index]
+            if Path(output.get("filename", "")).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                raise ValueError("只能复用 PNG、JPEG、WebP 图片结果")
+            url = output.get("url", "")
+            if not isinstance(url, str) or not re.fullmatch(r"/api/media/[0-9a-f]{32}", url):
+                raise ValueError("结果图片没有有效的本地媒体登记")
+            registered = self.media.get(url.rsplit("/", 1)[-1])
+            if not registered:
+                raise ValueError("结果图片未登记或已不可用")
+            media_backend, query = registered
+            if (media_backend != job["backend"] or query.get("type") not in {"output", "temp"}
+                    or query.get("filename") != output.get("filename")
+                    or query.get("subfolder", "") != output.get("subfolder", "")):
+                raise ValueError("结果图片与任务媒体登记不一致")
+            # Revalidate registered names rather than accepting a URL from a caller.
+            filename = safe_relative(query["filename"])
+            subfolder = safe_relative(query["subfolder"]) if query.get("subfolder") else ""
+            if "/" in filename:
+                raise ValueError("结果图片文件名无效")
+            view_query = {"filename": filename, "subfolder": subfolder, "type": query["type"]}
+            request = urllib.request.Request(media_backend + "/view?" + urllib.parse.urlencode(view_query),
+                                             headers={"Accept-Encoding": "identity"})
+            try:
+                with self.backend.opener.open(request, timeout=30) as response:
+                    if response.status != 200 or response.headers.get("Content-Range"):
+                        raise BackendError("结果图片未返回完整响应")
+                    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                        raise BackendError("结果图片使用了不支持的传输编码")
+                    lengths = response.headers.get_all("Content-Length", [])
+                    transfer = response.headers.get("Transfer-Encoding", "").lower()
+                    if transfer not in {"", "identity", "chunked"} or (transfer == "chunked" and lengths):
+                        raise BackendError("结果图片响应传输格式不明确")
+                    if len(lengths) > 1 or (lengths and not re.fullmatch(r"[0-9]{1,20}", lengths[0])):
+                        raise BackendError("结果图片响应长度无效")
+                    expected = int(lengths[0]) if lengths else None
+                    if expected is not None and not 8 <= expected <= MAX_IMAGE_BYTES:
+                        raise BackendError("结果图片响应大小超过 20 MiB 或为空")
+                    content = response.read(MAX_IMAGE_BYTES + 1)
+                    if len(content) > MAX_IMAGE_BYTES:
+                        raise BackendError("结果图片响应大小超过 20 MiB")
+                    if expected is not None and len(content) != expected:
+                        raise BackendError("结果图片响应读取不完整")
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                raise BackendError("无法完整读取任务图片结果：" + str(exc)) from None
+            result = self._upload_content(content, complete=True)
+            return {**result, "backend": self.backend.url, "source_job": job_id, "output_index": index}
 
     def compile(self, data):
         result = compile_workflow(self.resolve_request(data), self.object_info())
@@ -229,7 +313,7 @@ class App:
                 request = None  # The exact graph is already stored once below.
             elif data.get("kind") != "package":
                 summary = result.get("summary", {})
-                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles"):
+                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles", "denoise", "loras"):
                     if key in summary:
                         request[key] = copy.deepcopy(summary[key])
             result["request"] = request
@@ -701,11 +785,11 @@ def make_server(app, port=0):
                 elif path == "/api/diagnostics":
                     result = app.diagnostics(data)
                 elif path == "/api/packages/inspect":
-                    result = inspect_document(data.get("document"), app.info)
+                    result = inspect_document(transport_document(data), app.info)
                 elif path == "/api/packages":
-                    result = {"package": app.packages.save(data)}
+                    result = {"package": app.packages.save(transport_document(data, allow_bare=True))}
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/export", path):
-                    result = {"document": app.packages.export(path.split("/")[3])}
+                    result = app.packages.export_transport(path.split("/")[3])
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/apply", path):
                     result = {"prompt": apply_values(app.packages.get(path.split("/")[3]), data.get("values", {}))}
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/metadata", path):
@@ -714,10 +798,20 @@ def make_server(app, port=0):
                     result = app.compile(data)
                 elif path == "/api/jobs":
                     result = app.submit(data)
+                elif path == "/api/generate":
+                    if set(data) != {"request_id", "request"}:
+                        raise ValueError("生成接口需要 request_id 和 request")
+                    result = guarded_generate(app, data["request_id"], data["request"])
+                elif path == "/api/requests/query":
+                    if set(data) != {"request_id"}:
+                        raise ValueError("请求查询只接受 request_id")
+                    result = request_status(app, data["request_id"])
                 elif path == "/api/upload":
                     result = app.upload(data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/cancel", path):
                     result = app.cancel(path.split("/")[3])
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/image-input", path):
+                    result = app.image_input(path.split("/")[3], data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/retry", path):
                     result = app.retry(path.split("/")[3], data)
                 elif path == "/api/shutdown":
@@ -729,6 +823,8 @@ def make_server(app, port=0):
                     self.respond({"error": "接口不存在"}, 404)
                     return
                 self.respond(result)
+            except SubmissionRejected as exc:
+                self.respond({"error": str(exc), "submission_state": "rejected"}, 400)
             except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 self.respond({"error": "请求的 JSON 嵌套或数字超出限制" if isinstance(exc, (RecursionError, OverflowError)) else str(exc)}, 400)
             except (BackendError, OSError) as exc:

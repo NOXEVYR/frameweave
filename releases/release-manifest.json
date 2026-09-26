@@ -2,8 +2,8 @@
   "display_name": "棱光 PrismCanvas",
   "compatibility_identity": "FrameWeave",
   "version": "0.7.0",
-  "release_channel": "local-candidate",
-  "published": false,
+  "release_channel": "public-release",
+  "published": true,
   "created_utc": "2026-09-26T08:29:17.578592+00:00",
   "license": "MIT (client code)",
   "runtime_dependencies": [
@@ -25,7 +25,7 @@
     "new_runtime_dependencies": false,
     "real_gpu_generation_this_version": false,
     "native_window_and_taskbar_verified": false,
-    "published": false,
+    "published": true,
     "personal_backend_8188_responded": false,
     "environment_scan_intercepted_for_ui_tests": true,
     "generation_backend": "isolated loopback mock",
@@ -456,5 +456,16 @@
       "sha256": "28423ac6c1a0bb620ae81a48ffc9e7b3f104b6432f69cf01f6b7f33d953a2e4f"
     }
   ],
-  "package_revision": "publication-20260926"
+  "package_revision": "publication-20260926",
+  "publication": {
+    "repository": "NOXEVYR/frameweave",
+    "branch": "main",
+    "mode": "repository releases directory",
+    "verified_commit": "adbce8104b6caa370d29084eaeaeb6e2a46e36d6",
+    "verified_tree": "274032300f1f79666362b91099346dd1e1b591c3",
+    "verified_utc": "2026-09-26T08:35:55.404Z",
+    "verified_tree_paths": 76,
+    "historical_files_preserved": 6,
+    "archives_redownloaded_and_verified": true
+  }
 }

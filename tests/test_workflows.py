@@ -213,7 +213,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["lora"], all_names[4:])
 
     def test_capabilities_follow_node_and_clip_support(self):
-        self.assertEqual(capabilities(self.info), {"h3": True, "sdxl": True, "sdxl_i2i": True, "krea": True})
+        self.assertEqual(capabilities(self.info), {"h3": True, "sdxl": True, "sdxl_i2i": True, "krea": True,
+                                                  "qwen21_t2i": False, "qwen21_edit": False})
         del self.info["MiniMaxH3ImageToVideo"]
         self.assertFalse(capabilities(self.info)["h3"])
         self.info["CLIPLoader"]["input"]["required"]["type"] = [["minimax"]]

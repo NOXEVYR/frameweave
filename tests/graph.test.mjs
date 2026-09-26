@@ -2,6 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNode, createDemo, connect, canConnect, removeNodes, duplicateNodes, generationPayload, executionOrder, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from '../web/graph.mjs';
 
+test('Qwen 2.1 canvas preserves model identity and reference order rather than video frame roles', () => {
+  const target = createNode('generation', 0, 0, { kind: 'qwen21_edit', models: { dit: 'qwen_image_2.1_variant.safetensors' }, width: 1024, height: 1024 });
+  const first = createNode('reference', 0, 0, { name: 'target.png', role: 'end' });
+  const second = createNode('reference', 0, 0, { name: 'reference.png', role: 'start' });
+  const graph = { nodes: [target, first, second], edges: [] };
+  connect(graph, first.id, target.id); connect(graph, second.id, target.id);
+  const restored = parseGraph(serializeGraph(graph));
+  const payload = generationPayload(restored, target.id);
+  assert.deepEqual(payload.references, ['target.png', 'reference.png']);
+  assert.equal(Object.hasOwn(payload, 'reference_roles'), false);
+  assert.equal(payload.models.dit, 'qwen_image_2.1_variant.safetensors');
+  target.data.kind = 'qwen21_t2i';
+  assert.throws(() => generationPayload(graph, target.id), /不接收参考图/);
+  target.data.kind = 'qwen21_edit'; second.data.name = '';
+  assert.throws(() => generationPayload(graph, target.id), /尚未上传/);
+  second.data.name = 'reference.png'; target.data.denoise = .5;
+  assert.throws(() => generationPayload(graph, target.id), /denoise=1/);
+});
+
 test('canvas serialization is stable and retains all generation controls', () => {
   const graph = createDemo();
   const generation = graph.nodes.find(node => node.type === 'generation');

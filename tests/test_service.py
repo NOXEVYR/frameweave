@@ -5,15 +5,17 @@ import copy
 import http.client
 import json
 import re
+import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from frameweave.server import App, make_server
+from frameweave.server import MAX_JSON, App, make_server
 
 
 PNG = base64.b64decode(
@@ -202,6 +204,25 @@ class ServiceHTTPTests(unittest.TestCase):
         status, headers, body = self.request("POST", path, data, **kwargs)
         return status, headers, json.loads(body)
 
+    def test_engine_and_update_controls_require_csrf(self):
+        for path in ('/api/engines/start', '/api/engines/register', '/api/updates/check',
+                     '/api/updates/stage', '/api/updates/install', '/api/exit'):
+            with self.subTest(path=path):
+                status, _, _ = self.post(path, {}, csrf=False)
+                self.assertEqual(status, 403)
+        self.assertFalse(self.app.closed.is_set())
+
+    def test_engine_registration_does_not_accept_arbitrary_commands(self):
+        status, _, body = self.post('/api/engines/register', {'root': str(self.root), 'arguments': ['bad']})
+        self.assertEqual(status, 400)
+        self.assertNotIn('profiles', body)
+
+    def test_engine_list_and_update_status_do_not_trigger_generation(self):
+        for path in ('/api/engines', '/api/updates', '/api/heartbeat'):
+            status, _, _ = self.request('GET', path)
+            self.assertEqual(status, 200)
+        self.assertEqual(self.backend.next_id, 0)
+
     def submit(self):
         status, _, job = self.post("/api/jobs", copy.deepcopy(API_JOB))
         self.assertEqual(status, 200, job)
@@ -380,6 +401,87 @@ class ServiceHTTPTests(unittest.TestCase):
                 self.assertEqual(self.post("/api/jobs", API_JOB, headers=headers)[0], 403)
         self.assertEqual(self.post("/api/jobs", API_JOB, csrf=False)[0], 403)
         self.assertEqual(self.request("OPTIONS", "/api/jobs")[0], 403)
+        self.assertFalse(self.backend.calls)
+
+    def test_early_rejection_sends_response_before_draining_small_body(self):
+        body = json.dumps(API_JOB).encode()
+        host = f"127.0.0.1:{self.port}"
+        cases = (
+            {"Host": "attacker.invalid", "X-FW-Token": self.token},
+            {"Host": host, "X-FW-Token": "invalid"},
+        )
+        backend_calls = list(self.backend.calls)
+        for override in cases:
+            with self.subTest(override=override):
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                try:
+                    sock.settimeout(2)
+                    headers = {"Host": host, "Content-Type": "application/json",
+                               "Content-Length": str(len(body)), "Connection": "keep-alive",
+                               "X-FW-Token": self.token, **override}
+                    lines = ["POST /api/jobs HTTP/1.1", *(f"{key}: {value}" for key, value in headers.items()), "", ""]
+                    sock.sendall("\r\n".join(lines).encode("ascii"))
+                    response = http.client.HTTPResponse(sock)
+                    response.begin()
+                    self.assertEqual(response.status, 403)
+                    self.assertEqual(response.getheader("Connection"), "close")
+                    self.assertIn(b"\xe8\xaf\xb7\xe6\xb1\x82\xe6\xa0\xa1\xe9\xaa\x8c\xe5\xa4\xb1\xe8\xb4\xa5",
+                                  response.read())
+                    # Send the declared, valid JSON only after the complete
+                    # rejection has reached the client.
+                    sock.sendall(body)
+                    self.assertEqual(sock.recv(1), b"")
+                finally:
+                    sock.close()
+        self.assertEqual(self.backend.calls, backend_calls)
+        self.assertFalse(self.app.jobs)
+
+    def test_rejected_body_drain_is_bounded_for_idle_oversized_and_unknown_bodies(self):
+        host = f"127.0.0.1:{self.port}"
+        cases = (
+            ({"Host": host, "X-FW-Token": self.token,
+              "Content-Length": str(MAX_JSON + 1)}, 413),
+            ({"Host": host, "X-FW-Token": self.token}, 413),
+            ({"Host": host, "X-FW-Token": self.token,
+              "Transfer-Encoding": "chunked"}, 400),
+        )
+        backend_calls = list(self.backend.calls)
+        for headers, expected in cases:
+            with self.subTest(headers=headers):
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                try:
+                    sock.settimeout(2)
+                    request_headers = {"Content-Type": "application/json", **headers}
+                    lines = ["POST /api/jobs HTTP/1.1",
+                             *(f"{key}: {value}" for key, value in request_headers.items()), "", ""]
+                    sock.sendall("\r\n".join(lines).encode("ascii"))
+                    response = http.client.HTTPResponse(sock)
+                    response.begin()
+                    self.assertEqual(response.status, expected)
+                    self.assertEqual(response.getheader("Connection"), "close")
+                    response.read()
+                    self.assertEqual(sock.recv(1), b"")
+                finally:
+                    sock.close()
+        self.assertEqual(self.backend.calls, backend_calls)
+
+    def test_rejected_small_body_idle_drain_has_a_short_deadline(self):
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        try:
+            sock.settimeout(2)
+            headers = {"Host": f"127.0.0.1:{self.port}", "Content-Type": "application/json",
+                       "Content-Length": "8", "X-FW-Token": "invalid", "Connection": "keep-alive"}
+            lines = ["POST /api/jobs HTTP/1.1", *(f"{key}: {value}" for key, value in headers.items()), "", ""]
+            started = time.monotonic()
+            sock.sendall("\r\n".join(lines).encode("ascii"))
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(response.status, 403)
+            response.read()
+            self.assertEqual(sock.recv(1), b"")
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            sock.close()
         self.assertFalse(self.backend.calls)
 
     def test_bad_json_content_type_and_request_length_are_rejected(self):

@@ -34,6 +34,10 @@ def _known_family(filename, role):
     base = name.rsplit("/", 1)[-1]
     if "minimax_h3" in name or "/minimaxh3/" in name:
         return "h3"
+    if role in {"dit", "vae", "lora"} and re.search(r"qwen[-_]?image[-_]?2[._]1", base):
+        return "qwen21"
+    if role == "text_encoder" and re.search(r"qwen[-_]?3[-_]?vl[-_]?8b", base):
+        return "qwen21"
     if role == "text_encoder":
         if re.search(r"qwen[-_]?3[-_]?vl[-_]?4b", base):
             return "krea"
@@ -62,7 +66,8 @@ def _known_family(filename, role):
 
 def _check_family(filename, role, kind):
     known = _known_family(filename, role)
-    expected = "h3" if kind.startswith("h3_") else "sdxl" if kind == "sdxl_i2i" else kind
+    expected = ("h3" if kind.startswith("h3_") else "sdxl" if kind == "sdxl_i2i"
+                else "qwen21" if kind in {"qwen21_t2i", "qwen21_edit"} else kind)
     compatible = {expected}
     if kind == "krea" and role == "vae":
         compatible.add("qwen_image")
@@ -132,12 +137,17 @@ def capabilities(object_info: dict) -> dict:
                  "MiniMaxH3SigmaShift", "KSampler", "ConditioningZeroOut", "CreateVideo", "SaveVideo"}
     h3_decode = "MiniMaxH3AVDecodeT8" in present or {
         "LTXVSeparateAVLatent", "VAEDecode", "VAEDecodeAudio"} <= present
+    qwen21_common = {"UNETLoader", "CLIPLoader", "VAELoader", "TextEncodeQwenImage21",
+                     "KSampler", "VAEDecode", "SaveImage"}
+    qwen21_clip = "qwen_image" in _options(object_info.get("CLIPLoader", {}), "type")
     return {
         "h3": h3_common <= present and h3_decode and "minimax" in _options(object_info.get("CLIPLoader", {}), "type"),
         "sdxl": image_common | {"CheckpointLoaderSimple", "EmptyLatentImage"} <= present,
         "sdxl_i2i": image_common | {"CheckpointLoaderSimple", "LoadImage", "ImageScale", "VAEEncode"} <= present,
         "krea": image_common | {"UNETLoader", "CLIPLoader", "VAELoader", "EmptySD3LatentImage", "ConditioningZeroOut"} <= present
         and "krea2" in _options(object_info.get("CLIPLoader", {}), "type"),
+        "qwen21_t2i": qwen21_common | {"EmptyLatentImage"} <= present and qwen21_clip,
+        "qwen21_edit": qwen21_common | {"LoadImage", "EmptyLatentImage"} <= present and qwen21_clip,
     }
 
 
@@ -156,6 +166,20 @@ def generation_options(object_info: dict) -> dict:
                                 "schedulers": _options(dual, "scheduler")}
     for role, names in catalog(object_info).items():
         result["model_families"][role] = {name: _known_family(name, role) or "unknown" for name in names}
+    qwen = object_info.get("TextEncodeQwenImage21", {})
+    resolution = qwen.get("input", {}).get("required", {}).get("resolution")
+    resolution_meta = _spec(resolution)[1] if resolution is not None else {}
+    image_spec = qwen.get("input", {}).get("required", {}).get("images")
+    image_kind, image_meta = _spec(image_spec) if image_spec is not None else (None, {})
+    template = image_meta.get("template", {}) if image_kind == "COMFY_AUTOGROW_V3" else {}
+    names = template.get("names")
+    backend_limit = len(names) if isinstance(names, list) else template.get("max", 0)
+    result["qwen21"] = {
+        "modes": {key: value for key, value in capabilities(object_info).items() if key.startswith("qwen21_")},
+        "clip_types": [value for value in _options(object_info.get("CLIPLoader", {}), "type") if value == "qwen_image"],
+        "reference_limit": min(10, backend_limit) if type(backend_limit) is int and backend_limit >= 0 else 0,
+        "ref_resolution": {key: resolution_meta[key] for key in ("default", "min", "max", "step") if key in resolution_meta},
+    }
     return result
 
 
@@ -384,7 +408,7 @@ def _lora_specs(request, kind):
         model_strength = _number(item, "strength_model", 1, -10, 10)
         clip_strength = _number(item, "strength_clip", 1 if sdxl else 0, -10, 10)
         if not sdxl and clip_strength != 0:
-            raise ValueError("H3 / Krea 当前仅支持 model-only LoRA；strength_clip 必须省略或为 0")
+            raise ValueError("H3 / Krea / Qwen Image 2.1 当前仅支持 model-only LoRA；strength_clip 必须省略或为 0")
         result.append({"name": name, "strength_model": model_strength, "strength_clip": clip_strength})
     return result
 
@@ -444,7 +468,9 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             prompt = prompt["prompt"]
         validate_prompt(prompt, object_info)
         return {"prompt": copy.deepcopy(prompt), "summary": {"kind": kind, "nodes": len(prompt), "warnings": []}}
-    if kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i"}:
+    qwen21 = kind in {"qwen21_t2i", "qwen21_edit"}
+    qwen21_edit = kind == "qwen21_edit"
+    if kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "qwen21_t2i", "qwen21_edit"}:
         raise ValueError("不支持的生成类型")
     positive, negative = request.get("positive", ""), request.get("negative", "")
     if not isinstance(positive, str) or not positive.strip() or not isinstance(negative, str):
@@ -454,23 +480,42 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
     models = request.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models 必须是模型角色对象")
+    if qwen21 and any(role not in {"dit", "text_encoder", "vae", "lora"} for role in models):
+        raise ValueError("Qwen Image 2.1 models 只支持 dit、text_encoder、vae 和 model-only LoRA")
     h3 = kind.startswith("h3_")
     sdxl = kind in {"sdxl", "sdxl_i2i"}
     width = _number(request, "width", 736 if h3 else 1024, 32, 8192, True)
     height = _number(request, "height", 416 if h3 else 1024, 32, 8192, True)
-    alignment = 32 if h3 else 16 if kind == "krea" else 8
+    alignment = 32 if h3 or qwen21 else 16 if kind == "krea" else 8
     if width % alignment or height % alignment:
         raise ValueError(f"宽高必须为 {alignment} 的倍数")
     seed = _number(request, "seed", 0, 0, 2**64 - 1, True)
-    steps = _number(request, "steps", 20 if kind != "krea" else 8, 1, 1000, True)
+    step_default = 40 if kind == "qwen21_t2i" else 25 if qwen21_edit else 20 if kind != "krea" else 8
+    steps = _number(request, "steps", step_default, 1, 1000, True)
     cfg = _number(request, "cfg", 7.0 if sdxl else 1.0, 0, 100)
     denoise = _number(request, "denoise", 1.0, 0, 1)
+    ref_resolution = _number(request, "ref_resolution", 1024, 0, 4096, True) if qwen21 else 1024
+    custom_size = request.get("custom_size", False) if qwen21 else False
+    if qwen21:
+        if ref_resolution % 32:
+            raise ValueError("ref_resolution 必须为 32 的倍数")
+        if type(custom_size) is not bool:
+            raise ValueError("custom_size 必须为布尔值")
+        if custom_size and not qwen21_edit:
+            raise ValueError("custom_size 只支持 Qwen Image 2.1 编辑模式")
     refs = _reference_names(request)
     roles = _reference_roles(request, kind, refs)
     available = catalog(object_info)
     graph = _Graph(object_info)
     summary = {"kind": kind, "width": width, "height": height, "seed": seed,
                "steps": steps, "cfg": cfg, "warnings": [], "models": {}}
+    if qwen21:
+        summary["ref_resolution"] = ref_resolution
+    if qwen21_edit and not custom_size:
+        summary.update(width=None, height=None, requested_width=width, requested_height=height,
+                       size_mode="first_reference")
+    elif qwen21_edit:
+        summary["size_mode"] = "custom"
     warnings = summary["warnings"]
     if steps > 100:
         warnings.append("较高步数将显著增加推理计算量，更多步数不保证生成质量更好。")
@@ -483,6 +528,14 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
         raise ValueError("低于 1 的 denoise 需要输入图片")
     if kind == "h3_t2v" and refs:
         raise ValueError("文生视频不接收参考图，请选择图生视频或参考生视频")
+    if kind == "qwen21_t2i" and refs:
+        raise ValueError("Qwen Image 2.1 文生图不接收参考图")
+    if qwen21_edit and not 1 <= len(refs) <= 10:
+        raise ValueError("Qwen Image 2.1 条件编辑需要 1–10 张参考图")
+    if qwen21 and denoise != 1:
+        raise ValueError("Qwen Image 2.1 条件生成固定使用 denoise=1")
+    if qwen21 and any(role != "reference" for role in roles):
+        raise ValueError("Qwen Image 2.1 参考图按数组顺序传入，reference_roles 只能使用 reference")
     if kind == "h3_i2v" and not 1 <= len(refs) <= 2:
         raise ValueError("图生视频需要 1–2 张图片，可按角色指定首帧或尾帧")
     if kind == "h3_ref" and not 1 <= len(refs) <= 9:
@@ -506,16 +559,22 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             vae = graph.add("VAELoader", vae_name=vae_name)
             summary["models"]["vae"] = vae_name
     else:
-        dit_tokens = ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",)
+        dit_tokens = (("qwen_image_2.1", "qwen_image_2_1") if qwen21 else
+                      ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",))
+        encoder_tokens = (("qwen3vl_8b",) if qwen21 else ("minimax_h3",) if h3 else ("qwen3vl_4b",))
+        vae_tokens = (("qwen_image_2.1_vae", "qwen_image_2_1_vae") if qwen21 else
+                      ("minimax_h3_video_vae",) if h3 else ("qwen_image_vae",))
         dit = _model(models, "dit", available, dit_tokens, ("pruned",) if h3 and not loras else ())
-        text_encoder = _model(models, "text_encoder", available, ("minimax_h3",) if h3 else ("qwen3vl_4b",),
-                              ("nvfp4",) if h3 else ())
-        vae_name = _model(models, "vae", available, ("minimax_h3_video_vae",) if h3 else ("qwen_image_vae",))
+        text_encoder = _model(models, "text_encoder", available, encoder_tokens, ("nvfp4",) if h3 else ())
+        vae_name = _model(models, "vae", available, vae_tokens)
         for role, name in (("dit", dit), ("text_encoder", text_encoder), ("vae", vae_name)):
             _check_family(name, role, kind)
+            if qwen21 and not name.lower().endswith(".safetensors"):
+                raise ValueError(f"Qwen Image 2.1 的 {role} 目前只支持标准加载器列出的 safetensors 模型")
         summary["models"].update(dit=dit, text_encoder=text_encoder, vae=vae_name)
         model = graph.add("UNETLoader", unet_name=dit, weight_dtype="default")
-        clip = graph.add("CLIPLoader", clip_name=text_encoder, type="minimax" if h3 else "krea2")
+        clip = graph.add("CLIPLoader", clip_name=text_encoder,
+                         type="minimax" if h3 else "qwen_image" if qwen21 else "krea2")
         vae = graph.add("VAELoader", vae_name=vae_name)
     for item in loras:
         lora = item["name"]
@@ -631,6 +690,35 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             decoded_audio = [decoded_images[0], 1]
         video = graph.add("CreateVideo", images=decoded_images, fps=24.0, audio=decoded_audio)
         graph.add("SaveVideo", video=video, filename_prefix="FrameWeave/video", format="mp4", codec="h264")
+    elif qwen21:
+        encoder_inputs = {"clip": clip, "prompt": positive, "negative_prompt": negative,
+                          "resolution": ref_resolution}
+        if qwen21_edit:
+            edit_schema = object_info.get("TextEncodeQwenImage21", {})
+            definition = edit_schema.get("input", {}).get("required", {}).get("images")
+            if definition is None or _spec(definition)[0] != "COMFY_AUTOGROW_V3":
+                raise ValueError("TextEncodeQwenImage21 没有兼容的动态图片输入")
+            encoder_inputs["vae"] = vae
+            template = _spec(definition)[1].get("template", {})
+            names = template.get("names")
+            if names is None:
+                maximum = template.get("max", 0)
+                prefix = template.get("prefix", "image_")
+                if type(maximum) is not int or not 0 <= maximum <= 1000 or not isinstance(prefix, str):
+                    raise ValueError("Qwen Image 2.1 动态图片输入定义无效")
+                names = [prefix + str(index) for index in range(maximum)]
+            if not isinstance(names, list) or len(names) < len(images):
+                raise ValueError("参考图数量超过当前后端 Qwen Image 2.1 限制")
+            for name, image in zip(names[:len(images)], images):
+                encoder_inputs["images." + name] = image
+        conditioning = graph.add("TextEncodeQwenImage21", **encoder_inputs)
+        latent = [conditioning[0], 2] if qwen21_edit and not custom_size else graph.add(
+            "EmptyLatentImage", width=width, height=height, batch_size=1)
+        sampled = graph.add("KSampler", model=model, seed=seed, steps=steps, cfg=cfg,
+                            sampler_name=sampler, scheduler=scheduler, positive=[conditioning[0], 0],
+                            negative=[conditioning[0], 1], latent_image=latent, denoise=1.0)
+        decoded = graph.add("VAEDecode", samples=sampled, vae=vae)
+        graph.add("SaveImage", images=decoded, filename_prefix="FrameWeave/image")
     else:
         if kind == "krea" and images:
             model = graph.add("Krea2OstrisEditModelPatch", model=model)

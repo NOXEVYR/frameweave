@@ -5,6 +5,19 @@ const node = (tag, className = '', text) => { const n = document.createElement(t
 const labels = { queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', cancelled: '已取消', unknown: '待确认' };
 const safeURL = value => { try { const url = new URL(value, location.origin); return url.origin === location.origin && /^https?:$/.test(url.protocol) ? url.href : ''; } catch { return ''; } };
 
+export function studioModelNames(names, families, key, kind, search = '') {
+  const family = kind.startsWith('h3') ? 'h3' : kind.startsWith('sdxl') ? 'sdxl' : kind.startsWith('qwen21') ? 'qwen21' : kind;
+  const query = String(search).trim().toLowerCase();
+  return names.map(item => typeof item === 'string' ? item : item?.name).filter(Boolean).filter(name => {
+    if (query && !name.toLowerCase().includes(query)) return false;
+    const known = families?.[name];
+    if (known && known !== 'unknown' && known !== family && !(family === 'krea' && key === 'vae' && known === 'qwen_image')) return false;
+    if (family === 'qwen21' && known !== 'qwen21' && !query) return false;
+    if (family === 'h3' && key === 'dit' && (kind === 'h3_ref' ? /fl2va/i.test(name) : /ref2va/i.test(name))) return false;
+    return true;
+  });
+}
+
 export function createGenerationStudio(host) {
   let active = 'canvas', drafts = Object.fromEntries(Object.keys(STUDIO_MODES).map(mode => [mode, newDraft(mode)]));
   let kindDrafts = {}, pending = {}, selectedJobs = {}, busy = new Set(), panels = new Map(), lastMedia = new Map(), lastCatalog = new Map(), initialized = false, storageWarned = false;
@@ -42,40 +55,35 @@ export function createGenerationStudio(host) {
     input.addEventListener(options.select ? 'change' : 'input', () => { if (options.change) { options.change(input.value); return; } drafts[mode][key] = options.number ? input.value === '' ? '' : Number(input.value) : input.value; save(); refresh(); });
     wrap.append(input); if (options.help) wrap.append(node('small', '', options.help)); return wrap;
   }
-  function setOptions(select, options, current) {
+  function setOptions(select, options, current, preserveMissing = true) {
     select.replaceChildren();
     for (const item of options) { const [value, text] = Array.isArray(item) ? item : [item, item]; const opt = node('option', '', text); opt.value = value; select.append(opt); }
-    if (current && !Array.from(select.options).some(option => option.value === current)) { const missing = node('option', '', `${current} · 当前列表未找到`); missing.value = current; select.append(missing); }
+    if (preserveMissing && current && !Array.from(select.options).some(option => option.value === current)) { const missing = node('option', '', `${current} · 当前列表未找到`); missing.value = current; select.append(missing); }
     select.value = current || '';
   }
-  function values(key, mode) {
-    const kind = drafts[mode].kind, family = kind.startsWith('h3') ? 'h3' : kind.startsWith('sdxl') ? 'sdxl' : kind;
+  function values(key, mode, search = '') {
+    const kind = drafts[mode].kind;
     const families = host.engine().generation_options?.model_families?.[key] || {};
-    const compatible = name => {
-      const known = families[name];
-      if (known && known !== 'unknown' && known !== family && !(family === 'krea' && key === 'vae' && known === 'qwen_image')) return false;
-      if (family === 'h3' && key === 'dit' && (kind === 'h3_ref' ? /fl2va/i.test(name) : /ref2va/i.test(name))) return false;
-      return true;
-    };
     const loaders = host.engine().generation_options?.lora_loaders;
     if (key === 'lora' && loaders) {
       const dit = drafts[mode].models?.dit || '';
       if (!kind.startsWith('sdxl') && !dit) return [];
       const loader = kind.startsWith('sdxl') ? 'LoraLoader' : /int8|fp8|nvfp4|gguf/i.test(dit) && loaders.LoraLoaderBypassModelOnly ? 'LoraLoaderBypassModelOnly' : 'LoraLoaderModelOnly';
-      return (loaders[loader]?.names || []).filter(compatible);
+      return studioModelNames(loaders[loader]?.names || [], families, key, kind, search);
     }
     let list = host.engine().models?.[key] || (key === 'checkpoint' ? host.engine().models?.checkpoints : []) || [];
-    list = list.map(item => typeof item === 'string' ? item : item.name).filter(Boolean);
-    const recommended = host.catalog(key, drafts[mode].kind) || [];
-    return [...new Set([...recommended, ...list])].filter(compatible);
+    const recommended = kind.startsWith('qwen21') ? [] : host.catalog(key, drafts[mode].kind) || [];
+    return studioModelNames([...new Set([...recommended, ...list])], families, key, kind, search);
   }
   function modelSelector(mode, key, label, target, change) {
     const wrap = node('label', 'studio-field studio-model'), title = node('span', '', label), search = node('input'), select = node('select');
     search.type = 'search'; search.placeholder = '搜索本地文件名…'; search.setAttribute('aria-label', `搜索${label}`);
     select.setAttribute('aria-label', label); select.dataset.model = key;
     const update = () => {
-      const current = target(), list = values(key, mode).filter(name => name.toLowerCase().includes(search.value.toLowerCase()));
-      setOptions(select, [['', key === 'lora' ? '选择 LoRA 文件' : '自动匹配（可手动选择）'], ...list], current);
+      const current = target(), kind = drafts[mode].kind, families = host.engine().generation_options?.model_families?.[key] || {}, known = families[current];
+      const hiddenIncompatible = kind.startsWith('qwen21') && current && known && known !== 'unknown' && known !== 'qwen21';
+      const list = values(key, mode, search.value);
+      setOptions(select, [['', key === 'lora' ? '选择 LoRA 文件' : '自动匹配（可手动选择）'], ...list], hiddenIncompatible ? '' : current, !hiddenIncompatible);
     };
     search.addEventListener('input', update); select.addEventListener('change', () => { change(select.value); save(); refresh(); });
     wrap.append(title, search, select); wrap.updateCatalog = update; update(); return wrap;
@@ -99,16 +107,26 @@ export function createGenerationStudio(host) {
     pause(container); container.replaceChildren(); const draft = drafts[mode];
     draft.references.forEach((ref, index) => {
       const row = node('div', 'studio-reference'); const image = node('img'); image.src = safeURL(ref.url); image.alt = ref.label || ref.name;
-      row.append(image, node('span', '', `${draft.kind === 'h3_i2v' ? index ? '尾帧' : '首帧' : '参考图'} · ${ref.label || ref.name}`), action('移除', 'button quiet', () => { draft.references.splice(index, 1); save(); references(mode, container); })); container.append(row);
+      const qwenEdit = draft.kind === 'qwen21_edit', label = qwenEdit ? index === 0 ? '编辑目标 · 图 1' : `参考图 · 图 ${index + 1}` : draft.kind === 'h3_i2v' ? index ? '尾帧' : '首帧' : '参考图';
+      row.append(image, node('span', '', `${label} · ${ref.label || ref.name}`));
+      if (qwenEdit) {
+        const up = action('↑', 'button quiet compact', () => { [draft.references[index - 1], draft.references[index]] = [draft.references[index], draft.references[index - 1]]; save(); references(mode, container); });
+        up.disabled = index === 0; up.setAttribute('aria-label', `图 ${index + 1} 上移`); up.title = '上移';
+        const down = action('↓', 'button quiet compact', () => { [draft.references[index], draft.references[index + 1]] = [draft.references[index + 1], draft.references[index]]; save(); references(mode, container); });
+        down.disabled = index === draft.references.length - 1; down.setAttribute('aria-label', `图 ${index + 1} 下移`); down.title = '下移'; row.append(up, down);
+      }
+      row.append(action('移除', 'button quiet', () => { draft.references.splice(index, 1); save(); references(mode, container); })); container.append(row);
     });
-    const input = node('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.multiple = draft.kind === 'h3_ref'; input.hidden = true;
+    const input = node('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.multiple = draft.kind === 'qwen21_edit' || draft.kind === 'h3_ref'; input.hidden = true;
     const upload = action(draft.references.length ? '＋ 添加图片' : '＋ 上传参考图片', 'button studio-upload', () => input.click());
-    const limit = mode === 'img2img' ? 1 : draft.kind === 'h3_i2v' ? 2 : 9; upload.disabled = draft.references.length >= limit;
+    const limit = draft.kind === 'qwen21_edit' ? 10 : mode === 'img2img' ? 1 : draft.kind === 'h3_i2v' ? 2 : 9; upload.disabled = draft.references.length >= limit;
     input.addEventListener('change', async () => {
       upload.disabled = true;
       const startedBackend = backend();
       try {
-        const files = Array.from(input.files).slice(0, limit - draft.references.length);
+        const selectedFiles = Array.from(input.files), remaining = limit - draft.references.length;
+        if (selectedFiles.length > remaining) host.toast(`当前还可添加 ${remaining} 张图片，本次多选的 ${selectedFiles.length - remaining} 张不会上传`, true);
+        const files = selectedFiles.slice(0, remaining);
         for (const file of files) {
           if (!/^image\/(png|jpeg|webp)$/.test(file.type) || file.size > 20 * 1024 * 1024) throw new Error('参考图支持 PNG/JPEG/WebP，每张最多 20 MiB');
           const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); });
@@ -119,7 +137,8 @@ export function createGenerationStudio(host) {
       } catch (error) { host.reportError(error); }
       finally { if (drafts[mode] === draft) references(mode, container); }
     });
-    container.append(input, upload, node('small', 'studio-help', mode === 'img2img' ? '根据宽高缩放参考图；去噪越低，越接近原图。' : '首尾帧按添加顺序排列；参考素材保留在你的推理引擎。'));
+    const help = draft.kind === 'qwen21_edit' ? 'Qwen Image 2.1 条件编辑：第 1 张是编辑目标，第 2–10 张依序作为参考；可用 ↑ / ↓ 调整顺序。固定完整采样（denoise=1），不使用 SDXL 低去噪重绘。' : mode === 'img2img' ? 'SDXL 重绘会根据画幅缩放参考图；去噪越低，越接近原图。' : '首尾帧按添加顺序排列；参考素材保留在你的推理引擎。';
+    container.append(input, upload, node('small', 'studio-help', help));
   }
   function render(mode) {
     const old = panels.get(mode); pause(old); old?.remove(); const draft = drafts[mode], config = STUDIO_MODES[mode];
@@ -128,7 +147,8 @@ export function createGenerationStudio(host) {
     const tools = node('div', 'studio-heading-actions'); tools.append(action('刷新模型', 'button quiet', async () => { await host.refreshEngine(true); updateCatalogs(panel); refresh(); }), action('引擎设置', 'button', () => host.openSettings()), action('开始生成', 'button primary studio-run-top', () => submit(mode))); header.append(heading, tools);
     const layout = node('div', 'studio-layout'), form = node('div', 'studio-form'), results = node('div', 'studio-results');
     const section = (title, hint = '') => { const block = node('section', 'studio-section'); block.append(node('h2', '', title)); if (hint) block.append(node('p', 'studio-help', hint)); form.append(block); return block; };
-    const models = section('01  模型与风格', '模型列表来自当前本地推理引擎，无需复制模型到客户端。');
+    const qwen21 = draft.kind.startsWith('qwen21');
+    const models = section('01  模型与风格', qwen21 ? '模型列表来自当前引擎；默认只列出后端标记为 qwen21 的项。搜索可手动选择未分类文件，但需自行核对兼容性。已知其他架构会过滤。' : '模型列表来自当前本地推理引擎，无需复制模型到客户端。');
     const kindField = field(mode, '生成引擎', 'kind', { select: config.kinds, change: kind => {
       kindDrafts[mode] ||= {}; kindDrafts[mode][draft.kind] = structuredClone(draft);
       const cached = kindDrafts[mode][kind], next = cached ? restoreDraft(mode, cached) : newDraft(mode, kind);
@@ -138,12 +158,24 @@ export function createGenerationStudio(host) {
     const modelKeys = draft.kind.startsWith('sdxl') ? [['checkpoint', 'Checkpoint 主模型']] : [['dit', 'DiT 主模型'], ['text_encoder', '文本编码器'], ['vae', '图像 / 视频 VAE'], ...(mode === 'video' ? [['audio_vae', '音频 VAE']] : [])];
     modelKeys.forEach(([key, label]) => models.append(modelSelector(mode, key, label, () => draft.models[key], value => { draft.models[key] = value; })));
     const loras = node('details', 'studio-details'); loras.open = true; loras.append(node('summary', '', 'LoRA 叠加 · 最多 4 个')); const rows = node('div'); loraRows(mode, rows); loras.append(rows, node('small', 'studio-help', '选择与主模型架构兼容的 LoRA。文件名推荐不代表兼容性已验证；模型 / 文本强度可分别调整。')); models.append(loras);
-    if (mode === 'img2img' || ['h3_i2v', 'h3_ref'].includes(draft.kind)) { const block = section('02  参考图片'); const refs = node('div'); references(mode, refs); block.append(refs); }
+    if (mode === 'img2img' || draft.kind === 'qwen21_edit' || ['h3_i2v', 'h3_ref'].includes(draft.kind)) { const block = section(draft.kind === 'qwen21_edit' ? '02  编辑目标与条件参考图' : '02  参考图片'); const refs = node('div'); references(mode, refs); block.append(refs); }
     const prompts = section('提示词'); prompts.append(field(mode, '正向提示词', 'positive', { multiline: true, rows: 6, placeholder: '描述主体、环境、光线、构图；视频可加入动作与运镜…' }), field(mode, '负向提示词', 'negative', { multiline: true, rows: 3, placeholder: '不希望出现的内容…' }), action('复制提示词', 'button quiet', () => host.copyText(`${draft.positive}${draft.negative ? `\n\n负向提示词：${draft.negative}` : ''}`)));
-    const controls = section('画幅与采样'), presets = node('div', 'studio-presets');
-    for (const [label, w, h] of [['方形', 1024, 1024], ['横屏', mode === 'video' ? 768 : 1216, mode === 'video' ? 448 : 832], ['竖屏', mode === 'video' ? 448 : 832, mode === 'video' ? 768 : 1216]]) presets.append(action(label, 'button quiet compact', () => { draft.width = w; draft.height = h; panel.querySelector('[name=width]').value = w; panel.querySelector('[name=height]').value = h; save(); }));
-    controls.append(presets); const grid = node('div', 'studio-grid');
-    for (const [label, key, min, max, step] of [['宽度 / px', 'width', 64, 4096, mode === 'video' ? 32 : draft.kind === 'krea' ? 16 : 8], ['高度 / px', 'height', 64, 4096, mode === 'video' ? 32 : draft.kind === 'krea' ? 16 : 8], ['采样步数', 'steps', 1, 200, 1], ['提示词引导 CFG', 'cfg', 0, 100, .1]]) grid.append(field(mode, label, key, { number: true, min, max, step }));
+    const qwenEdit = draft.kind === 'qwen21_edit', controls = section(qwenEdit ? '尺寸策略与采样' : '画幅与采样'), presets = node('div', 'studio-presets');
+    if (qwenEdit) {
+      const wrap = node('label', 'studio-field'), title = node('span', '', '输出尺寸模式'), select = node('select'); select.setAttribute('aria-label', '输出尺寸模式');
+      for (const [value, label] of [['false', '按编辑目标比例与参考分辨率'], ['true', '自定义宽度和高度']]) { const option = node('option', '', label); option.value = value; select.append(option); }
+      select.value = String(draft.custom_size); select.addEventListener('change', () => { draft.custom_size = select.value === 'true'; save(); render(mode); refresh(); }); wrap.append(title, select); controls.append(wrap);
+      controls.append(field(mode, '参考分辨率 / px', 'ref_resolution', { number: true, min: 0, max: 4096, step: 32, help: '控制条件参考图的面积预算；按首图模式同时决定输出尺寸。设为 0 保留输入尺寸并对齐 32。' }));
+    }
+    const showExplicitSize = !qwenEdit || draft.custom_size;
+    if (showExplicitSize) {
+      for (const [label, w, h] of [['方形', 1024, 1024], ['横屏', mode === 'video' ? 768 : 1216, mode === 'video' ? 448 : 832], ['竖屏', mode === 'video' ? 448 : 832, mode === 'video' ? 768 : 1216]]) presets.append(action(label, 'button quiet compact', () => { draft.width = w; draft.height = h; panel.querySelector('[name=width]').value = w; panel.querySelector('[name=height]').value = h; save(); }));
+      controls.append(presets);
+    }
+    const grid = node('div', 'studio-grid');
+    const sizeStep = mode === 'video' || draft.kind.startsWith('qwen21') ? 32 : draft.kind === 'krea' ? 16 : 8;
+    if (showExplicitSize) for (const [label, key] of [['宽度 / px', 'width'], ['高度 / px', 'height']]) grid.append(field(mode, label, key, { number: true, min: 64, max: 4096, step: sizeStep }));
+    for (const [label, key, min, max, step] of [['采样步数', 'steps', 1, 200, 1], ['提示词引导 CFG', 'cfg', 0, 100, .1]]) grid.append(field(mode, label, key, { number: true, min, max, step }));
     const options = samplerOptions(mode);
     grid.append(field(mode, '采样器', 'sampler', { select: options.samplers?.length ? options.samplers : ['euler'] }), field(mode, '调度器', 'scheduler', { select: options.schedulers?.length ? options.schedulers : ['simple'] }));
     if (mode === 'img2img') grid.append(field(mode, '去噪强度', 'denoise', { number: true, min: 0, max: 1, step: .05, help: '低值保留原图，高值更自由地重绘。' }));
@@ -165,12 +197,24 @@ export function createGenerationStudio(host) {
     if (mode !== 'video') return options;
     return { samplers: [...new Set([...(options.samplers || []), ...(options.h3_dual_clock?.samplers || [])])], schedulers: drafts[mode].sampler === 'dual_clock_euler' ? options.h3_dual_clock?.schedulers || [] : options.schedulers || [] };
   }
+  function validateSelectedQwenModels(draft) {
+    if (!draft.kind.startsWith('qwen21')) return;
+    const families = host.engine().generation_options?.model_families || {};
+    for (const key of ['dit', 'text_encoder', 'vae', 'lora']) {
+      const selected = key === 'lora' ? (draft.loras || []).map(item => item.name).filter(Boolean) : [draft.models?.[key]].filter(Boolean);
+      for (const name of selected) {
+        const known = families[key]?.[name];
+        if (known && known !== 'unknown' && known !== 'qwen21') throw new Error(`所选 ${key} 属于已知的 ${known} 架构，不兼容 Qwen Image 2.1；请重新选择`);
+      }
+    }
+  }
   function updateCatalogs(panel) {
     panel.querySelectorAll('.studio-model').forEach(wrap => wrap.updateCatalog());
     const mode = panel.dataset.studioMode, options = samplerOptions(mode);
     for (const [key, source] of [['sampler', options.samplers], ['scheduler', options.schedulers]]) if (source?.length) setOptions(panel.querySelector(`[name=${key}]`), source, drafts[mode][key]);
   }
   async function inspect(mode, type) {
+    validateSelectedQwenModels(drafts[mode]);
     const request = buildStudioRequest(drafts[mode], backend()), panel = panels.get(mode), details = panel.querySelector('.studio-inspection');
     details.hidden = false; details.open = true; details.querySelector('pre').textContent = '正在检查本地引擎…';
     try { const result = await host.api(type === 'compile' ? '/api/compile' : '/api/diagnostics', request); details.querySelector('pre').textContent = type === 'diagnostics' ? result.repair_prompt || result.summary || JSON.stringify(result, null, 2) : JSON.stringify(result, null, 2); }
@@ -178,6 +222,7 @@ export function createGenerationStudio(host) {
   }
   async function submit(mode) {
     if (busy.has(mode) || pending[mode]) return;
+    validateSelectedQwenModels(drafts[mode]);
     const request = buildStudioRequest(drafts[mode], backend());
     if (!host.engine().online) throw new Error('本地引擎未连接，请先设置引擎地址');
     pending[mode] = { request_id: crypto.randomUUID(), request, backend: backend() };
@@ -258,6 +303,6 @@ export function createGenerationStudio(host) {
       initialized = true; document.querySelectorAll('.workspace-nav[data-workspace]').forEach(button => button.addEventListener('click', () => open(button.dataset.workspace)));
       document.querySelector('#toggle-inspector')?.addEventListener('click', () => { document.body.classList.toggle('inspector-open'); window.dispatchEvent(new Event('resize')); });
       open('canvas');
-    }, open, refresh, destroy() { pause(root); panels.clear(); root.replaceChildren(); },
+    }, open, refresh, hasPending: () => busy.size > 0 || Object.keys(pending).length > 0, destroy() { pause(root); panels.clear(); root.replaceChildren(); },
   };
 }

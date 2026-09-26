@@ -2,7 +2,7 @@
 import { packageValues, parseJSONWithSafeNumbers } from './packages.mjs';
 export const SCHEMA = 'frameweave.canvas.v1';
 export const NODE_TYPES = ['prompt', 'reference', 'generation', 'result'];
-export const KINDS = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'api', 'package'];
+export const KINDS = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'qwen21_t2i', 'qwen21_edit', 'api', 'package'];
 const copy = value => JSON.parse(JSON.stringify(value));
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image'];
@@ -60,7 +60,7 @@ function loraStack(value, kind) {
       if (!Object.hasOwn(entry, key)) continue;
       const number = entry[key];
       if (typeof number !== 'number' || !Number.isFinite(number) || number < -10 || number > 10) throw new Error(`${label} ${key} 必须是 -10 到 10 之间的数字`);
-      if (key === 'strength_clip' && !['sdxl', 'sdxl_i2i'].includes(kind) && number !== 0) throw new Error('H3 / Krea LoRA 仅支持模型强度，CLIP 强度应省略或设为 0');
+      if (key === 'strength_clip' && !['sdxl', 'sdxl_i2i'].includes(kind) && number !== 0) throw new Error('H3 / Krea / Qwen 2.1 LoRA 仅支持模型强度，CLIP 强度应省略或设为 0');
       result[key] = number;
     }
     return result;
@@ -189,8 +189,15 @@ export function generationPayload(graph, id, context = {}) {
   const incoming = graph.edges.filter(edge => edge.target === id).map(edge => graph.nodes.find(item => item.id === edge.source)).filter(Boolean);
   const prompts = incoming.filter(item => item.type === 'prompt');
   const refs = incoming.filter(item => item.type === 'reference' && item.data.name);
-  const orderedRefs = [...refs].sort((a, b) => ({ start: 0, reference: 1, end: 2 }[a.data.role] ?? 1) - ({ start: 0, reference: 1, end: 2 }[b.data.role] ?? 1));
+  const orderedRefs = node.data.kind.startsWith('qwen21_') ? refs : [...refs].sort((a, b) => ({ start: 0, reference: 1, end: 2 }[a.data.role] ?? 1) - ({ start: 0, reference: 1, end: 2 }[b.data.role] ?? 1));
   if (node.data.kind === 'sdxl_i2i' && refs.length !== 1) throw new Error('SDXL 图生图需要连接 1 张已上传的参考图片');
+  if (node.data.kind.startsWith('qwen21_')) {
+    if (incoming.some(item => item.type === 'reference' && !item.data.name)) throw new Error('Qwen 2.1 参考图片尚未上传完成');
+    if (node.data.kind === 'qwen21_t2i' && refs.length) throw new Error('Qwen 2.1 文生图不接收参考图，请选择图像编辑模式');
+    if (node.data.kind === 'qwen21_edit' && (refs.length < 1 || refs.length > 10)) throw new Error('Qwen 2.1 编辑需要连接 1–10 张参考图片');
+    if (node.data.denoise !== 1) throw new Error('Qwen 2.1 条件编辑使用 denoise=1');
+    if ((node.data.kind !== 'qwen21_edit' || node.data.custom_size) && (node.data.width % 32 || node.data.height % 32)) throw new Error('Qwen 2.1 宽高须为 32 的倍数');
+  }
   for (const ref of refs) {
     uploadedImageName(ref.data.name);
     if (ref.data.mediaType !== 'image') throw new Error('生成节点需要图片参考素材，请先上传图片');
@@ -209,7 +216,7 @@ export function generationPayload(graph, id, context = {}) {
     positive: [...prompts.map(item => item.data.text), data.positive].filter(Boolean).join('\n\n'),
     negative: [...prompts.map(item => item.data.negative), data.negative].filter(Boolean).join(', '),
     references: orderedRefs.map(item => item.data.name),
-    reference_roles: orderedRefs.map(item => item.data.role || 'reference'),
+    ...(!data.kind.startsWith('qwen21_') ? { reference_roles: orderedRefs.map(item => item.data.role || 'reference') } : {}),
   };
 }
 
@@ -319,6 +326,15 @@ export function parseGraph(text) {
         data[key] = value;
       }
       if (Object.hasOwn(node.data, 'ref_image_size')) data.ref_image_size = String(node.data.ref_image_size ?? '').slice(0, 100000);
+      if (Object.hasOwn(node.data, 'custom_size')) {
+        if (typeof node.data.custom_size !== 'boolean') throw new Error('custom_size 必须是布尔值');
+        data.custom_size = node.data.custom_size;
+      }
+      if (Object.hasOwn(node.data, 'ref_resolution')) {
+        const value = node.data.ref_resolution;
+        if (!Number.isInteger(value) || value < 0 || value > 4096 || value % 32) throw new Error('ref_resolution 必须是 0–4096 间 32 的倍数');
+        data.ref_resolution = value;
+      }
       // The backend gives a nonempty top-level LoRA precedence. Normalize it into
       // the existing editable model role so later UI changes remain effective.
       if (node.data.lora) {

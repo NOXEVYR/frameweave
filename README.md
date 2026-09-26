@@ -4,7 +4,9 @@
 
 **AI 图片与视频生成画布，兼顾本地 AI 环境发现与检查。** 在画布上组织提示词、参考图、生成任务与结果，连接已有本地 ComfyUI 完成生成；发现并检查推理环境、模型依赖和后端状态。
 
-以钴蓝、杏桃与暖灰构建的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；重点是 MiniMax H3 视频、Krea 2 / SDXL 图片控制、缺失项检查和可复现工作流。
+以钴蓝、杏桃与暖灰构建的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；支持 MiniMax H3 视频、Krea 2 / SDXL 图片控制、Qwen Image 2.1 原生文生图与条件编辑、缺失项检查和可复现工作流。
+
+> **0.9.2**：一个应用管理本地引擎与工作流，登记已有安装后可在后台启动、复用连接；同一工作区防重复启动，桌面入口恢复已有窗口。新增手动更新与可选自动更新，校验后在空闲退出时安装，保留旧版。Qwen Image 2.1 原生与 GGUF / Heretic 工作流在同一包库使用，客户端不捆绑权重。见[引擎与更新指南](docs/ENGINE_AND_UPDATES.md)、[Qwen 指南](docs/QWEN_IMAGE_21.md)和[验证记录](docs/VALIDATION.md)。
 
 > **0.7.0**：整套工作流可作为节点组合，连接提示词、参考图和上游图片输出；支持按依赖顺序运行、原请求恢复和整套画布集合导入导出。保留独立文生图、图生图、视频生成页面、详细模型/LoRA 参数、清晰缩放和 14 个 MCP 工具。生成计算由本地 ComfyUI 完成，客户端不包含模型、PyTorch 或 CUDA。Windows x64 便携版和源码见下方下载入口。
 
@@ -18,11 +20,11 @@
 
 ## 开始使用
 
-**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.7.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.7.0-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
+**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.9.2-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.9.2-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
 
 新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/NOXEVYR/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 
-Windows 用户完整解压 0.7.0 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
+Windows 用户完整解压 0.9.2 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
 
 1. 启动你的本地 ComfyUI 推理服务。
 2. 棱光启动后自动发现本机后端，点击使用发现的服务；也可在右上角设置填写地址，例如 `http://127.0.0.1:8188`。
@@ -40,7 +42,7 @@ python launch.py
 
 ## 工作流包：填信息，生成图片或视频
 
-在顶栏打开“工作流包”，导入 ComfyUI API JSON，或把当前已配置的 H3 / Krea / SDXL 生成节点封装成包。选择需要开放的提示词、种子、尺寸、步数等参数，保存后得到画布上的表单节点；填写信息即可提交生成，输出进入原有队列和结果预览。
+在顶栏打开“工作流包”，导入 ComfyUI API JSON，或把当前已配置的 H3 / Krea / SDXL / Qwen Image 2.1 生成节点封装成包。选择需要开放的提示词、种子、尺寸、步数等参数，保存后得到画布上的表单节点；填写信息即可提交生成，输出进入原有队列和结果预览。
 
 0.7.0 可把多套包放在同一画布，通过端口明确连接文本或图片输入，例如“文生图 → 图生图 → H3 图生视频”。点击“运行所选及上游”顺序执行，失败时停止下游；刷新或响应丢失后按原请求查询恢复。“工作流集合”可将画布和所需包定义一起保存、恢复，导入不触发生成。
 
@@ -56,7 +58,7 @@ python launch.py
 - 提示词：独立文本卡片、连接生成节点、一键复制。JSON 画布可导入导出，浏览器自动保存工作状态。
 - 参考图：PNG / JPEG / WebP 上传到本机推理服务。H3 支持文生、首尾帧、1–9 张图像参考；视频和音频参考请使用专用 API 工作流。
 - 控制：模式、模型、种子、尺寸、步数、CFG、采样器、调度器、LoRA、降噪、时长。H3 固定 24 fps，展示按 `17n+5` 对齐的真实帧数和时长。
-- 图片：Krea 2 文生图与带兼容节点/LoRA的参考编辑、SDXL 文生图和图生图。参数与节点会在提交前校验。
+- 图片：Krea 2 文生图与带兼容节点/LoRA的参考编辑、SDXL 文生图和图生图，以及 Qwen Image 2.1 文生图和 1–10 张参考图的条件编辑。参数、模型角色与当前后端节点会在提交前校验；Qwen 原生模式须使用匹配的 2.1 DiT、Qwen3-VL 8B 编码器与 2.1 VAE。
 - 队列：只追踪本客户端提交的任务，保存复现图、耗时、执行错误和输出；支持状态筛选与标题、ID、类型、错误搜索，刷新时复用未变化的缩略图。
 - 参数复用：从历史任务创建独立生成节点，修改提示词或参数再运行。再次生成使用保存的精确 API 图与种子，并校验当前节点；同一次请求不会重复排队。详见 [任务历史指南](docs/TASK_HISTORY.md)。
 - 预览：图片放大、视频播放与下载；关闭或更换预览时暂停并释放媒体源。输入即时保存，轮询不会覆盖尚未失焦的有效文本。
@@ -65,7 +67,7 @@ python launch.py
 
 ## 缺失检查与 AI 协作
 
-顶栏 **AI 接入**可复制本机 MCP 连接配置。支持 Streamable HTTP 的同机 AI 客户端可以查询环境、管理数据工作流包、校验与提交图片/视频生成、查询和取消任务。AI 创建的结果可从队列放入画布；接口不直接拖拽排版。连接方式、14 个工具和去重规则见 [AI 接口指南](docs/AI_INTERFACE.md)。
+顶栏 **AI 接入**可复制本机 MCP 连接配置。支持 Streamable HTTP 的同机 AI 客户端可以查询环境、管理数据工作流包、校验与提交图片/视频生成、查询和取消任务；原生 Qwen 模式为 `qwen21_t2i` 与 `qwen21_edit`。AI 创建的结果可从队列放入画布；接口不直接拖拽排版。连接方式、14 个工具和去重规则见 [AI 接口指南](docs/AI_INTERFACE.md)。
 
 启动后自动检查少量本机候选端口、运行中的 ComfyUI、已识别安装位置和显卡信息；可在设置中补充自定义安装目录。按所选图片/视频工作流检查节点、模型角色、参考图、LoRA 和运行时证据，分别显示通过、缺失、错误、提醒和未知。后端未启动时不会把所有节点与模型误报为缺失。
 

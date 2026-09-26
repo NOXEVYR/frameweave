@@ -193,6 +193,24 @@ class StudioHTTPTests(unittest.TestCase):
         self.assertEqual(recipe["denoise"], 0.4)
         self.assertEqual(self.prompt_count(), 1)
 
+    def test_qwen_edit_recipe_retains_inputs_when_output_size_is_derived(self):
+        from test_qwen21 import qwen_fixture
+        self.backend.info = qwen_fixture()
+        self.app.info = {}
+        request = {"kind": "qwen21_edit", "positive": "Change the cup color", "references": ["first.png"],
+                   "custom_size": False, "ref_resolution": 512, "width": 768, "height": 512}
+        status, _, job = self.submit_guarded(request)
+        self.assertEqual(status, 200, job)
+        recipe = self.app.recipe(job["id"])["request"]
+        self.assertEqual((recipe["width"], recipe["height"]), (768, 512))
+        self.assertFalse(recipe["custom_size"])
+        self.assertEqual(recipe["ref_resolution"], 512)
+        self.assertNotIn("reference_roles", recipe)
+        compiled = self.app.compile(recipe)
+        self.assertIsNone(compiled["summary"]["width"])
+        self.assertEqual(compiled["summary"]["size_mode"], "first_reference")
+        self.assertEqual(self.prompt_count(), 1)
+
     def test_mcp_can_query_the_studio_request_without_resubmission(self):
         self.assertEqual(self.submit_guarded()[0], 200)
         status, response = automation.dispatch(self.app, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",

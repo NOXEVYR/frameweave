@@ -153,6 +153,20 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue(self.call("fw_compile", {"request": API_JOB})["isError"])
         self.assertEqual(self.prompts(), [])
 
+    def test_qwen_multireference_mcp_contract_compiles_without_dispatch(self):
+        from test_qwen21 import qwen_fixture
+        self.backend.info = qwen_fixture()
+        request = {"kind": "qwen21_edit", "positive": "Combine references", "references": ["first.png"] * 10,
+                   "custom_size": True, "width": 768, "height": 512, "ref_resolution": 512}
+        result = self.call("fw_compile", {"request": request})
+        self.assertFalse(result["isError"], result)
+        prompt = result["structuredContent"]["prompt"]
+        encoded = next(n["inputs"] for n in prompt.values() if n["class_type"] == "TextEncodeQwenImage21")
+        self.assertIn("images.image_10", encoded)
+        self.assertEqual(encoded["resolution"], 512)
+        self.assertTrue(self.call("fw_compile", {"request": {**request, "ref_resolution": 513}})["isError"])
+        self.assertEqual(self.prompts(), [])
+
     def test_native_h3_krea_and_sdxl_requests_compile_through_mcp(self):
         self.backend.info = fixture()
         cases = [

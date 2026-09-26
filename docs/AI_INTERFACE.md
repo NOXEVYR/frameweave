@@ -1,6 +1,6 @@
 # AI 调用棱光 PrismCanvas
 
-0.4.0 增加本机 MCP 接口。支持 **Streamable HTTP、自定义 Authorization 请求头**的 AI 客户端，可以查询环境、选择工作流、提交图片/视频生成和获取任务结果。无需模拟鼠标点击，也不需要安装新的客户端运行依赖。
+0.4.0 增加本机 MCP 接口。支持 **Streamable HTTP、自定义 Authorization 请求头**的 AI 客户端，可以查询环境、选择工作流、提交图片/视频生成和获取任务结果。无需模拟鼠标点击，也不需要安装新的客户端运行依赖。0.8.0 的 Qwen Image 2.1 支持属于本地候选能力，尚未发布为公开下载版本。
 
 ## 连接
 
@@ -35,7 +35,15 @@
 
 推荐流程：`fw_status` → `fw_packages` → `fw_compile` → `fw_generate` → `fw_jobs`。AI 可以先分析所需依赖，让用户确认规格后再提交。接口本身不增加第二次人工审批；调用权限由用户在 AI 客户端中控制。
 
-生成请求中的 `kind` 支持 H3 文生视频、首尾帧与参考模式，Krea、SDXL、API 图和工作流包。先用 `fw_upload_image` 得到输入名，再把它放入 `references` 或工作流包图片字段。客户端不自动从磁盘路径或 URL 读取图片；单张上传最多 20 MiB。大图宜由 AI 客户端的程序工具读取并编码，不要把大段 base64 放进自然语言聊天。
+生成请求中的 `kind` 支持 H3 文生视频、首尾帧与参考模式，Krea、SDXL、Qwen Image 2.1、API 图和工作流包。先用 `fw_upload_image` 得到输入名，再把它放入 `references` 或工作流包图片字段。客户端不自动从磁盘路径或 URL 读取图片；单张上传最多 20 MiB。大图宜由 AI 客户端的程序工具读取并编码，不要把大段 base64 放进自然语言聊天。
+
+### Qwen Image 2.1（0.8.0 本地候选）
+
+原生模式为 `qwen21_t2i` 与 `qwen21_edit`。文生图不接收参考图；编辑接收 1–10 张，按 `references` 顺序连接，第一张作为编辑目标。可省略 `reference_roles`，若传入则每项只能是 `reference`。两种模式都接受 `positive`、`negative`、`seed`、`steps`、`cfg`、`width`、`height`；宽高为 32 的倍数，编辑条件生成固定 `denoise=1`。编辑的 `custom_size` 默认 `false`，按首张参考图计算输出尺寸；设为 `true` 后用请求中的宽高。`ref_resolution` 默认 1024，范围 0–4096、以 32 为步长，控制参考图预处理。默认尺寸下编译摘要中的 `width` 和 `height` 会是 `null`，原始请求宽高仍作为 `requested_width` 与 `requested_height` 保留。
+
+通过 `models` 显式选择 `dit`、`text_encoder` 和 `vae`，它们必须分别是兼容的 Qwen Image 2.1 DiT、Qwen3-VL 8B 编码器和 2.1 VAE。原生模式使用标准 safetensors 加载器；旧 Qwen Image VAE、Qwen3-VL 4B 与 GGUF 不会被自动当作兼容项。模型出现在后端列表不等于权重组合已验证；LoRA 兼容性同样需实际生成确认。
+
+GGUF 或社区编码器组合可在安装相应加载扩展并通过当前后端节点检查后，封装为 ComfyUI API 工作流包；这不启用原生 Qwen 模型下拉中的 GGUF 支持。已验证的 Q4 GGUF 使用 `leejet/ComfyUI-GGUF` 固定提交 `373048b8403a7820620065210a691263d4da0a61`。社区 Heretic 配置指 Qwen3-VL 编码器与 mmproj 的组合，不是独立的官方 DiT；不同编码器组合的结果与指令遵循不能从单次样例推广。完整参数与限制见 [Qwen Image 2.1 指南](QWEN_IMAGE_21.md)。
 
 AI 提交的任务与界面使用相同记录。打开 **生成队列 → 放入画布**可创建结果节点，或用**复用参数**创建可编辑生成节点。再次点击定位到已有节点，不会重新生成。MCP 不直接操作浏览器中的拖拽、框选和节点排版。
 

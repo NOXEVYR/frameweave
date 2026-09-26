@@ -9,6 +9,12 @@ dist/
 node_modules/
 data/
 settings.json
+engines.json
+engine-logs/
+instance.json
+instance.lock
+window.lock
+updates/
 jobs.json
 last-url.txt
 automation-requests.json

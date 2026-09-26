@@ -6,10 +6,12 @@ import copy
 import hmac
 import http.client
 import json
+import logging
 import mimetypes
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -21,21 +23,25 @@ from pathlib import Path
 
 from . import __version__
 from .automation import (PROTOCOL_VERSIONS, SubmissionRejected, dispatch as dispatch_mcp,
-                         generate as guarded_generate, request_status)
+                         generate as guarded_generate, request_status, _read_ledger, _ledger_lock)
 from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
+from .engines import EngineManager
+from .updates import UpdateManager, UpdateError
 from .packages import PackageStore, apply_values, inspect_document, transport_document
 from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
 MAX_JSON = 28 * 1024 * 1024
+MAX_REJECT_DRAIN = 64 * 1024
+REJECT_DRAIN_TIMEOUT = 0.25
 TERMINAL = {"completed", "failed", "cancelled"}
 MAX_RUN = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
                   "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
                   "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video",
-                  "shift_audio", "ref_image_size", "package_id", "values"}
+                  "shift_audio", "ref_image_size", "custom_size", "ref_resolution", "package_id", "values"}
 
 
 class SubmissionUncertain(BackendError):
@@ -73,6 +79,16 @@ class App:
         if comfy_roots:
             self.settings["comfy_roots"] = self.validate_roots(comfy_roots)
         self.backend = Backend(self.settings["backend_url"])
+        self.engines = EngineManager(self.data_dir)
+        saved_options = locals().get("saved", {})
+        self.settings["auto_start_engine"] = isinstance(saved_options, dict) and saved_options.get("auto_start_engine") is True
+        self.settings["auto_update"] = isinstance(saved_options, dict) and saved_options.get("auto_update") is True
+        self.updates = UpdateManager(__version__, self.data_dir, auto_check=self.settings["auto_update"])
+        self.update_lock = threading.Lock()
+        self.update_busy = False
+        self.update_error = ""
+        self.exit_pending = False
+        self.listen_port = None
         self.info = {}
         self.info_at = 0
         self.jobs = {}
@@ -93,6 +109,83 @@ class App:
                         self.register_media(output["filename"], output.get("subfolder", ""), "output", job.get("backend"))
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
             self.jobs = {}
+
+        if self.settings["auto_start_engine"]:
+            threading.Thread(target=self.start_saved_engine, daemon=True).start()
+        if self.settings["auto_update"]:
+            self.begin_update("auto")
+
+    def update_status(self):
+        return {**self.updates.status(), "busy": self.update_busy, "error": self.update_error,
+                "auto_update": self.settings["auto_update"], "install_supported": bool(getattr(sys, "frozen", False) and os.name == "nt")}
+
+    def begin_update(self, action):
+        if action not in {"check", "stage", "auto"}:
+            raise ValueError("更新操作无效")
+        with self.lock, self.update_lock:
+            if self.exit_pending:
+                raise ValueError("棱光正在退出，不能开始更新")
+            if self.update_busy:
+                return self.update_status()
+            self.update_busy, self.update_error = True, ""
+        def run():
+            try:
+                status = self.updates.check()
+                if action in {"stage", "auto"} and status.get("update_available"):
+                    if status.get("release", {}).get("bytes", 0) > 50 * 1024 * 1024:
+                        raise ValueError("更新包超过 50 MiB，请通过发布页面确认大小后手动下载")
+                    self.updates.stage()
+            except (OSError, ValueError, UpdateError) as exc:
+                self.update_error = str(exc)
+            finally:
+                self.update_busy = False
+        threading.Thread(target=run, daemon=True).start()
+        return self.update_status()
+
+    def prepare_exit(self, port, install=False):
+        """An owned client may exit only after its submissions are settled."""
+        with self.lock, _ledger_lock(self):
+            if self.exit_pending:
+                raise ValueError("棱光正在退出，请勿重复安装")
+            if self.update_busy:
+                return False
+            if any(job["status"] not in TERMINAL for job in self.jobs.values()):
+                return False
+            if any(record["state"] in {"pending", "unknown"} for record in _read_ledger(self).values()):
+                return False
+            staged = self.updates.status().get("staged")
+            if install or (self.settings["auto_update"] and staged):
+                if self.update_busy:
+                    return False
+                if not staged or not staged.get("verified"):
+                    raise ValueError("请先下载并校验更新")
+                if not getattr(sys, "frozen", False) or os.name != "nt":
+                    if install:
+                        raise ValueError("自动安装仅支持 Windows 打包客户端，源码运行请使用版本管理更新")
+                    return True
+                from .update_handoff import launch_handoff
+                launch_handoff(sys.executable, self.data_dir, staged, port)
+            self.exit_pending = True
+            return True
+
+    def start_saved_engine(self):
+        """Start only the user's selected, locally registered engine; never switch.
+
+        A profile may opt out of auto start with ``"auto_start": false`` in
+        engines.json; manual starts from the engine center are unaffected.
+        """
+        try:
+            for profile in self.engines.status()["profiles"]:
+                if profile["base_url"] != self.backend.url:
+                    continue
+                if profile.get("auto_start", True) is False:
+                    logging.info("引擎 %s 配置为不自动启动，跳过。", profile["id"])
+                    break
+                logging.info("自动拉起引擎 %s（%s）。", profile["id"], profile["base_url"])
+                self.engines.start(profile["id"])
+                break
+        except (OSError, ValueError, BackendError) as exc:
+            logging.warning("自动拉起引擎未完成：%s", exc)  # The engine center reports failure; startup must remain usable.
 
     @staticmethod
     def validate_roots(roots):
@@ -161,19 +254,31 @@ class App:
 
     def save_settings(self, data):
         settings = {"backend_url": local_url(data.get("backend_url", "")),
+                    "auto_start_engine": data.get("auto_start_engine", self.settings.get("auto_start_engine", False)),
+                    "auto_update": data.get("auto_update", self.settings.get("auto_update", False)),
                     "model_roots": self.validate_roots(data.get("model_roots", [])),
                     "comfy_roots": self.validate_roots(data.get("comfy_roots", self.settings.get("comfy_roots", [])))}
+        if type(settings["auto_start_engine"]) is not bool or type(settings["auto_update"]) is not bool:
+            raise ValueError("自动启动设置须为布尔值")
         with self.lock:
             changed = settings["backend_url"] != self.backend.url
+            enable_updates = settings["auto_update"] and not self.settings.get("auto_update", False)
             if changed and any(j["status"] not in TERMINAL for j in self.jobs.values()):
                 raise ValueError("有任务尚未结束，请等待任务结束后切换推理后端")
+            if changed:
+                with _ledger_lock(self):
+                    if any(record["state"] in {"pending", "unknown"} for record in _read_ledger(self).values()):
+                        raise ValueError("有提交结果尚未确认，请先在原引擎核实请求，不能切换后端")
             atomic_json(self.data_dir / "settings.json", settings)
             self.settings = settings
+            self.updates.set_auto_check(settings["auto_update"])
             self.backend = Backend(settings["backend_url"])
             self.info, self.info_at = {}, 0
             self.environment_at = 0
             if changed:
                 self.uploaded.clear()
+            if enable_updates:
+                self.begin_update("auto")
             return {"settings": settings}
 
     def register_media(self, filename, subfolder="", kind="output", backend=None):
@@ -313,14 +418,24 @@ class App:
                 request = None  # The exact graph is already stored once below.
             elif data.get("kind") != "package":
                 summary = result.get("summary", {})
-                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles", "denoise", "loras"):
+                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles", "denoise", "loras", "custom_size", "ref_resolution"):
                     if key in summary:
+                        if key in {"width", "height"} and summary[key] is None:
+                            # An input-derived output size is unknown until execution;
+                            # its display summary must not erase replayable input values.
+                            if key not in request and summary.get("requested_" + key) is not None:
+                                request[key] = summary["requested_" + key]
+                            continue
+                        if key == "reference_roles" and str(data.get("kind", "")).startswith("qwen21_"):
+                            continue
                         request[key] = copy.deepcopy(summary[key])
             result["request"] = request
             return self._dispatch(result, data.get("kind"))
 
     def _dispatch(self, result, kind, retry_of=None):
         """Called under lock. Prepare storage before any inference side effect."""
+        if self.exit_pending or self.closed.is_set():
+            raise ValueError("棱光正在退出，未提交生成任务")
         if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
             raise ValueError("最多同时保留 24 个未结束任务")
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2)
@@ -640,22 +755,66 @@ def make_server(app, port=0):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def drain_rejected_body(self):
+            """Consume only a small, explicitly sized body after the rejection is sent."""
+            if self.headers.get_all("Transfer-Encoding"):
+                return
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+                return
+            digits = lengths[0].lstrip("0") or "0"
+            if len(digits) > len(str(MAX_REJECT_DRAIN)):
+                return
+            length = int(digits)
+            if not 1 <= length <= MAX_REJECT_DRAIN:
+                return
+            deadline = time.monotonic() + REJECT_DRAIN_TIMEOUT
+            remaining = length
+            try:
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        return
+                    self.connection.settimeout(timeout)
+                    chunk = self.rfile.read1(min(remaining, 8192))
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
+            except OSError:
+                # The response has already been sent. A timeout or disconnect
+                # ends this rejected request without waiting for the full body.
+                return
+
+        def reject(self, data, code=400, content_type="application/json; charset=utf-8", extra=None):
+            """Reject and close, draining only a bounded, unambiguous body."""
+            self.close_connection = True
+            headers = dict(extra or {})
+            headers["Connection"] = "close"
+            self.respond(data, code, content_type, headers)
+            self.drain_rejected_body()
+
         def do_GET(self):
             if not self.allowed_host() or not self.origin_ok() or self.headers.get("Sec-Fetch-Site") == "cross-site":
-                self.respond({"error": "仅允许本机客户端访问"}, 403)
+                self.reject({"error": "仅允许本机客户端访问"}, 403)
                 return
             app.last_seen = time.monotonic()
             path = urllib.parse.urlsplit(self.path).path
             try:
                 if path == "/api/bootstrap":
-                    self.respond({"version": __version__, "csrf": app.csrf, "settings": app.settings,
+                    self.respond({"application": "PrismCanvas", "version": __version__, "csrf": app.csrf, "settings": app.settings,
                                   "presets": [{"id": "draft", "label": "构图试样", "steps": 20, "width": 768, "height": 448, "seconds": 4},
                                               {"id": "balanced", "label": "标准制作", "steps": 20, "width": 1344, "height": 768, "seconds": 5},
                                               {"id": "quality", "label": "细节优先", "steps": 25, "width": 1344, "height": 768, "seconds": 5}]})
                 elif path == "/mcp":
-                    self.respond({"error": "此 MCP 接口使用 POST；不提供 SSE 订阅"}, 405, extra={"Allow": "POST"})
+                    self.reject({"error": "此 MCP 接口使用 POST；不提供 SSE 订阅"}, 405, extra={"Allow": "POST"})
                 elif path == "/api/status":
                     self.respond(app.status())
+                elif path == "/api/engines":
+                    self.respond(app.engines.status())
+                elif path == "/api/updates":
+                    self.respond(app.update_status())
+                elif path == "/api/heartbeat":
+                    self.respond({"ok": True})
                 elif path == "/api/jobs":
                     self.respond(app.job_list())
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/recipe", path):
@@ -669,7 +828,7 @@ def make_server(app, port=0):
                     with app.lock:
                         registered = app.media.get(key)
                     if not registered:
-                        self.respond({"error": "媒体不属于此客户端的任务或导入"}, 404)
+                        self.reject({"error": "媒体不属于此客户端的任务或导入"}, 404)
                         return
                     backend_url, query = registered
                     header = {}
@@ -679,17 +838,17 @@ def make_server(app, port=0):
                     # Stream large videos: no full-file buffering in the lightweight client.
                     self.stream_media(backend_url, query, header)
                 elif path.startswith("/api/"):
-                    self.respond({"error": "接口不存在"}, 404)
+                    self.reject({"error": "接口不存在"}, 404)
                 else:
                     relative = "index.html" if path == "/" else safe_relative(urllib.parse.unquote(path).lstrip("/"))
                     file = (app.web_dir / relative).resolve()
                     if not file.is_relative_to(app.web_dir) or not file.is_file():
-                        self.respond({"error": "文件不存在"}, 404)
+                        self.reject({"error": "文件不存在"}, 404)
                     else:
                         mime = "text/javascript" if file.suffix in (".js", ".mjs") else mimetypes.guess_type(str(file))[0] or "application/octet-stream"
                         self.respond(file.read_bytes(), content_type=mime)
             except (ValueError, OSError, BackendError) as exc:
-                self.respond({"error": str(exc)}, 400 if isinstance(exc, ValueError) else 502)
+                self.reject({"error": str(exc)}, 400 if isinstance(exc, ValueError) else 502)
 
         def stream_media(self, backend_url, query, headers):
             import urllib.request
@@ -726,13 +885,11 @@ def make_server(app, port=0):
             if (not self.allowed_host() or not self.origin_ok()
                     or self.headers.get("Sec-Fetch-Site") == "cross-site"
                     or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))):
-                self.close_connection = True
-                self.respond({"error": "请求校验失败，请刷新客户端后重试"}, 403)
+                self.reject({"error": "请求校验失败，请刷新客户端后重试"}, 403)
                 return
             app.last_seen = time.monotonic()
-            if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) > 1:
-                self.close_connection = True
-                self.respond({"error": "请求须使用单一 Content-Length"}, 400)
+            if self.headers.get_all("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) > 1:
+                self.reject({"error": "请求须使用单一 Content-Length"}, 400)
                 return
             if is_mcp:
                 accepted = set()
@@ -745,24 +902,24 @@ def make_server(app, port=0):
                     if 0 < quality <= 1:
                         accepted.add(media_type.strip())
                 if not {"application/json", "text/event-stream"} <= accepted:
-                    self.close_connection = True
-                    self.respond({"error": "MCP Accept 须包含 application/json 和 text/event-stream"}, 406)
+                    self.reject({"error": "MCP Accept 须包含 application/json 和 text/event-stream"}, 406)
                     return
                 protocol = self.headers.get("MCP-Protocol-Version", "2025-03-26")
                 if protocol not in PROTOCOL_VERSIONS:
-                    self.close_connection = True
-                    self.respond({"error": "不支持此 MCP 协议版本"}, 400)
+                    self.reject({"error": "不支持此 MCP 协议版本"}, 400)
                     return
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-                self.close_connection = True
-                self.respond({"error": "仅支持 application/json"}, 415)
+                self.reject({"error": "仅支持 application/json"}, 415)
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 1 <= length <= MAX_JSON:
-                    self.close_connection = True
-                    self.respond({"error": "请求大小超限"}, 413)
-                    return
+            except ValueError:
+                self.reject({"error": "Content-Length 无效"}, 400)
+                return
+            if not 1 <= length <= MAX_JSON:
+                self.reject({"error": "请求大小超限"}, 413)
+                return
+            try:
                 self.connection.settimeout(30)
                 try:
                     raw = self.rfile.read(length)
@@ -780,6 +937,21 @@ def make_server(app, port=0):
                     raise ValueError("请求应为 JSON 对象")
                 if path == "/api/settings":
                     result = app.save_settings(data)
+                elif path == "/api/engines/start":
+                    result = app.engines.start(data.get("id"))
+                elif path == "/api/engines/register":
+                    if set(data) - {"root", "port", "name"}:
+                        raise ValueError("仅支持登记已有安装目录、名称和端口")
+                    result = app.engines.register(data.get("root"), data.get("port", 8188), data.get("name", "本地 ComfyUI"))
+                elif path in {"/api/updates/check", "/api/updates/stage"}:
+                    result = app.begin_update(path.rsplit("/", 1)[-1])
+                elif path in {"/api/updates/install", "/api/exit"}:
+                    if not app.prepare_exit(self.server.server_port, install=path.endswith("/install")):
+                        raise ValueError("有生成任务、待确认提交或下载正在处理，请完成后再退出安装")
+                    self.respond({"ok": True, "exiting": True})
+                    app.closed.set()
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    return
                 elif path == "/api/environment":
                     result = app.environment()
                 elif path == "/api/diagnostics":
@@ -831,16 +1003,15 @@ def make_server(app, port=0):
                 self.respond({"error": str(exc)}, 502)
 
         def do_OPTIONS(self):
-            self.respond({"error": "不允许跨站请求"}, 403)
+            self.reject({"error": "不允许跨站请求"}, 403)
 
         def do_DELETE(self):
-            self.close_connection = True
             if not self.allowed_host() or not self.origin_ok() or self.headers.get("Sec-Fetch-Site") == "cross-site":
-                self.respond({"error": "仅允许本机客户端访问"}, 403)
+                self.reject({"error": "仅允许本机客户端访问"}, 403)
             elif urllib.parse.urlsplit(self.path).path == "/mcp":
-                self.respond({"error": "此 MCP 接口不创建会话"}, 405, extra={"Allow": "POST"})
+                self.reject({"error": "此 MCP 接口不创建会话"}, 405, extra={"Allow": "POST"})
             else:
-                self.respond({"error": "接口不存在"}, 404)
+                self.reject({"error": "接口不存在"}, 404)
 
     server = Server(("127.0.0.1", port), Handler)
     server.app = app

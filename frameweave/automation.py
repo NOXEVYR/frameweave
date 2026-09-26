@@ -45,22 +45,25 @@ def object_schema(properties=None, required=()):
 
 
 REQUEST_SCHEMA = object_schema({
-    "kind": {"type": "string", "enum": ["h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "api", "package"]},
+    "kind": {"type": "string", "enum": ["h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "qwen21_t2i", "qwen21_edit", "api", "package"]},
     "positive": TEXT, "negative": TEXT, "prompt": OBJECT,
     "models": object_schema({key: {"type": "string", "maxLength": 1024} for key in
                              ("checkpoint", "dit", "text_encoder", "vae", "audio_vae", "lora")}),
     "seed": INTEGER, "width": INTEGER, "height": INTEGER, "steps": INTEGER,
     "cfg": NUMBER, "denoise": NUMBER, "sampler": {"type": "string", "maxLength": 200},
     "scheduler": {"type": "string", "maxLength": 200}, "seconds": NUMBER, "fps": INTEGER,
-    "references": {"type": "array", "maxItems": 9, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
-    "reference_roles": {"type": "array", "maxItems": 9, "items": {"type": "string", "enum": ["start", "end", "reference"]}},
+    "references": {"type": "array", "maxItems": 10, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+    "reference_roles": {"type": "array", "maxItems": 10, "items": {"type": "string", "enum": ["start", "end", "reference"]}},
     "lora": {"type": "string", "maxLength": 1024}, "lora_strength": NUMBER,
     "loras": {"type": "array", "maxItems": 4, "items": object_schema({
         "name": {"type": "string", "minLength": 1, "maxLength": 1024},
         "strength_model": {"type": "number", "minimum": -10, "maximum": 10},
         "strength_clip": {"type": "number", "minimum": -10, "maximum": 10},
-    }, ("name",)), "description": "按顺序应用，存在时覆盖旧 lora 字段，空数组表示禁用；H3/Krea 的 strength_clip 只能省略或为 0。"},
+    }, ("name",)), "description": "按顺序应用，存在时覆盖旧 lora 字段，空数组表示禁用；H3/Krea/Qwen 2.1 的 strength_clip 只能省略或为 0。"},
     "shift_video": NUMBER, "shift_audio": NUMBER,
+    "custom_size": {"type": "boolean", "description": "Qwen 2.1 编辑默认 false，按首图与参考分辨率确定输出尺寸；true 使用 width/height。"},
+    "ref_resolution": {"type": "integer", "minimum": 0, "maximum": 4096, "multipleOf": 32,
+                       "description": "Qwen 2.1 参考图面积预算的边长，默认 1024；0 保留输入尺寸并对齐 32。"},
     "ref_image_size": {"type": "string", "maxLength": 100,
                        "description": "H3 参考图尺寸模式，通常为 match（默认）或 max；以当前后端节点选项校验。"},
     "package_id": PACKAGE_ID, "values": OBJECT,
@@ -70,6 +73,7 @@ REQUEST_SCHEMA["description"] = (
     "原生 kind 通过 fw_status 查询可用模型；positive/negative、seed、width/height、steps/cfg 控制生成。"
     "references 只能使用 fw_upload_image 返回的 name 或已在原后端保留的输入图名。"
     "sdxl_i2i 必须提供一张 references，可用 denoise 控制重绘强度。"
+    "qwen21_t2i 不接收参考图；qwen21_edit 使用 1–10 张有序 references、denoise=1、宽高为 32 倍数。"
     "H3 视频使用 seconds；fps 固定 24，帧数及分辨率约束由 fw_compile 返回。")
 PACKAGE_SCHEMA = {
     "type": "object", "required": ["name", "prompt"],
@@ -210,6 +214,8 @@ def _validate(value, schema, path="arguments"):
     elif kind in ("number", "integer"):
         if value < schema.get("minimum", -math.inf) or value > schema.get("maximum", math.inf):
             raise ValueError(f"{path} 数值超出允许范围")
+        if "multipleOf" in schema and value % schema["multipleOf"] != 0:
+            raise ValueError(f"{path} 必须是 {schema['multipleOf']} 的倍数")
 
 
 def _read_ledger(app):

@@ -96,6 +96,7 @@ def resolve_model(roots, name, role):
 COMFY_DOCS = "https://docs.comfy.org/installation/system_requirements"
 H3_DOCS = "https://docs.comfy.org/tutorials/video/minimax/minimax-h3-native"
 KREA_DOCS = "https://docs.comfy.org/tutorials/image/krea/krea-2"
+QWEN21_DOCS = "https://huggingface.co/Comfy-Org/Qwen-Image-2.1"
 STATES = ("ok", "missing", "error", "warning", "unknown")
 ROLES = ("checkpoint", "dit", "text_encoder", "vae", "audio_vae", "lora")
 MODEL_FIELDS = {"ckpt_name": "checkpoint", "unet_name": "dit", "clip_name": "text_encoder",
@@ -108,20 +109,32 @@ def _request(request):
         raise ValueError("检测请求必须是对象")
     _check_json_limits(request)
     kind = request.get("kind", "h3_t2v")
-    if not isinstance(kind, str) or kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "api"}:
+    if not isinstance(kind, str) or kind not in {"h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i",
+                                                 "qwen21_t2i", "qwen21_edit", "api"}:
         raise ValueError("不支持的检测模式")
     models = request.get("models", {})
     if not isinstance(models, dict) or any(key not in ROLES for key in models):
         raise ValueError("models 必须是支持的模型角色对象")
     if any(value is not None and (not isinstance(value, str) or len(value) > 1024) for value in models.values()):
         raise ValueError("模型名称必须是 0–1024 字符的文本")
+    qwen21 = kind in {"qwen21_t2i", "qwen21_edit"}
+    if qwen21 and any(key not in {"dit", "text_encoder", "vae", "lora"} for key in models):
+        raise ValueError("Qwen Image 2.1 models 只支持 dit、text_encoder、vae 和 model-only LoRA")
     for key in ("positive", "negative", "sampler", "scheduler", "lora"):
         if key in request and (not isinstance(request[key], str) or len(request[key]) > (100000 if key in {"positive", "negative"} else 1024)):
             raise ValueError("提示词、采样选项和 LoRA 名称必须是长度受限的文本")
     refs = _reference_names(request)
-    if len(refs) > 9 or any(len(ref) > 1024 for ref in refs):
-        raise ValueError("参考图最多 9 张，每个相对名称不超过 1024 字符")
-    _reference_roles(request, kind, refs)
+    reference_limit = 10 if kind == "qwen21_edit" else 9
+    if len(refs) > reference_limit or any(len(ref) > 1024 for ref in refs):
+        raise ValueError(f"参考图最多 {reference_limit} 张，每个相对名称不超过 1024 字符")
+    roles = _reference_roles(request, kind, refs)
+    if qwen21 and any(role != "reference" for role in roles):
+        raise ValueError("Qwen Image 2.1 参考图按数组顺序传入，reference_roles 只能使用 reference")
+    if qwen21:
+        if "custom_size" in request and type(request["custom_size"]) is not bool:
+            raise ValueError("custom_size 必须为布尔值")
+        if request.get("custom_size") and kind != "qwen21_edit":
+            raise ValueError("custom_size 只支持 Qwen Image 2.1 编辑模式")
     _lora_specs(request, kind)
     _number(request, "denoise", 1, 0, 1)
     for key, minimum, maximum, integer in (("width", 32, 8192, True), ("height", 32, 8192, True),
@@ -130,6 +143,10 @@ def _request(request):
             ("shift_video", .01, 100, False), ("shift_audio", .01, 100, False), ("lora_strength", -10, 10, False)):
         if key in request:
             _number(request, key, minimum, minimum, maximum, integer)
+    if qwen21:
+        resolution = _number(request, "ref_resolution", 1024, 0, 4096, True)
+        if resolution % 32:
+            raise ValueError("ref_resolution 必须为 32 的倍数")
     if kind != "api":
         return kind, models, refs, None
     prompt = request.get("prompt", request.get("workflow", {}))
@@ -153,9 +170,17 @@ def _selections(kind, models, request, model_catalog):
     h3 = kind.startswith("h3_")
     loras = _lora_specs(request, kind)
     sdxl = kind in {"sdxl", "sdxl_i2i"}
+    qwen21 = kind in {"qwen21_t2i", "qwen21_edit"}
     if kind == "api":
         return []
-    choices = [("checkpoint", ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"), ())] if sdxl else [
+    if sdxl:
+        choices = [("checkpoint", ("sdxl", "_xl", "xl_", "xl.", "pony", "illustrious", "illust"), ())]
+    elif qwen21:
+        choices = [("dit", ("qwen_image_2.1", "qwen_image_2_1"), ()),
+                   ("text_encoder", ("qwen3vl_8b",), ()),
+                   ("vae", ("qwen_image_2.1_vae", "qwen_image_2_1_vae"), ())]
+    else:
+        choices = [
         ("dit", ("ref2va",) if kind == "h3_ref" else ("fl2va",) if h3 else ("krea2",), ("pruned",) if h3 and not loras else ()),
         ("text_encoder", ("minimax_h3",) if h3 else ("qwen3vl_4b",), ("nvfp4",) if h3 else ()),
         ("vae", ("minimax_h3_video_vae",) if h3 else ("qwen_image_vae",), ())]
@@ -181,6 +206,7 @@ def _dependencies(kind, request, refs, selections, info):
         return []
     h3 = kind.startswith("h3_")
     sdxl = kind in {"sdxl", "sdxl_i2i"}
+    qwen21 = kind in {"qwen21_t2i", "qwen21_edit"}
     needed = {"CheckpointLoaderSimple"} if sdxl else {"UNETLoader", "CLIPLoader", "VAELoader"}
     models = dict((role, name) for role, name, _ in selections)
     if sdxl and models.get("vae"):
@@ -202,6 +228,12 @@ def _dependencies(kind, request, refs, selections, info):
             needed |= {"MiniMaxH3SigmaShift", "KSampler", "CLIPTextEncode" if negative else "ConditioningZeroOut"}
         decode = {"LTXVSeparateAVLatent", "VAEDecode", "VAEDecodeAudio"}
         needed |= decode if decode <= info.keys() else {"MiniMaxH3AVDecodeT8"}
+    elif qwen21:
+        needed |= {"TextEncodeQwenImage21", "KSampler", "VAEDecode", "SaveImage"}
+        if kind == "qwen21_edit":
+            needed.add("LoadImage")
+        if kind == "qwen21_t2i" or request.get("custom_size", False):
+            needed.add("EmptyLatentImage")
     else:
         needed |= {"KSampler", "VAEDecode", "SaveImage"}
         needed |= {"Krea2OstrisEditModelPatch", "TextEncodeKrea2OstrisEdit"} if kind == "krea" and refs else {"CLIPTextEncode"}
@@ -248,7 +280,8 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
     online = status.get("online") is True
     info = object_info if online else {}
     checks, repair_rows = [], []
-    docs = H3_DOCS if kind.startswith("h3_") else KREA_DOCS if kind == "krea" else COMFY_DOCS
+    docs = (H3_DOCS if kind.startswith("h3_") else KREA_DOCS if kind == "krea"
+            else QWEN21_DOCS if kind in {"qwen21_t2i", "qwen21_edit"} else COMFY_DOCS)
 
     def add(key, category, name, state, detail, steps=(), url=None, repair=None):
         action = {"label": "查看修复步骤" if state != "ok" else "查看检查说明", "steps": list(steps)}
@@ -318,7 +351,8 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
             repair=detail + (f"；所需节点：{node}" if kind != "api" else "；API 自定义节点名称请在本地检查面板核对"))
 
     if kind != "api":
-        limits = {"h3_t2v": (0, 0), "h3_i2v": (1, 2), "h3_ref": (1, 9), "krea": (0, 3), "sdxl": (0, 1), "sdxl_i2i": (1, 1)}
+        limits = {"h3_t2v": (0, 0), "h3_i2v": (1, 2), "h3_ref": (1, 9), "krea": (0, 3),
+                  "sdxl": (0, 1), "sdxl_i2i": (1, 1), "qwen21_t2i": (0, 0), "qwen21_edit": (1, 10)}
         minimum, maximum = limits[kind]
         if not minimum <= len(refs) <= maximum or (request.get("denoise", 1) < 1 and not refs):
             add("input.references", "input", "参考图数量", "missing" if len(refs) < minimum or not refs else "error",
@@ -326,7 +360,7 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
                 ("在画布连接已上传的输入图片并核对首帧、尾帧或参考图角色。",), docs)
         if online and "CLIPLoader" in needed and "CLIPLoader" in info:
             options = _options(info["CLIPLoader"], "type")
-            expected = "minimax" if kind.startswith("h3_") else "krea2"
+            expected = "minimax" if kind.startswith("h3_") else "qwen_image" if kind in {"qwen21_t2i", "qwen21_edit"} else "krea2"
             add("schema.clip_type", "schema", "文本编码器模式", "ok" if expected in options else "missing",
                 "后端文本编码器支持目标模式" if expected in options else "后端 CLIPLoader 缺少当前模式选项；需要核对 ComfyUI 版本",
                 ("按模式官方文档核对节点及文本编码器版本。",), docs)

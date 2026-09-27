@@ -179,6 +179,10 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
       const frozen = parseGraph(serializeGraph(graph));
       const targets = targetIds === undefined ? frozen.nodes.filter(node => node.type === 'generation').map(node => node.id) : [...targetIds];
       const order = executionOrder(frozen, targets); if (!order.length) throw new Error('请选择至少一个可执行生成节点');
+      for (const id of order) {
+        const node = frozen.nodes.find(item => item.id === id);
+        if (node.data.kind === 'package' && !node.data.package_id) throw new Error(`「${node.data.title}」尚未建立外层参数，请先提取参数或复用已保存配置；本次未启动任何节点。`);
+      }
       const normalized = normalizeBackend(backend), now = new Date().toISOString();
       state = { schema: RUN_SCHEMA, id: globalThis.crypto.randomUUID(), status: 'running', backend: normalized, graph: frozen, target_ids: targets, created_at: now, updated_at: now, error: '', steps: order.map(node_id => ({ node_id, state: 'pending', request_id: null, request: null, job_id: null, job_status: null, image_inputs: {} })) };
       if (canvasId !== undefined) state.canvas_id = canvasId;

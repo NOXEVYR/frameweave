@@ -51,6 +51,14 @@ function harness(options = {}) {
   return { make: () => createWorkflowRunner(config), config, calls, saves, accepted, jobs, requests, control, changes, jobEvents, disk: () => copy(disk) };
 }
 
+test('a pending native node blocks a whole run before earlier nodes can submit', async () => {
+  const h = harness(), runner = h.make();
+  const ready = createNode('generation',0,0,{kind:'sdxl',positive:'Ready'});
+  const pending = createNode('generation',400,0,{kind:'package',editor_id:'e-'+'a'.repeat(24),package_id:''});
+  await assert.rejects(runner.start({graph:{nodes:[ready,pending],edges:[]},backend:BACKEND}),/尚未建立外层参数/);
+  assert.deepEqual(h.calls,[]);assert.deepEqual(h.saves,[]);assert.equal(runner.getState(),null);
+});
+
 test('selected downstream runs only its ancestors in order and transfers an image-only index from this run', async () => {
   const h = harness(), runner = h.make(), graph = chain({ viaResult: true });
   const state = await runner.start({ graph, targetIds: ['second'], backend: BACKEND });

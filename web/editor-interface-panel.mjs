@@ -77,6 +77,7 @@ export function initialEditorFieldIds(fields, previousFields = [], previousValue
       ...candidates.filter(field => editorFieldGroup(field) === '提示词'),
       ...candidates.filter(field => editorFieldGroup(field) === '采样尺寸'),
       ...candidates.filter(field => field.recommended === true && editorFieldGroup(field) === '其他'),
+      ...candidates.filter(field => field.recommended !== true && editorFieldGroup(field) === '其他'),
     ];
   const ordered = [...required, ...wanted.filter(field => !required.includes(field))];
   const capped = required.length > EDITOR_INTERFACE_FIELD_LIMIT

@@ -293,7 +293,14 @@ def inspect_document(document, info=None, *, field_limit=64):
             # must still allow fractional values such as a video duration.
             if spec == "FLOAT" and type(value) in (int, float):
                 kind = "number"
-            options = spec if isinstance(spec, list) else meta.get("options") if spec == "COMBO" else None
+            dynamic_combo = spec == "COMFY_DYNAMICCOMBO_V3"
+            if dynamic_combo:
+                definitions = meta.get("options")
+                if not isinstance(definitions, list) or not 1 <= len(definitions) <= 512:
+                    raise ValueError("动态组合选项须为 1–512 项")
+                options = [definition["key"] for definition in definitions]
+            else:
+                options = spec if isinstance(spec, list) else meta.get("options") if spec == "COMBO" else None
             if isinstance(options, list) and 1 <= len(options) <= 512 and all(scalar(v) for v in options):
                 kind = "select"
             if node["class_type"] in {"LoadImage", "LoadImageMask"} and name == "image":
@@ -309,7 +316,7 @@ def inspect_document(document, info=None, *, field_limit=64):
                      "recommended": name in labels and name not in MODEL_INPUTS}
             if kind == "select":
                 field["options"] = options
-                if value not in options:
+                if value not in options and not dynamic_combo:
                     field["options"] = [value, *options][:512]
             if kind in {"integer", "number"}:
                 for bound in ("min", "max"):

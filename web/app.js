@@ -13,6 +13,7 @@ import { createNativeWorkflowEditor, editorDocument, EDITOR_LIMIT } from './nati
 import { chooseEditorInterface, resolveEditorConflicts } from './editor-interface-panel.mjs';
 import { editorConnectionSummary, applyEditorInterfaceGraph } from './editor-canvas-interface.mjs';
 import { chooseWorkflowBackend, workflowBackendTarget } from './editor-backend-picker.mjs';
+import { createWorkflowConfigurations } from './workflow-configurations.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
@@ -458,7 +459,7 @@ function port(node, direction) {
   element.dataset.port = direction;
   return element;
 }
-function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '双击新建 · 滚轮缩放 · 空格平移 · Shift 框选'; renderEdges(); renderSelection(); }
+function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '左键框选 · 中键平移 · 双击新建 · 滚轮缩放'; renderEdges(); renderSelection(); }
 function renderNodes() {
   const remaining = new Map([...nodesLayer.children].map(card => [card.dataset.nodeId, card]));
   graph.nodes.forEach((node, index) => {
@@ -492,7 +493,7 @@ function renderNodes() {
       stats.forEach(([name, value]) => { const stat = el('div', 'stat'); stat.append(el('span', '', name), el('strong', '', value)); summary.append(stat); });
       body.append(summary);
       let prompt = ''; try { prompt = generationPayload(graph, node.id).positive; } catch { /* API import has no prompt yet. */ }
-      body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '连接提示词或上游图片，也可在右侧填写输入。运行时自动完成上游依赖。' : node.data.editor_id ? '点击“进入工作流”选择内部模式与参数，再应用到外层。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
+      body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '连接提示词或上游图片，也可在右侧填写输入。运行时自动完成上游依赖。' : node.data.editor_id ? '先提取外层参数，或复用已保存的完整工作流配置。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
       if (pack) {
         const inputs = el('div', 'node-workflow-inputs');
         for (const definition of pack.fields.filter(f => ['text', 'image'].includes(f.type)).slice(0, 6)) {
@@ -500,6 +501,9 @@ function renderNodes() {
           inputs.append(el('span', '', `${link ? '●' : '○'} ${definition.label}${link ? ` ← ${getNode(link.edge.source)?.data.title || '来源'}` : ''}`));
         }
         body.append(inputs);
+      }
+      if (node.data.editor_id && !pack) {
+        body.append(button('提取外层参数', 'button primary prepare-workflow', () => nativeEditor.prepare(node)), button('复用已保存配置', 'button quiet reuse-workflow', () => workflowConfigurations.choose(node)));
       }
       if (node.data.editor_id) body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => nativeEditor.open(node)));
       if (node.data.editor_id && pack) body.append(button('配置外层参数与输出', 'button quiet', () => configureNativePanel(node)));
@@ -633,18 +637,26 @@ function modelField(node, label, key) {
 }
 function renderPackageInputs(wrap, node) {
   const pack = packages.find(item => item.id === node.data.package_id);
+  const tools = el('details', 'workflow-configuration-tools');
+  tools.append(el('summary', '', '工作流结构 · 保存与复用配置'));
   if (node.data.editor_id) {
-    wrap.append(button('↗ 进入工作流 · 内部调参', 'button primary', () => nativeEditor.open(node)));
-    if (pack) wrap.append(button('配置外层参数与输出', 'button quiet', () => configureNativePanel(node)));
-    if (!pack) { wrap.append(el('p', 'model-note', '完整原生工作流已保存。先进入内部选择模式、模型和参数，点击“应用参数并返回”后，这里会显示可连接的输入。')); return; }
+    if (!pack) {
+      wrap.append(el('p', 'model-note', '此原生文件尚未建立外层参数。可直接提取控件，或使用已保存的完整配置；不需要先生成一次。'),
+        button('提取外层参数', 'button primary prepare-workflow', () => nativeEditor.prepare(node)),
+        button('复用已保存配置', 'button quiet reuse-workflow', () => workflowConfigurations.choose(node)),
+        button('进入内部编辑 · 修复结构', 'button quiet', () => nativeEditor.open(node)));
+      return;
+    }
+    tools.append(button('↗ 进入工作流 · 内部调参', 'button quiet', () => nativeEditor.open(node)));
+    if (pack) tools.append(button('配置外层参数与输出', 'button quiet', () => configureNativePanel(node)));
   }
   if (!pack) {
     wrap.append(el('p', 'model-note', packagesLoaded ? '本机包库中没有对应工作流包。请导入原来的包文件；相同内容会恢复画布关联。' : '正在读取本机工作流包库…'));
     wrap.append(button('导入对应工作流包', 'button quiet', openPackages));
     return;
   }
-  wrap.append(el('p', 'model-note', pack.description || '填写以下输入，整套工作流将在本地推理引擎中执行。'));
-  const actions = el('div', 'inspector-actions'); actions.append(button('打开包库', 'button quiet', openPackages), button('导出此工作流包', 'button quiet', () => exportPackage(pack.id))); wrap.append(actions);
+  tools.append(el('p', 'model-note', pack.description || '填写以下输入，整套工作流将在本地推理引擎中执行。'));
+  const actions = el('div', 'inspector-actions'); actions.append(button('保存此工作流配置', 'button quiet save-workflow-configuration', () => workflowConfigurations.save(node)), button('我的工作流配置', 'button quiet', () => workflowConfigurations.choose()), button('导出此工作流包', 'button quiet', () => exportPackage(pack.id))); tools.append(actions); wrap.append(tools);
   section(wrap, '工作流输入', `${pack.fields.length} / INPUTS`);
   if (!pack.fields.length) wrap.append(el('p', 'form-note', '此包使用固定参数，可以直接检查环境并运行。'));
   const values = { ...defaultValues(pack.fields), ...(node.data.packageValues || {}) };
@@ -731,9 +743,10 @@ function renderPackageLibrary() {
   $('#package-library-count').textContent = `${filtered.length} / ${packages.length} 个工作流包 · ${editorLibrary.length} 个原生工作流`;
   for (const entry of editorLibrary.filter(item => $('#package-scope').value === 'library' && item.name.toLowerCase().includes($('#package-search').value.toLowerCase()))) {
     const card = el('article', 'package-card'); card.append(el('span', 'eyebrow', 'NATIVE WORKFLOW'), el('h3', '', entry.name), el('p', 'muted', `${entry.nodes} 个节点 · 保留内部控件、分组和旁路状态`));
-    card.append(button('添加到画布 · 内部调参', 'button primary', () => {
+    card.append(button('添加到画布 · 提取参数', 'button primary', async () => {
       const node = addPackageNode({ name: entry.name, id: '', fields: [] });
       mutate(() => { node.data.editor_id = entry.id; });
+      await nativeEditor.prepare(node);
     })); list.append(card);
   }
   if (!filtered.length) list.append(el('div', 'package-empty', '没有符合当前筛选的工作流包。可以清空搜索或切换到其他分类。'));
@@ -820,7 +833,8 @@ async function inspectPackageFile(file) {
     const record = await api('/api/editor-workflows', { name: file.name.replace(/\.json$/i, ''), source_json: sourceJSON });
     const node = addPackageNode({ name: record.name, id: '', fields: [] });
     mutate(() => { node.data.editor_id = record.id; });
-    toast(`已保存完整工作流（${record.nodes} 个节点）；点击“进入工作流”调参`);
+    toast(`已保存完整工作流（${record.nodes} 个节点），正在提取外层参数`);
+    await nativeEditor.prepare(node);
     return;
   }
   const document = parsePackageDocument(sourceJSON.replace(/^\uFEFF/, ''));
@@ -924,7 +938,7 @@ function renderInspector() {
       renderLoraFields(wrap, node);
     }
     const actions = el('div', 'inspector-actions'); actions.append(button('检查缺失项', 'button quiet', () => runDiagnostics(node)), button('导出执行 JSON', 'button quiet', () => compileNode(node))); wrap.append(actions);
-    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id); run.dataset.runNode = node.id; wrap.append(run);
+    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
     wrap.append(el('p', 'form-note', '速度与质量取决于后端、模型、显存和参数。生成任务通过本机服务执行，可在队列中查看耗时与取消。'));
   } else if (node.type === 'prompt') {
     wrap.append(field('正向提示词', node.data.text, value => editNode(node.id, 'text', value), { multiline: true, rows: 9 }), field('负向提示词', node.data.negative, value => editNode(node.id, 'negative', value), { multiline: true, rows: 3 }));
@@ -1509,7 +1523,7 @@ canvas.addEventListener('pointerdown', event => {
   if (event.button !== 0 && event.button !== 1) return;
   const card = event.target.closest('.node');
   const interactive = event.target.closest('button,input,textarea,select,video,a');
-  if (event.target.closest('[data-edge-id],.edge-line')) return;
+  if (event.button === 0 && !spaceDown && tool !== 'hand' && event.target.closest('[data-edge-id],.edge-line')) return;
   if (card && event.button === 0 && !spaceDown && tool !== 'hand') {
     revealInspector();
     if (interactive && !selected.has(card.dataset.nodeId)) {
@@ -1519,11 +1533,12 @@ canvas.addEventListener('pointerdown', event => {
   if (interactive && event.button !== 1 && !spaceDown) return;
   if (connecting && !card && event.button === 0) { cancelConnection(); return; }
   const point = viewPoint(event.clientX, event.clientY);
-  if (spaceDown || event.button === 1 || tool === 'hand' || !card && !event.shiftKey && tool !== 'box') {
+  if (spaceDown || event.button === 1 || tool === 'hand') {
     pointer = { mode: 'pan', x: event.clientX, y: event.clientY, startX: viewport.x, startY: viewport.y, distance: 0 };
     canvas.classList.add('panning');
-  } else if (!card && (event.shiftKey || tool === 'box')) {
+  } else if (!card) {
     const rect = canvas.getBoundingClientRect(); pointer = { mode: 'box', x: event.clientX - rect.left, y: event.clientY - rect.top, previous: event.shiftKey ? new Set(selected) : new Set() };
+    selected = new Set(pointer.previous); selectedEdge = null; renderSelection(); renderEdges();
     const box = $('#selection-box'); box.hidden = false; box.style.left = `${pointer.x}px`; box.style.top = `${pointer.y}px`; box.style.width = '0'; box.style.height = '0';
   } else if (card) {
     const id = card.dataset.nodeId;
@@ -1555,13 +1570,13 @@ canvas.addEventListener('pointermove', event => {
 function finishPointer(event) {
   if (!pointer) return;
   if (pointer.mode === 'drag') pushHistory(pointer.before);
-  if (pointer.mode === 'pan' && pointer.distance < 3 && !event.target.closest('.node') && !spaceDown && tool !== 'hand') { selected.clear(); selectedEdge = null; renderSelection(); renderEdges(); }
   if (pointer.mode === 'pan') save();
   pointer = null; $('#selection-box').hidden = true; canvas.classList.remove('panning'); renderInspector();
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 }
 canvas.addEventListener('pointerup', finishPointer);
 canvas.addEventListener('pointercancel', finishPointer);
+canvas.addEventListener('auxclick', event => { if (event.button === 1) event.preventDefault(); });
 canvas.addEventListener('dragover', event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); });
 canvas.addEventListener('drop', event => {
   event.preventDefault(); const files = [...event.dataTransfer.files];
@@ -1731,6 +1746,31 @@ workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () =>
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });
 workflowCanvas.init();
+const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle: () => workflowCanvas.buildBundle(),
+  async install(bundle, target) {
+    if (workflowCanvas.isRunning() || nativeEditor.isOpen()) throw new Error('请先结束当前画布调度或关闭内部编辑器，再载入配置');
+    const incoming = parseGraph(bundle.canvas).nodes[0];
+    const entry = bundle.packages.find(item => item.id === incoming.data.package_id);
+    const {package: pack} = await api('/api/packages', entry.source_json ? {source_json:entry.source_json} : entry.document);
+    let editorId = '';
+    if (incoming.data.editor_id) {
+      const editor = bundle.editors.find(item => item.id === incoming.data.editor_id);
+      editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json})).id;
+    }
+    await loadPackages();
+    const replace = target && getNode(target.id) === target && !target.data.package_id && !graph.edges.some(edge => edge.source === target.id || edge.target === target.id);
+    const node = replace ? target : addPackageNode(pack);
+    mutate(() => {
+      node.data = {...structuredClone(incoming.data), package_id:pack.id,
+        packageFields:pack.fields.map(({id,label,type})=>({id,label,type})), ...(editorId ? {editor_id:editorId} : {})};
+      selected = new Set([node.id]); selectedEdge = null;
+    });
+    revealInspector(); switchTab('properties');
+    toast(replace ? '已载入完整配置，外层参数可直接调整；原导入文件仍保留' : '已添加配置节点；生成前仍会检查引擎、模型与输入');
+  }
+});
+const configurationButton = button('我的工作流配置', 'button quiet', () => workflowConfigurations.choose());
+configurationButton.id = 'workflow-configurations-button'; $('#packages-dialog .package-library-toolbar').append(configurationButton);
 const workspaceTools = createWorkspaceTools({ api, workflow: () => workflowCanvas, title: () => projectTitle, setTitle: title => { setProjectTitle(title); save(true); }, jobs: () => jobs, settings: () => settings, refreshJobs: pollJobs, outputMedia, mediaURL, reuseJob, toast, reportError });
 workspaceTools.init();
 initialize();

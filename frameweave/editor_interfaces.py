@@ -96,6 +96,8 @@ def inspect_interface(prompt, info):
             field["default"] = copy.deepcopy(node["inputs"][field["input"]])
         meta = prompt.get(field["node_id"], {}).get("_meta", {}) if isinstance(prompt, dict) else {}
         title = meta.get("title", "") if isinstance(meta, dict) else ""
+        if field['input'] == 'value' and isinstance(title, str) and title.strip():
+            field['label'] = f"{title.strip()[:100]} · {field['node_id']}"
         role, group = _role(field, node["class_type"], title if isinstance(title, str) else "")
         field["role"] = role
         field["group"] = group

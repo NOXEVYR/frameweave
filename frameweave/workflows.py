@@ -297,8 +297,15 @@ def _expanded_inputs(schema, values):
     def add(groups, prefix="", depth=0):
         if depth > 32:
             raise ValueError("后端动态输入定义嵌套过深")
+        if not isinstance(groups, dict):
+            raise ValueError("后端动态输入定义无效")
         for group in ("required", "optional"):
-            for name, definition in groups.get(group, {}).items():
+            group_inputs = groups.get(group, {})
+            if not isinstance(group_inputs, dict):
+                raise ValueError("后端动态输入定义无效")
+            for name, definition in group_inputs.items():
+                if not isinstance(name, str) or not name:
+                    raise ValueError("后端动态输入名称无效")
                 key = prefix + name
                 kind, meta = _spec(definition)
                 if kind == "COMFY_AUTOGROW_V3":
@@ -327,10 +334,22 @@ def _expanded_inputs(schema, values):
                     required.add(key)
                 if kind == "COMFY_DYNAMICCOMBO_V3":
                     selection = values.get(key)
-                    selected = next((option for option in meta.get("options", [])
-                                     if isinstance(option, dict) and option.get("key") == selection), None)
-                    if selected:
-                        add(selected.get("inputs", {}), key + ".", depth + 1)
+                    options = meta.get("options")
+                    if not isinstance(options, list):
+                        raise ValueError("后端动态组合输入定义无效")
+                    option_keys, selected = set(), None
+                    for option in options:
+                        if (not isinstance(option, dict) or not isinstance(option.get("key"), str)
+                                or not isinstance(option.get("inputs"), dict)
+                                or option["key"] in option_keys):
+                            raise ValueError("后端动态组合输入定义无效")
+                        option_keys.add(option["key"])
+                        if option["key"] == selection:
+                            selected = option
+                    if selected is not None:
+                        # ComfyUI serializes nested dynamic-combo values as flat
+                        # dotted input names, for example format.codec.encoding.
+                        add(selected["inputs"], key + ".", depth + 1)
                 elif isinstance(kind, list) and isinstance(meta.get("formats"), dict):
                     selection = values.get(key)
                     if not isinstance(selection, str) or selection not in kind:
@@ -872,7 +891,25 @@ def compile_workflow(request: dict, object_info: dict) -> dict:
             decoded_images = graph.add("MiniMaxH3AVDecodeT8", av_latent=sampled, video_vae=vae, audio_vae=audio_vae)
             decoded_audio = [decoded_images[0], 1]
         video = graph.add("CreateVideo", images=decoded_images, fps=24.0, audio=decoded_audio)
-        graph.add("SaveVideo", video=video, filename_prefix="FrameWeave/video", format="mp4", codec="h264")
+        save_schema = object_info["SaveVideo"]
+        save_inputs = {"video": video, "filename_prefix": "FrameWeave/video", "format": "mp4"}
+        save_fields, _ = _expanded_inputs(save_schema, save_inputs)
+        codec_field = next((name for name in ("format.codec", "codec") if name in save_fields), None)
+        if codec_field is not None:
+            codec_kind, codec_meta = _spec(save_fields[codec_field])
+            if isinstance(codec_kind, list):
+                codec_options = codec_kind
+            elif codec_kind == "COMFY_DYNAMICCOMBO_V3":
+                codec_options = [option["key"] for option in codec_meta.get("options", [])]
+            elif codec_kind == "COMBO":
+                codec_options = codec_meta.get("options", [])
+            else:
+                codec_options = []
+            codec = next((option for option in ("h264", "auto") if option in codec_options),
+                         codec_options[0] if codec_options else None)
+            if codec is not None:
+                save_inputs[codec_field] = codec
+        graph.add("SaveVideo", **save_inputs)
     elif qwen21:
         encoder_inputs = {"clip": clip, "prompt": positive, "negative_prompt": negative,
                           "resolution": ref_resolution}

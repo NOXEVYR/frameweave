@@ -1,0 +1,646 @@
+{
+  "version": "0.11.2",
+  "release_channel": "source-preview",
+  "stable_windows_version": "0.11.1",
+  "windows_launch_verified": false,
+  "contains_weights": false,
+  "contains_private_configuration": false,
+  "artifacts": [
+    {
+      "name": "PrismCanvas-v0.11.2-source.zip",
+      "bytes": 2172453,
+      "sha256": "52841a82373dac0025da2509873321e5285a8ef4c062563b9ef1c646de28b819"
+    }
+  ],
+  "checks": {
+    "python_passed": 455,
+    "python_skipped": 2,
+    "node_passed": 140,
+    "browser_gestures_passed": 8,
+    "native_import_outer_parameters": 30,
+    "savevideo_real_output_verified": true,
+    "new_gpu_inference_tested": false
+  },
+  "source_files": [
+    {
+      "path": ".gitignore",
+      "bytes": 289,
+      "sha256": "87b501a032d6cc621bcc0e67590d391415102f94fbdcd189bb8c0eb1a48dbbe3"
+    },
+    {
+      "path": "AGENTS.md",
+      "bytes": 4401,
+      "sha256": "6ece5d7698ca9376eccf9ba190b19e629761f304310089100fed8adfee776c7a"
+    },
+    {
+      "path": "assets/frameweave.ico",
+      "bytes": 40623,
+      "sha256": "68ef6ec423523cd98d71fb4c30661896e4776757748c645d37e1b0228293482a"
+    },
+    {
+      "path": "assets/frameweave.png",
+      "bytes": 74297,
+      "sha256": "752fe56cb53240882b5c6f059c564ebec98e781666571f7f48f0de2310716d58"
+    },
+    {
+      "path": "assets/frameweave.svg",
+      "bytes": 1288,
+      "sha256": "a9186c8b5e50d3eea07ea2fda14450e733bc2e5fc3f00ed9c769093a7de4a444"
+    },
+    {
+      "path": "docs/AI_INTERFACE.md",
+      "bytes": 10593,
+      "sha256": "41e91d6276267561016f28226c766b2cfbb74dbfdf380ce586b90689e1702bd2"
+    },
+    {
+      "path": "docs/ANALYSIS.md",
+      "bytes": 3279,
+      "sha256": "870f256efd9ae772603b1b4a77af1d0755b95fbd2994c9b15cf5c4b1e91ebc52"
+    },
+    {
+      "path": "docs/BRAND.md",
+      "bytes": 1869,
+      "sha256": "06f48390b2735dd860b32e3e5c4f229301f1a181193a2e41da88818489e5c666"
+    },
+    {
+      "path": "docs/BUILD.md",
+      "bytes": 1923,
+      "sha256": "bb6d5e55d69feea9b2c2d2f4305ecde5cdf35952a84c5147711ee3dc3f17bd6b"
+    },
+    {
+      "path": "docs/DEVELOPMENT_LOG.md",
+      "bytes": 36900,
+      "sha256": "dc876518c4ef0fe9af0ced9d4f2c52c8bac3c92507bd2506cb73f8697fe199d3"
+    },
+    {
+      "path": "docs/ENGINE_AND_UPDATES.md",
+      "bytes": 3061,
+      "sha256": "ab54fa1a22d0042e358fccf970bc38307c60c304801252d93e5dc985ee78b2d1"
+    },
+    {
+      "path": "docs/ENVIRONMENT.md",
+      "bytes": 7806,
+      "sha256": "b56ed899c64dc1d5fed4694920b2c915d73ea1e006bbbcff2f8dfb1cc2269cb0"
+    },
+    {
+      "path": "docs/MODELS.md",
+      "bytes": 8851,
+      "sha256": "833e3baa6356faa0f6d4e82b3167a8adc0b5264f26ca8a2495f35ba954a3ae5e"
+    },
+    {
+      "path": "docs/QWEN_IMAGE_21.md",
+      "bytes": 1864,
+      "sha256": "0724bcabd031e79e88903a58c075f1ab808b81635556f6ded360fef7c3f27b2a"
+    },
+    {
+      "path": "docs/screenshot-v0.3.0.png",
+      "bytes": 262780,
+      "sha256": "716ca3f9b8d9a5c7e4476d49e96807e72ac414dc66a5273ec2b1b18f95b7b407"
+    },
+    {
+      "path": "docs/screenshot-v0.4.0.png",
+      "bytes": 166460,
+      "sha256": "91ad7cf26c20371854dee96beecfb7c986ff05dae08b7339b9fedf0ed12539b3"
+    },
+    {
+      "path": "docs/screenshot-v0.5.0.png",
+      "bytes": 184983,
+      "sha256": "e27ca247ef5704fb6f2cafe976a9f4e192d7fc675092e32b818f19c0d09bb17f"
+    },
+    {
+      "path": "docs/screenshot-v0.6.0-canvas.png",
+      "bytes": 196930,
+      "sha256": "d0315718e4faa5e6780c2f20cca92fa549ec9117911c7a00a17a882dce5136b9"
+    },
+    {
+      "path": "docs/screenshot-v0.6.0-studio.png",
+      "bytes": 194625,
+      "sha256": "e2e9d961630e11e5049b052788f4259e99afaf480ed70dcf1ced5ffb5acc2ad0"
+    },
+    {
+      "path": "docs/screenshot-v0.7.0-studio.png",
+      "bytes": 211124,
+      "sha256": "dfc49abd5da8ff6ad9e99652b67151ef2d7ad12e297801484acce913df14b86e"
+    },
+    {
+      "path": "docs/screenshot-v0.7.0-workflows.png",
+      "bytes": 123319,
+      "sha256": "ebd4a3cc5c9cf8ef8024c9f208d33aaa941d551a8b5f55c1fe0fb6ab14de4042"
+    },
+    {
+      "path": "docs/screenshot.png",
+      "bytes": 235897,
+      "sha256": "7774194aef11713eb48ebdb3afa435063a56accc5f1d4e993556e9f3fc901e6a"
+    },
+    {
+      "path": "docs/TASK_HISTORY.md",
+      "bytes": 3601,
+      "sha256": "114ceafff21b0d3f67982fea4317209b0ce7818f6c8b3dc36d63ffd156467691"
+    },
+    {
+      "path": "docs/VALIDATION.md",
+      "bytes": 28650,
+      "sha256": "aa8187efef49496adbd0abe820ad54e85af7ee34d3c084c3a5a1c40b7f84333f"
+    },
+    {
+      "path": "docs/WORKFLOW_PACKAGES.md",
+      "bytes": 15681,
+      "sha256": "8346553c4232fee1b254c2f1759a919ca136bc3a2253bcc7b90bfe3038a35cdd"
+    },
+    {
+      "path": "docs/WORKSPACES.md",
+      "bytes": 7596,
+      "sha256": "5475fb92255aa8b31422990e55290718f48e4abbf135edef52e258f75c2a52bf"
+    },
+    {
+      "path": "frameweave/__init__.py",
+      "bytes": 107,
+      "sha256": "7d583bcc0d1415a2348645eaf804c3331726215ad6a5ebb2a7966c2833753a7c"
+    },
+    {
+      "path": "frameweave/__main__.py",
+      "bytes": 5755,
+      "sha256": "d1f0ed6a095a818d2f30f4e48429cb979965b2a74861140331dce00a9b860d7d"
+    },
+    {
+      "path": "frameweave/audio_workflows.py",
+      "bytes": 7061,
+      "sha256": "576b8da57e8f4cf193b8568b779dfabf0837dafe83af39f3c0d00b7215fb3fd4"
+    },
+    {
+      "path": "frameweave/automation.py",
+      "bytes": 33057,
+      "sha256": "d623fe4d511b67f78535467cf1aa33e7f5d571c147af1c58b171ecddaca25be1"
+    },
+    {
+      "path": "frameweave/backend.py",
+      "bytes": 3649,
+      "sha256": "9014429bc0f1bf52b38a4177d1c3a3d4472e6b734b0cbfc8685ce5dc5aaa9cba"
+    },
+    {
+      "path": "frameweave/canvas_store.py",
+      "bytes": 7669,
+      "sha256": "b4c4cafac8743260d30faf78937ca5729387f03dfaad67685bf64f1a9b519ee7"
+    },
+    {
+      "path": "frameweave/diagnostics.py",
+      "bytes": 41082,
+      "sha256": "fdd12adcb3e4cc8a3d3f413ca3efa3c7d928cdb9494bbf5f85562233d246fcf3"
+    },
+    {
+      "path": "frameweave/editor_backends.py",
+      "bytes": 1956,
+      "sha256": "fcf44c5f4d16d8ad9ec52873732008fc61327c002a7443ea2fc1ee57c7c5ee1c"
+    },
+    {
+      "path": "frameweave/editor_interfaces.py",
+      "bytes": 16920,
+      "sha256": "9c0e98881989d2cb0eb70b367db0c46647376ec1d76ba331f86e028e6dfdbe5a"
+    },
+    {
+      "path": "frameweave/editor_proxy.py",
+      "bytes": 35644,
+      "sha256": "aff5e2871f132f1f2e567a19559eeded5dcefe5726032720cf0ab0c3e3b2b239"
+    },
+    {
+      "path": "frameweave/editor_workflows.py",
+      "bytes": 25692,
+      "sha256": "0e61e784c8563385f8d80fd08341c304dd93602e0f8489d1cecf3db74b72d7ef"
+    },
+    {
+      "path": "frameweave/engines.py",
+      "bytes": 41750,
+      "sha256": "4e038df748b56034a55a70316e10b37186ef180670c4d75c7de9eee5fc0767d4"
+    },
+    {
+      "path": "frameweave/environment.py",
+      "bytes": 29489,
+      "sha256": "fa65ada17297977a71fbdff341de237a9cb84b156cde973bf1371f2f494aef68"
+    },
+    {
+      "path": "frameweave/instance.py",
+      "bytes": 16365,
+      "sha256": "c96d50ab41c17b7b3fb3e8a7e4f2493f1c88d889f1da6ce869affee196435bc4"
+    },
+    {
+      "path": "frameweave/packages.py",
+      "bytes": 23440,
+      "sha256": "6a40d23a01163816cf8190163b759e4f30041ab9e59d3791e3b0ac65f87adb35"
+    },
+    {
+      "path": "frameweave/server.py",
+      "bytes": 74482,
+      "sha256": "d2190c41fd65fee3e355844534b56dde3629c4d56399f427f6ae287e5a556138"
+    },
+    {
+      "path": "frameweave/update_handoff.py",
+      "bytes": 34531,
+      "sha256": "d19eb9920d9809211b8e04379844e7a79eda3c22e2720cb902080b70111d4c8e"
+    },
+    {
+      "path": "frameweave/update_install.py",
+      "bytes": 7027,
+      "sha256": "fe6d8803629944f549ef126f3292a4900df7f3722fa38ced358edc12fa64d61f"
+    },
+    {
+      "path": "frameweave/updates.py",
+      "bytes": 21885,
+      "sha256": "2f1beffc3227f90cca5142cee61fba8c0c06bc5843270383da87ae71fb365aa1"
+    },
+    {
+      "path": "frameweave/workflows.py",
+      "bytes": 55377,
+      "sha256": "3d0793e81c5824c7924afa15af447e7b35de8ece4ae389e357c998960b99c3d7"
+    },
+    {
+      "path": "frameweave/workspace_services.py",
+      "bytes": 8845,
+      "sha256": "ffd784b0e3becd72cbfedccb819fe03c393258ccdfdd7834e44f58309d18aa2b"
+    },
+    {
+      "path": "launch.py",
+      "bytes": 122,
+      "sha256": "86b9673809c27afd12fe20a16cb5aad80f4309b62b22dfa5409917536dcef173"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1080,
+      "sha256": "3486c5a741c6fd7b50eeae562c570dc7950f99f23680bb8f051d7a5be9039413"
+    },
+    {
+      "path": "MIGRATION.md",
+      "bytes": 2628,
+      "sha256": "ea3027ebfff7f07cd76b85f7ddda86e3bda23d4cd3e6995df7bdd6887fb56090"
+    },
+    {
+      "path": "PYTHON-LICENSE.txt",
+      "bytes": 36874,
+      "sha256": "e502c6b880ff58d614901495a9009c136539cd0b1e2a2abb8fc00b934c203419"
+    },
+    {
+      "path": "README.md",
+      "bytes": 12552,
+      "sha256": "daf2b176419e94b37df8f0c7b32c5d0e43309054e644d9f773efdac8f0362b52"
+    },
+    {
+      "path": "tests/audio-studio.test.mjs",
+      "bytes": 4422,
+      "sha256": "ec94ee1a9ed217dcdc74becf6235f5f537c9d44a4b5781fe9c89c9324d68cd4a"
+    },
+    {
+      "path": "tests/canvas-actions.test.mjs",
+      "bytes": 7009,
+      "sha256": "0fe0d776a1656ac750a9921bb77dc8aa7c9c1dc4730a134ca86df68214f69f1f"
+    },
+    {
+      "path": "tests/canvas-layout.test.mjs",
+      "bytes": 2711,
+      "sha256": "97409e7f2ce76f2ea34c80d639b60ea0049ebd1477ca545725f23ae83df2706b"
+    },
+    {
+      "path": "tests/editor-backend-picker.test.mjs",
+      "bytes": 2794,
+      "sha256": "afd92369bf8cdd7354dd2291ff574b6c348449e7851b903979337248eecedae0"
+    },
+    {
+      "path": "tests/editor-interface-panel.test.mjs",
+      "bytes": 9729,
+      "sha256": "b48c588d24817e0be158ae3b40f70f4fcbe25a14bc4baa52cd4904f6bc057ec8"
+    },
+    {
+      "path": "tests/graph.test.mjs",
+      "bytes": 26764,
+      "sha256": "33c6510cb1ffc8bb054b4b2a8f195f55d1de82a3f7c637dbd3c676831455752e"
+    },
+    {
+      "path": "tests/library.test.mjs",
+      "bytes": 5063,
+      "sha256": "42365783db961eb2188e460cf420c58d5aacf90cd605a799a5f77ca7c7e544c9"
+    },
+    {
+      "path": "tests/native-editor-bridge.test.mjs",
+      "bytes": 17947,
+      "sha256": "30c0dc9dffdbfbefe84b5352e69df6e0027f8d00a21554f1c252939f110fd64e"
+    },
+    {
+      "path": "tests/native-editor-prepare.test.mjs",
+      "bytes": 11400,
+      "sha256": "cd0dcc137e80a714c1efb686c8d223e75118cce983bc7b1fc185ecc5f7f648b1"
+    },
+    {
+      "path": "tests/native-editor-state.test.mjs",
+      "bytes": 10609,
+      "sha256": "658a833e5f61f9161ba79a68035a53ec7837a6adb314e6f4862d5234ec394397"
+    },
+    {
+      "path": "tests/packages.test.mjs",
+      "bytes": 13065,
+      "sha256": "e9d038cf97a981b5c0b2a6c5343d770caefba22cecc813d0fc9167801ccb793c"
+    },
+    {
+      "path": "tests/studio-state.test.mjs",
+      "bytes": 10716,
+      "sha256": "621035ef8e64cfa3689087c8f69b409db303d7a3205f61e9d86561ec34163442"
+    },
+    {
+      "path": "tests/test_automation.py",
+      "bytes": 34147,
+      "sha256": "7a51bfd36ce0db38150a7b268408677f944b7b8aef8088322a7ed26d1136bd0a"
+    },
+    {
+      "path": "tests/test_canvas_media.py",
+      "bytes": 14177,
+      "sha256": "54397cce80bf31a8c9c632c2de872bca1b3735f839dc0a606db44ed6816876f0"
+    },
+    {
+      "path": "tests/test_diagnostics.py",
+      "bytes": 17700,
+      "sha256": "adfc6e4bd7339b1069cde7f6ed21bd70acdcf0399bada118de4e71408d7b408d"
+    },
+    {
+      "path": "tests/test_editor_backend_http.py",
+      "bytes": 9383,
+      "sha256": "bb46df1ab67c3ecc72b43a64ee93e9d022686a14ccafba27000f8b8eda540146"
+    },
+    {
+      "path": "tests/test_editor_backends.py",
+      "bytes": 1102,
+      "sha256": "892b45666596a9bc85e592bc1d86c524a41c88b4c15aad2b205c1bef2432f671"
+    },
+    {
+      "path": "tests/test_editor_float_inputs.py",
+      "bytes": 764,
+      "sha256": "4283bff96ea9c6a3215f88e780eefbf7d6bf0dbd783da4ea77620af7c8a00894"
+    },
+    {
+      "path": "tests/test_editor_integration.py",
+      "bytes": 30864,
+      "sha256": "a75cc8840f4fc1086252c5bafe68ef87aeec905ee14a579444f8f65d5905fd42"
+    },
+    {
+      "path": "tests/test_editor_interfaces.py",
+      "bytes": 16921,
+      "sha256": "83e04e4a8094b008516467c4bc7565cd6db505783e581e26f71f84090990f41b"
+    },
+    {
+      "path": "tests/test_editor_proxy.py",
+      "bytes": 18313,
+      "sha256": "7c559b02af42fc909ea1dde8e456458e7858d9fc85d52d2bbd6519c3ed590d83"
+    },
+    {
+      "path": "tests/test_editor_workflows.py",
+      "bytes": 9748,
+      "sha256": "b4707c589ef53b75e70f847abbd6c5c2f2320525f8838742bc8d137f1bd4fb72"
+    },
+    {
+      "path": "tests/test_engine_integration.py",
+      "bytes": 3585,
+      "sha256": "3eb0466d1020d1a0bc7f84ad9a18c2999d2c353fe1bef3700b504e8a9e1c790e"
+    },
+    {
+      "path": "tests/test_engine_supervision.py",
+      "bytes": 18189,
+      "sha256": "e31e5227d4ee3f4af3c55b56a6d79d8cca4988c8337e0465215f2fd07aa15bde"
+    },
+    {
+      "path": "tests/test_engines.py",
+      "bytes": 8621,
+      "sha256": "d150e253577d1dea3d5c5a90b13e98f8d1954a1bb4fd46431c5d04259966fd19"
+    },
+    {
+      "path": "tests/test_engines_v091.py",
+      "bytes": 10665,
+      "sha256": "bda2c9f03a4b40dfd90e38ee611f0efcef124b67be5830fe647caf9edcd79c0b"
+    },
+    {
+      "path": "tests/test_environment.py",
+      "bytes": 17557,
+      "sha256": "3accfb886db3b3cfd948223e481f04ee3bfa824a92b7ffbf2093559abb726213"
+    },
+    {
+      "path": "tests/test_generation_extensions.py",
+      "bytes": 15040,
+      "sha256": "f5e91f0e383207727298339c30b692bcc663668e0e6cb57df87defb2ddf4cb55"
+    },
+    {
+      "path": "tests/test_instance.py",
+      "bytes": 7170,
+      "sha256": "a867fb74b1b8ad9f181f7b498d993bb13b82e816d8e413b8f7ef0985f90143f6"
+    },
+    {
+      "path": "tests/test_mcp_http.py",
+      "bytes": 8209,
+      "sha256": "830fcb9a44eda62e5bc65783a8521ae0a33b21c6869c52efc8a37bdc94b4c488"
+    },
+    {
+      "path": "tests/test_packages.py",
+      "bytes": 19703,
+      "sha256": "75801c1503acd54fe498e8b312df71c1d26cc462052108b62940a646d93d6469"
+    },
+    {
+      "path": "tests/test_qwen21.py",
+      "bytes": 14451,
+      "sha256": "5d5487a1a0d0b3a74c8e2ac5a95d39fac6540299e719462a5f7e819eb9958794"
+    },
+    {
+      "path": "tests/test_replay.py",
+      "bytes": 15399,
+      "sha256": "fb543bfc6788ab387617d4ddb29388074db42ab274fa0b13b37a779167151b6a"
+    },
+    {
+      "path": "tests/test_savevideo_dynamic.py",
+      "bytes": 7356,
+      "sha256": "6ea04675445ddd01eebc0120b7d69cb863e33b59fee7a8bb788ffcb367ddd288"
+    },
+    {
+      "path": "tests/test_service.py",
+      "bytes": 33702,
+      "sha256": "ea022f8fb24e1b45a9917153fef61513198945be8f19a2e5f538bc0e085965bb"
+    },
+    {
+      "path": "tests/test_studio.py",
+      "bytes": 11117,
+      "sha256": "0bd7ae56252be537740e6b144720daccb7cbbd504bde8843a08ba06bdb67b97e"
+    },
+    {
+      "path": "tests/test_update_handoff.py",
+      "bytes": 17108,
+      "sha256": "dabaf0e012748b514371497a808a2d5449019724c219706f6e9458cf4d1bf123"
+    },
+    {
+      "path": "tests/test_update_install.py",
+      "bytes": 6955,
+      "sha256": "2d0cebd040f4d32ce7bf456e00807e32653e67749995f5478e0bb27535eb7642"
+    },
+    {
+      "path": "tests/test_updates.py",
+      "bytes": 11176,
+      "sha256": "2eb6a438990f09ee242e7093dfaac18f81438c1b0b801ea36d661f13acc459de"
+    },
+    {
+      "path": "tests/test_video_format_inputs.py",
+      "bytes": 5517,
+      "sha256": "7ec49925c3afe7827295f9e1d116452c3bbf59b1192366ec4e9d23c1442b5254"
+    },
+    {
+      "path": "tests/test_workflows.py",
+      "bytes": 25578,
+      "sha256": "a3b06596b1d49b1fbde0863745d83f303d769301adc5b1bba1fb8f990c365273"
+    },
+    {
+      "path": "tests/test_workspace_http.py",
+      "bytes": 4490,
+      "sha256": "ed940cb183627a4f2c091dc75f2385c98efd15f27ee19a78fc740c587ff514fd"
+    },
+    {
+      "path": "tests/test_workspace_services.py",
+      "bytes": 8522,
+      "sha256": "df86e5ef7613a4423879024f4aea13b55cb30904122e4d4a108ff921909ad91b"
+    },
+    {
+      "path": "tests/workflow-configurations.test.mjs",
+      "bytes": 6682,
+      "sha256": "ac5490e0e64a2db183eba37aa8bf20b09dc18cfe99f79d18fd26f7a5b3139692"
+    },
+    {
+      "path": "tests/workflow-runner.test.mjs",
+      "bytes": 20030,
+      "sha256": "bbcbe26856bb32215b95e04431862896617525456850e696eac490a8be6097d1"
+    },
+    {
+      "path": "THIRD_PARTY.md",
+      "bytes": 1303,
+      "sha256": "dc32c7df40644451d9f34e7b4f3c0725be01805da9dc35ea95c4148fe75b2b48"
+    },
+    {
+      "path": "web/app.js",
+      "bytes": 145679,
+      "sha256": "f82020a157e029cf1d5982275619a28de825579e76f4a4fa742b835fe7f9c84a"
+    },
+    {
+      "path": "web/audio-studio.mjs",
+      "bytes": 10095,
+      "sha256": "1cec2d84910364acbeb25fc19bbdaf09fd99e5f040762b779b314689183a0091"
+    },
+    {
+      "path": "web/brand.svg",
+      "bytes": 1288,
+      "sha256": "a9186c8b5e50d3eea07ea2fda14450e733bc2e5fc3f00ed9c769093a7de4a444"
+    },
+    {
+      "path": "web/canvas-actions.mjs",
+      "bytes": 4494,
+      "sha256": "5a4efbb55c203b15e82455d9681fd81de3000d21cf0d6098b3b9a50fd95da256"
+    },
+    {
+      "path": "web/canvas-layout.mjs",
+      "bytes": 2363,
+      "sha256": "e171a4a460049303e3ccb289d072a2dca2443ba337a635edd40eba2cd00691da"
+    },
+    {
+      "path": "web/editor-backend-picker.mjs",
+      "bytes": 3940,
+      "sha256": "32280ac359ee324afd639dffeb781361e9c907505ac013c0a5ec9abc4efd23e2"
+    },
+    {
+      "path": "web/editor-canvas-interface.mjs",
+      "bytes": 4829,
+      "sha256": "dda6067c13cf7d64696cf057db5be4a93909b6264dd13c9f919835cef72105bc"
+    },
+    {
+      "path": "web/editor-interface-panel.mjs",
+      "bytes": 39568,
+      "sha256": "6aaf101f9bfc4ef02bc1bde8c71dce37d3787816adc9bbb80c78de61551fdb12"
+    },
+    {
+      "path": "web/engine-center.mjs",
+      "bytes": 2897,
+      "sha256": "1d0846b15cfac52f9d706335fa62b5224ad8cc013b869e2a2b5a50e724d31054"
+    },
+    {
+      "path": "web/generation-studio.mjs",
+      "bytes": 55280,
+      "sha256": "ba8023f706b00a2d5af28bae634439f478130b16ca8c28e2f174851a640ad78b"
+    },
+    {
+      "path": "web/graph.mjs",
+      "bytes": 31271,
+      "sha256": "385d7fef1b7b264993d2235348cde2c2ffe6ce57ca81349edfa2a34d730ac866"
+    },
+    {
+      "path": "web/index.html",
+      "bytes": 23030,
+      "sha256": "7d803cc9ddefd9587a6ed4a5e3aa27e300d844537515d41ca422dfa0b870acfe"
+    },
+    {
+      "path": "web/library.mjs",
+      "bytes": 1082,
+      "sha256": "e07fbba9e9742f8291d2a644d5742003b48c80fb925cc0f78f49937b91b6d2fb"
+    },
+    {
+      "path": "web/native-editor-bridge.js",
+      "bytes": 15319,
+      "sha256": "98beda2877f8a2c2a9f55664acd81bcddb8f641f31b8a24bacb88234765ae479"
+    },
+    {
+      "path": "web/native-workflow-editor.mjs",
+      "bytes": 13447,
+      "sha256": "901eb918e1b22d7e5d54e577c0b6af32116957d8b8203e9325da730176625ac2"
+    },
+    {
+      "path": "web/packages.mjs",
+      "bytes": 7217,
+      "sha256": "5bc6f18d7b248b8efc419af9dba541fe98d1c73e0efc1ab8ec34b1d5347a4dfc"
+    },
+    {
+      "path": "web/studio-state.mjs",
+      "bytes": 11321,
+      "sha256": "c0b7cdc302a8df97a8c8038c3b6904f5941d6c021f6172ba7e43877bd78b10fb"
+    },
+    {
+      "path": "web/studio.css",
+      "bytes": 14370,
+      "sha256": "2a80681899c775e2ea80c5a9974718f7e6125317ebb805ef5bf6699483dc0c4e"
+    },
+    {
+      "path": "web/style.css",
+      "bytes": 43464,
+      "sha256": "6a6471d80e918f469974498d1701d3ff1fd2ee17ee703766b227b77d84ef3a22"
+    },
+    {
+      "path": "web/update-center.mjs",
+      "bytes": 2931,
+      "sha256": "255bb31397ec2e10f5ed959c71e6f2fb48cf299dcd1305a09178c7bc448d71d5"
+    },
+    {
+      "path": "web/workflow-canvas.css",
+      "bytes": 4167,
+      "sha256": "aa6b4800e01b8ff5befb708c12fdfb2ecbb38fdb2f3d09392739716f69fa9025"
+    },
+    {
+      "path": "web/workflow-canvas.mjs",
+      "bytes": 19594,
+      "sha256": "6d998e4a20b8d38388fd0a933cd54f6fffff5fa6225d4373b9762002126b557a"
+    },
+    {
+      "path": "web/workflow-configurations.mjs",
+      "bytes": 7340,
+      "sha256": "a744f0dbd57966ce18789e3df750e7221d549df9c60794c4586c561d20de0afa"
+    },
+    {
+      "path": "web/workflow-runner.mjs",
+      "bytes": 15164,
+      "sha256": "2f47a9a46bbf28bf72f9defefe69be6220eb31a48cd3a9b3adcbdd46295f9ab9"
+    },
+    {
+      "path": "web/workspace-tools.css",
+      "bytes": 2165,
+      "sha256": "9387063cd2bd7964797147895440024449599137a505b7f14d8137bf43aaa9a2"
+    },
+    {
+      "path": "web/workspace-tools.mjs",
+      "bytes": 9459,
+      "sha256": "9211cf3ccb96fc4f27b7585368404a5cfd522f41be464ef05de7fbdffde6039b"
+    }
+  ]
+}

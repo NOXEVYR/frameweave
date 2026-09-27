@@ -8,12 +8,12 @@ export function editorDocument(text) {
 export function createNativeWorkflowEditor(host) {
   let active = null, opening = false;
   const element = (tag, text = '') => { const item = document.createElement(tag); item.textContent = text; return item; };
-  async function open(node, backendReady = false) {
+  async function open(node, backendReady = false, preparation = false) {
     if (active || opening) throw new Error('请先返回外层画布');
     opening = true;
-    try { await openEditor(node, backendReady); } finally { opening = false; }
+    try { await openEditor(node, backendReady, preparation); } finally { opening = false; }
   }
-  async function openEditor(node, backendReady) {
+  async function openEditor(node, backendReady, preparation) {
     let workflow = await host.api(`/api/editor-workflows/${node.data.editor_id}`);
     const selectedBackend = backendReady || (host.ensureBackend ? await host.ensureBackend(node, workflow) : null);
     if (host.ensureBackend && !selectedBackend) return;
@@ -26,6 +26,7 @@ export function createNativeWorkflowEditor(host) {
       throw new Error('推理引擎已被其他窗口切换，请重新选择后进入。');
     }
     const dialog = element('dialog'); dialog.className = 'native-workflow-dialog';
+    if (preparation) dialog.classList.add('native-prepare-dialog');
     const header = element('header'), title = element('strong', workflow.name), status = element('p', '正在加载原生编辑器与扩展…');
     const buttons = element('div'); buttons.className = 'native-editor-actions';
     const frame = element('iframe'); frame.title = `${workflow.name} · 内部工作流`;
@@ -68,14 +69,17 @@ export function createNativeWorkflowEditor(host) {
     const back = element('button', '← 返回画布'); back.className = 'button quiet';
     back.onclick = () => action(async () => { if (state.ready && !state.missing.length) await saveDraft(); await close(); });
     const draft = element('button', '保存内部草稿'); draft.className = 'button quiet'; draft.onclick = () => action(saveDraft);
-    const apply = element('button', '应用参数并返回'); apply.className = 'button primary';
-    apply.onclick = () => action(async () => {
+    async function applyParameters() {
       const result = await request('compile');
       const applied = await host.applyInterface(node, result, { session_id: session.session_id, base_revision: workflow.revision });
-      if (!applied) return;
+      if (!applied) { show('尚未选择外层参数。可以重新提取，或返回画布使用已保存配置。'); return; }
       await host.applied(node, applied);
       await close(); host.toast('已应用内部参数；现在可在外层连接输入并生成');
-    });
+    }
+    const apply = element('button', preparation ? '重新提取外层参数' : '应用参数并返回'); apply.className = 'button primary';
+    apply.onclick = () => action(applyParameters);
+    const reveal = element('button', '进入内部编辑'); reveal.className = 'button quiet'; reveal.hidden = !preparation;
+    reveal.onclick = () => { preparation = false; dialog.classList.remove('native-prepare-dialog'); reveal.hidden = true; apply.textContent = '应用参数并返回'; };
     const original = element('button', '导出完整工作流'); original.className = 'button quiet';
     original.onclick = () => action(async () => {
       if (state.ready && !state.missing.length) {
@@ -99,10 +103,10 @@ export function createNativeWorkflowEditor(host) {
       if (state.ready && !state.missing.length) await saveDraft();
       await close();
       const target = await host.ensureBackend(node, workflow, true);
-      if (target) await open(node, target);
+      if (target) await open(node, target, preparation);
     });
-    buttons.append(back, switchEngine, original, repair, recheck, draft, apply, discard); header.append(title, buttons, status);
-    const note = element('div', `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
+    buttons.append(back, switchEngine, reveal, original, repair, recheck, draft, apply, discard); header.append(title, buttons, status);
+    const note = element('div', preparation ? `正在用 ${session.backend_url} 解析工作流控件，随后选择要在外层显示的参数。此过程不生成图片或视频。` : `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
     dialog.append(header, note, frame); document.body.append(dialog);
     dialog.addEventListener('cancel', event => { event.preventDefault(); if (!state.busy) back.click(); });
     async function receive(event) {
@@ -144,6 +148,9 @@ export function createNativeWorkflowEditor(host) {
               }
             }
             show(`已载入 ${result.nodes} 个节点；已同步 ${patches.length} 项外层修改。${unmapped.length ? `以下特殊控件无法直接回写，外层覆盖值仍保留，应用时会核对：${unmapped.join('、')}` : '内部和外层使用同一组可映射参数。'}`);
+            if (preparation) { show('正在提取可编辑参数和输出…'); await applyParameters(); }
+          } else if (preparation) {
+            show(`无法建立外层参数：缺少 ${state.missing.length} 种节点（${state.missing.join('、')}）。可更换引擎、进入内部修复，或返回画布“复用已保存配置”。原文已保留。`);
           }
         } catch (error) { show(error.message); discard.hidden = false; }
         state.busy = false; refresh(); return;
@@ -157,5 +164,5 @@ export function createNativeWorkflowEditor(host) {
     const startup = setTimeout(() => show('原生编辑器加载超时。请检查所选 ComfyUI 服务是否启动、前端与扩展是否兼容；原始工作流已保留，可返回后更换后端再进入。'), 60000);
     refresh(); dialog.showModal(); frame.src = session.url;
   }
-  return { open, applyToNode: host.applied, isOpen: () => !!active || opening };
+  return { open, prepare: node => open(node, false, true), applyToNode: host.applied, isOpen: () => !!active || opening };
 }

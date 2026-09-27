@@ -2403,6 +2403,16 @@ kbd {
 .native-editor-note { flex: 0 0 auto; padding: 8px 20px; background: #eef2ff; color: #344563; font-size: 13px; }
 .native-workflow-dialog iframe { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #202127; }
 .enter-workflow { width: 100%; margin-bottom: 10px; color: #384fc1; border: 1px solid #abb9ee; background: #f1f4ff; }
+.native-workflow-dialog.native-prepare-dialog { width: min(760px, calc(100vw - 32px)); height: auto; min-height: 210px; overflow: visible; }
+.native-prepare-dialog iframe { position: fixed; left: -12000px; top: 0; width: 1200px; height: 800px; pointer-events: none; }
+.prepare-workflow, .reuse-workflow { width: 100%; margin-bottom: 10px; }
+.workflow-configurations-dialog { width: min(820px, calc(100vw - 32px)); }
+.workflow-configurations-dialog input[type=search] { width: 100%; margin: 12px 0; }
+.workflow-configuration-row { padding: 16px; border: 1px solid #d6dfec; border-radius: 10px; margin: 10px 0; }
+.configuration-choices { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+.workflow-configuration-tools { margin: 10px 0; border: 1px solid #d6dfec; border-radius: 8px; padding: 10px; }
+.workflow-configuration-tools summary { cursor: pointer; font-size: 13px; color: #405e9c; }
+.workflow-configuration-tools[open] > .button { margin-top: 10px; }
 @media(prefers-reduced-motion:reduce) {
   *,*::before,*::after {
     animation:none!important;

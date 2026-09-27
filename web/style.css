@@ -2394,6 +2394,15 @@ kbd {
     padding:6px 3px
   }
 }
+.native-workflow-dialog { width: calc(100vw - 24px); max-width: none; height: calc(100dvh - 24px); max-height: none; padding: 0; overflow: hidden; border: 1px solid #becce2; border-radius: 14px; }
+.native-workflow-dialog[open] { display: flex; flex-direction: column; }
+.native-workflow-dialog > header { flex: 0 0 auto; padding: 14px 20px 10px; background: #fff; border-bottom: 1px solid #d6dfec; position: relative; }
+.native-workflow-dialog > header strong { display: block; font-size: 18px; color: #20324e; margin-bottom: 10px; }
+.native-workflow-dialog > header p { font-size: 14px; line-height: 1.5; margin: 8px 0 0; max-height: 80px; overflow: auto; overflow-wrap: anywhere; }
+.native-editor-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.native-editor-note { flex: 0 0 auto; padding: 8px 20px; background: #eef2ff; color: #344563; font-size: 13px; }
+.native-workflow-dialog iframe { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #202127; }
+.enter-workflow { width: 100%; margin-bottom: 10px; color: #384fc1; border: 1px solid #abb9ee; background: #f1f4ff; }
 @media(prefers-reduced-motion:reduce) {
   *,*::before,*::after {
     animation:none!important;

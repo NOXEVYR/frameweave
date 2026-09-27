@@ -78,9 +78,11 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
       const upstreamId = upstreamFor(edge); if (!upstreamId) continue;
       const upstream = state.steps.find(item => item.node_id === upstreamId);
       if (!upstream || upstream.state !== 'completed' || !upstream.job_id) throw new Failure('上游任务尚未成功完成，不能继续下游。');
-      const outputIndex = edge.outputIndex ?? 0;
+      const selectedIndex = edge.outputIndex ?? 0;
       const images = (upstream.outputs || []).filter(output => output.type === 'image');
-      if (!Number.isInteger(outputIndex) || outputIndex < 0 || outputIndex >= images.length) throw new Failure('上游任务没有对应序号的图片输出；视频与音频不能直接作为图片输入。');
+      const candidates = edge.sourceOutput ? images.filter(output => output.node_id === edge.sourceOutput) : images;
+      if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= candidates.length) throw new Failure('上游任务没有所绑定输出节点及序号的图片；请检查输出接口，视频与音频不能直接作为图片输入。');
+      const outputIndex = images.indexOf(candidates[selectedIndex]);
       let input = step.image_inputs[edge.id];
       if (!input || input.job_id !== upstream.job_id || input.output_index !== outputIndex) {
         await checkBackend(); guardStop();

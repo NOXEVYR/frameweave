@@ -69,6 +69,8 @@ REQUEST_SCHEMA = object_schema({
     "ref_image_size": {"type": "string", "maxLength": 100,
                        "description": "H3 参考图尺寸模式，通常为 match（默认）或 max；以当前后端节点选项校验。"},
     "package_id": PACKAGE_ID, "values": OBJECT,
+    "editor_backend": {"type": "string", "maxLength": 200, "description": "原生编辑器应用参数时的后端地址；运行时必须与当前后端一致"},
+    "output_nodes": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 120}, "description": "工作流包要执行的输出节点 ID，仅执行选中输出及依赖"},
 }, ("kind",))
 REQUEST_SCHEMA["description"] = (
     "kind=package 使用 package_id 和 values（字段 ID 来自 fw_packages）；kind=api 使用 ComfyUI API prompt 对象。"

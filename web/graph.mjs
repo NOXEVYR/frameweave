@@ -37,6 +37,10 @@ function edgeOptions(options = {}) {
     if (!Number.isInteger(options.outputIndex) || options.outputIndex < 0 || options.outputIndex > 31) throw new Error('输出图片序号必须是 0 到 31 之间的整数');
     result.outputIndex = options.outputIndex;
   }
+  if (Object.hasOwn(options, 'sourceOutput')) {
+    if (typeof options.sourceOutput !== 'string' || !options.sourceOutput || options.sourceOutput.length > 120) throw new Error('工作流输出节点标识无效');
+    result.sourceOutput = options.sourceOutput;
+  }
   return result;
 }
 
@@ -180,7 +184,7 @@ export function generationPayload(graph, id, context = {}) {
         values[edge.targetField] = uploadedImageName(images[edge.id]);
       }
     }
-    return { kind: 'package', package_id: node.data.package_id, values: packageValues(values) };
+    return { kind: 'package', package_id: node.data.package_id, values: packageValues(values), ...(node.data.editor_backend ? { editor_backend: node.data.editor_backend } : {}), ...(node.data.editor_outputs?.length ? { output_nodes: [...node.data.editor_outputs] } : {}) };
   }
   if (node.data.kind === 'api') {
     if (!node.data.apiPrompt || typeof node.data.apiPrompt !== 'object' || Array.isArray(node.data.apiPrompt)) throw new Error('请先导入 ComfyUI API 格式工作流');
@@ -315,6 +319,26 @@ export function parseGraph(text) {
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
     if (node.type === 'generation') {
+      if (node.data.editor_id !== undefined) {
+        if (typeof node.data.editor_id !== 'string' || !/^e-[a-f0-9]{24}$/.test(node.data.editor_id)) throw new Error('原生工作流 ID 无效');
+        data.editor_id = node.data.editor_id;
+      }
+      if (node.data.editor_backend !== undefined) {
+        if (typeof node.data.editor_backend !== 'string' || node.data.editor_backend.length > 200) throw new Error('原生工作流后端地址无效');
+        data.editor_backend = node.data.editor_backend;
+      }
+      for (const key of ['editor_baseline', 'editor_outputs', 'editor_output_fields']) {
+        if (node.data[key] !== undefined) data[key] = packageValues({ value: node.data[key] }).value;
+      }
+      if (data.editor_outputs !== undefined && (!Array.isArray(data.editor_outputs) || data.editor_outputs.length > 64 || data.editor_outputs.some(id => typeof id !== 'string' || !id || id.length > 120))) throw new Error('工作流输出定义无效');
+      if (node.data.editor_controls !== undefined) {
+        if (!Array.isArray(node.data.editor_controls) || node.data.editor_controls.length > 4096) throw new Error('工作流控件映射无效');
+        data.editor_controls = node.data.editor_controls.map(control => {
+          const keys = ['node_id', 'input', 'widget_node_id', 'widget_name'];
+          if (!control || keys.some(key => typeof control[key] !== 'string' || !control[key] || control[key].length > 200)) throw new Error('工作流控件映射无效');
+          return Object.fromEntries(keys.map(key => [key, control[key]]));
+        });
+      }
       if (Object.hasOwn(node.data, 'refine')) {
         const value = node.data.refine;
         if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.enabled !== 'boolean') throw new Error('二次重绘参数无效');

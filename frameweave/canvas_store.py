@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-LIMIT = 8 * 1024 * 1024
+LIMIT = 24 * 1024 * 1024
 
 
 class CanvasStore:
@@ -120,7 +120,7 @@ class CanvasStore:
         except (TypeError, ValueError, OverflowError, UnicodeError, RecursionError):
             raise ValueError("画布集合不是有效的 JSON 数据") from None
         if len(encoded) > LIMIT:
-            raise ValueError("画布集合最大为 8 MiB")
+            raise ValueError("画布集合最大为 24 MiB")
 
     def save(self, document):
         self._validate(document)

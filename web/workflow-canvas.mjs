@@ -4,7 +4,7 @@ import { createWorkflowRunner } from './workflow-runner.mjs';
 
 const RUN_KEY = 'frameweave.workflow-run.v1';
 const BUNDLE = 'prismcanvas.project.v1';
-const LIMIT = 8 * 1024 * 1024;
+const LIMIT = 24 * 1024 * 1024;
 const element = (tag, className = '', text) => { const item = document.createElement(tag); item.className = className; if (text !== undefined) item.textContent = text; return item; };
 const statusNames = { running: '运行中', stopping: '停止后续中', paused: '已暂停', completed: '全部完成', failed: '已停止：任务失败' };
 const stepNames = { pending: '等待前序', preparing: '准备输入', submitting: '提交中', uncertain: '提交待确认', running: '执行中', completed: '完成', failed: '失败' };
@@ -38,6 +38,7 @@ export function createWorkflowCanvas(host) {
     const sourceField = select([['text', '正向提示词'], ['negative', '负向提示词']]); sourceField.id = 'workflow-connect-text';
     const textLabel = inputLabel('提示词内容', sourceField);
     const output = select(Array.from({ length: 32 }, (_, i) => [String(i), `第 ${i + 1} 张图片`])); output.id = 'workflow-connect-output'; const outputLabel = inputLabel('使用上游输出', output);
+    const outputNode = select([]), outputNodeLabel = inputLabel('工作流输出接口', outputNode); outputNode.id = 'workflow-connect-output-node';
     const note = element('p', 'workflow-connect-note');
     const sync = () => {
       const from = graph.nodes.find(n => n.id === source.value), type = from?.type === 'prompt' ? 'text' : 'image';
@@ -45,15 +46,21 @@ export function createWorkflowCanvas(host) {
       for (const f of fields.filter(f => f.type === type)) { const option = element('option', '', f.label); option.value = f.id; targetField.append(option); }
       if ([...targetField.options].some(o => o.value === previous)) targetField.value = previous;
       textLabel.hidden = type !== 'text'; outputLabel.hidden = !['generation', 'result'].includes(from?.type);
+      outputNode.replaceChildren();
+      const outputOwner = from?.type === 'result' ? graph.nodes.find(n => n.id === graph.edges.find(edge => edge.target === from.id)?.source) : from;
+      for (const item of (outputOwner?.data.editor_output_fields || []).filter(item => (outputOwner.data.editor_outputs || []).includes(item.id) && ['image', 'unknown'].includes(item.mediaType))) {
+        const option = element('option', '', `${item.label} · ${item.id}`); option.value = item.id; outputNode.append(option);
+      }
+      outputNodeLabel.hidden = !outputNode.options.length;
       note.textContent = targetField.options.length ? '每个输入连接一个来源；同一个来源可以连接多个输入。' : '来源类型与输入不匹配，请更换来源或开放对应参数。';
     };
     source.addEventListener('change', sync); sync();
-    body.append(inputLabel('来源节点', source), inputLabel('工作流输入', targetField), textLabel, outputLabel, note);
+    body.append(inputLabel('来源节点', source), inputLabel('工作流输入', targetField), textLabel, outputNodeLabel, outputLabel, note);
     const actions = element('div', 'dialog-actions');
     actions.append(button('取消', 'workflow-connect-cancel', closeDialog), button('建立连接', 'workflow-connect-submit', () => {
       const from = graph.nodes.find(n => n.id === source.value);
       if (!from || !targetField.value) throw new Error('请选择可连接的来源与输入');
-      const options = { targetField: targetField.value, sourceField: from.type === 'prompt' ? sourceField.value : 'image', ...(['generation', 'result'].includes(from.type) ? { outputIndex: Number(output.value) } : {}) };
+      const options = { targetField: targetField.value, sourceField: from.type === 'prompt' ? sourceField.value : 'image', ...(['generation', 'result'].includes(from.type) ? { outputIndex: Number(output.value), ...(outputNode.value ? { sourceOutput: outputNode.value } : {}) } : {}) };
       const valid = canConnect(host.graph(), source.value, targetId, options); if (!valid.ok) throw new Error(valid.reason);
       host.connect(source.value, targetId, options); closeDialog(); host.toast('已连接工作流输入');
     }, 'button primary'));
@@ -71,7 +78,7 @@ export function createWorkflowCanvas(host) {
     if (!statePanel) return;
     const busy = runner?.isRunning() || !!operation;
     runSelected.disabled = busy; runAll.disabled = busy;
-    document.querySelectorAll('[data-run-node]').forEach(b => { b.disabled = busy; });
+    document.querySelectorAll('[data-run-node]').forEach(b => { const node = host.graph().nodes.find(n => n.id === b.dataset.runNode); b.disabled = busy || !!node?.data.editor_id && !node?.data.package_id; });
     const signature = JSON.stringify([state?.id, state?.status, state?.error, state?.steps, busy]);
     if (signature === lastRunSignature) return; lastRunSignature = signature;
     const detailsOpen = statePanel.querySelector('details')?.open || false;
@@ -115,12 +122,17 @@ export function createWorkflowCanvas(host) {
   async function buildBundle() {
     await host.loadPackages();
     const canvas = JSON.parse(serializeGraph(host.graph(), host.viewport()));
-    const ids = [...new Set(canvas.nodes.filter(n => n.data.kind === 'package').map(n => n.data.package_id))];
+    const ids = [...new Set(canvas.nodes.filter(n => n.data.kind === 'package' && n.data.package_id).map(n => n.data.package_id))];
     const packages = [];
     for (const id of ids) { const result = await host.api(`/api/packages/${encodeURIComponent(id)}/export`, {}); if (!result.document) throw new Error('工作流包不完整，无法导出集合'); packages.push(result.source_json ? { id, source_json: result.source_json } : { id, document: result.document }); }
-    const document = { schema: BUNDLE, version: 1, name: host.title(), canvas, packages };
+    const editors = [];
+    for (const id of new Set(canvas.nodes.map(n => n.data.editor_id).filter(Boolean))) {
+      const result = await host.api(`/api/editor-workflows/${id}`);
+      editors.push({ id, name: result.name, source_json: result.source_json });
+    }
+    const document = { schema: BUNDLE, version: 1, name: host.title(), canvas, packages, ...(editors.length ? { editors } : {}) };
     const serialized = stableStringify(document);
-    if (new TextEncoder().encode(serialized).length > LIMIT) throw new Error('工作流画布集合最大为 8 MiB，请减少节点或拆分画布');
+    if (new TextEncoder().encode(serialized).length > LIMIT) throw new Error('工作流画布集合最大为 24 MiB，请减少节点或拆分画布');
     return document;
   }
   async function exportBundle() {
@@ -132,11 +144,21 @@ export function createWorkflowCanvas(host) {
     if (operation || runner?.isRunning()) throw new Error('请先停止后续调度或等待导入完成，再导入其他画布');
     operation = 'import'; if (runner) renderState(runner.getState());
     try {
-    if (file.size > LIMIT) throw new Error('工作流画布集合最大为 8 MiB');
+    if (file.size > LIMIT) throw new Error('工作流画布集合最大为 24 MiB');
     const document = parseJSONWithSafeNumbers(await file.text());
     if (document?.schema !== BUNDLE || document.version !== 1 || !Array.isArray(document.packages) || document.packages.length > 200) throw new Error('不是有效的棱光工作流画布集合');
     const incoming = parseGraph(document.canvas);
-    const needed = new Set(incoming.nodes.filter(n => n.data.kind === 'package').map(n => n.data.package_id));
+    const needed = new Set(incoming.nodes.filter(n => n.data.kind === 'package' && n.data.package_id).map(n => n.data.package_id));
+    const editorIds = new Set(incoming.nodes.map(n => n.data.editor_id).filter(Boolean));
+    const editorDefinitions = new Map();
+    if (document.editors !== undefined && (!Array.isArray(document.editors) || document.editors.length > 200)) throw new Error('集合中的原生工作流列表无效');
+    for (const entry of document.editors || []) {
+      if (!entry || !editorIds.has(entry.id) || editorDefinitions.has(entry.id) || typeof entry.source_json !== 'string' || !Array.isArray(parseJSONWithSafeNumbers(entry.source_json.replace(/^\uFEFF/, '')).nodes)) throw new Error('集合中的原生工作流缺失或重复');
+      if (typeof entry.name !== 'string' || !entry.name.trim() || entry.name.length > 120) throw new Error('原生工作流名称无效');
+      await host.api('/api/editor-workflows/inspect', { source_json: entry.source_json });
+      editorDefinitions.set(entry.id, entry);
+    }
+    if ([...editorIds].some(id => !editorDefinitions.has(id))) throw new Error('集合缺少内部工作流原文；请在原设备重新导出完整集合');
     const definitions = new Map();
     for (const entry of document.packages) {
       if (!entry || typeof entry.id !== 'string' || !/^p-[a-f0-9]{24}$/.test(entry.id) || definitions.has(entry.id) || !needed.has(entry.id)) throw new Error('集合含有重复或未引用的工作流包');
@@ -149,7 +171,12 @@ export function createWorkflowCanvas(host) {
     if ([...needed].some(id => !definitions.has(id))) throw new Error('集合缺少画布所引用的工作流定义，画布尚未更改');
     const remap = new Map();
     for (const [id, definition] of definitions) { const result = await host.api('/api/packages', definition); if (!result.package?.id) throw new Error('包导入未完成，当前画布尚未更改；已导入的包保留在包库'); remap.set(id, result.package); }
-    for (const node of incoming.nodes.filter(n => n.data.kind === 'package')) {
+    const editorRemap = new Map();
+    for (const [id, entry] of editorDefinitions) { const result = await host.api('/api/editor-workflows', { name: entry.name, source_json: entry.source_json }); editorRemap.set(id, result.id); }
+    for (const node of incoming.nodes) {
+      if (node.data.editor_id) node.data.editor_id = editorRemap.get(node.data.editor_id);
+    }
+    for (const node of incoming.nodes.filter(n => n.data.kind === 'package' && n.data.package_id)) {
       const pack = remap.get(node.data.package_id); node.data.package_id = pack.id; node.data.packageFields = pack.fields.map(({ id, label, type }) => ({ id, label, type }));
     }
     // Revalidate bindings against the definitions accepted by the local service.

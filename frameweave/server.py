@@ -30,8 +30,12 @@ from .environment import discover_environment
 from .engines import EngineManager
 from .updates import UpdateManager, UpdateError
 from .canvas_store import CanvasStore
+from .editor_workflows import EditorWorkflowStore, _parse_document as parse_editor_document
+from .editor_proxy import EditorProxy
+from .editor_interfaces import inspect_interface, reconcile_interface, select_outputs
 from .workspace_services import PROFILES, performance_plan, result_location
-from .packages import PackageStore, apply_values, inspect_document, transport_document
+from .packages import (PackageStore, apply_values, inspect_document,
+                       normalize_document, transport_document)
 from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
 MAX_JSON = 28 * 1024 * 1024
@@ -42,8 +46,8 @@ MAX_RUN = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
                   "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
-                  "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video",
-                  "shift_audio", "ref_image_size", "custom_size", "ref_resolution", "refine", "package_id", "values"}
+                  "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video", "editor_backend",
+                  "shift_audio", "ref_image_size", "custom_size", "ref_resolution", "refine", "package_id", "values", "output_nodes"}
 
 
 class SubmissionUncertain(BackendError):
@@ -101,6 +105,9 @@ class App:
         self.uploaded = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
         self.canvases = CanvasStore(self.data_dir / "canvases")
+        self.editor_workflows = EditorWorkflowStore(self.data_dir / "editor-workflows")
+        self.editor_sessions = {}
+        threading.Thread(target=self._close_editors_on_exit, daemon=True).start()
         self.environment_lock = threading.Lock()
         self.environment_snapshot = None
         self.environment_at = 0
@@ -120,6 +127,107 @@ class App:
             threading.Thread(target=self.start_saved_engine, daemon=True).start()
         if self.settings["auto_update"]:
             self.begin_update("auto")
+
+    def _close_editors_on_exit(self):
+        self.closed.wait()
+        with self.lock:
+            sessions, self.editor_sessions = self.editor_sessions, {}
+        for session in sessions.values():
+            session['proxy'].close()
+
+    def editor_session(self, workflow_id, parent_origin):
+        self.editor_workflows.get(workflow_id)
+        with self.lock:
+            if len(self.editor_sessions) >= 4:
+                raise ValueError('请先关闭已有的内部工作流编辑器')
+            backend = self.backend.url
+            proxy = EditorProxy(backend, parent_origin,
+                                (self.web_dir / 'native-editor-bridge.js').read_text(encoding='utf-8'))
+            session_id = secrets.token_hex(16)
+            result = proxy.start()
+            self.editor_sessions[session_id] = {'proxy': proxy, 'backend': backend, 'workflow_id': workflow_id}
+        return {**result, 'session_id': session_id, 'backend_url': backend}
+
+    def editor_interface(self, workflow_id, data):
+        self.editor_workflows.get(workflow_id)
+        prompt = data.get('prompt')
+        if prompt is None:
+            prompt = self._editor_package_prompt(data)
+        return inspect_interface(prompt, self.object_info(refresh=True))
+
+    def _editor_package_prompt(self, data):
+        package = self.packages.get(data.get('package_id'))
+        baseline = data.get('previous_baseline')
+        return apply_values(package, baseline if isinstance(baseline, dict) and baseline else data.get('values', {}))
+
+    def apply_editor(self, workflow_id, data, configure=False):
+        with self.lock:
+            if configure:
+                if data.get('backend_url') != self.backend.url:
+                    raise ValueError('请切换到该工作流的原推理后端后配置参数')
+                prompt = self._editor_package_prompt(data)
+            else:
+                session = self.editor_sessions.get(data.get('session_id'))
+                if not session or session['workflow_id'] != workflow_id:
+                    raise ValueError('编辑会话已失效，请重新进入工作流')
+                if session['backend'] != self.backend.url:
+                    raise ValueError('编辑期间推理后端已变化，请重新进入工作流')
+                prompt = data.get('prompt')
+            info = self.object_info(refresh=True)
+            validate_prompt(prompt, info)
+            interface = inspect_interface(prompt, info)
+            candidates = {field['id']: field for field in interface['fields']}
+            requested = data.get('fields')
+            if requested is None:
+                requested = [field for field in interface['fields'] if field.get('recommended') or field['type'] in {'image', 'audio'}][:64]
+            if not isinstance(requested, list) or len(requested) > 64:
+                raise ValueError('外层最多开放 64 个参数')
+            fields = []
+            for selection in requested:
+                candidate = candidates.get(selection.get('id')) if isinstance(selection, dict) else None
+                if candidate is None or any(selection.get(key) != candidate[key] for key in ('node_id', 'input', 'type')):
+                    raise ValueError('参数接口已改变，请重新选择外层字段')
+                fields.append({**candidate, 'label': selection.get('label', candidate['label'])})
+            baseline = {f['id']: prompt[f['node_id']]['inputs'][f['input']] for f in fields}
+            values = copy.deepcopy(baseline)
+            previous = self.packages.get(data['previous_package_id']) if data.get('previous_package_id') else None
+            changes = {}
+            if previous:
+                mappings = data.get('rebindings') or {}
+                if not isinstance(mappings, dict):
+                    raise ValueError('接口重绑映射须为对象')
+                live_bindings = {(f['node_id'], f['input'], f['type']) for f in interface['fields']}
+                for old in previous['fields']:
+                    if (old['node_id'], old['input'], old['type']) not in live_bindings and old['id'] not in mappings:
+                        raise ValueError('旧字段已失效，请明确重绑或解除：' + old['label'])
+                reconciled = reconcile_interface(
+                    previous['fields'], data.get('previous_values', {}), fields,
+                    prompt, data.get('previous_baseline'), data.get('rebindings'))
+                values.update(reconciled['values'])
+                changes = reconciled['changes']
+                resolutions = data.get('resolutions', {})
+                if changes.get('conflicts'):
+                    for index, conflict in enumerate(changes['conflicts']):
+                        key = str(conflict.get('id', index))
+                        choice = resolutions.get(key)
+                        if choice not in conflict.get('allowed', ['outer', 'inner']):
+                            return {'requires_resolution': True, 'changes': changes}
+                        values[conflict.get('field_id', conflict.get('id'))] = conflict[choice]
+            output_nodes = data.get('output_nodes', [item['id'] for item in interface['outputs']])
+            select_outputs(prompt, output_nodes, info)
+            current = self.editor_workflows.get(workflow_id)
+            if data.get('base_revision', current['revision']) != current['revision']:
+                raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
+            package_document = normalize_document({
+                'name': current['name'],
+                'description': '内部调参后应用到外层；草稿不会自动替换已应用参数。',
+                'prompt': prompt, 'fields': fields,
+            })
+            validate_prompt(apply_values(package_document, values), info)
+            package = self.packages.save(package_document)
+            revision = current if configure else self.editor_workflows.save_revision(workflow_id, data.get('document'), prompt)
+        return {'workflow': revision, 'package': package, 'values': values, 'baseline': baseline,
+                'output_nodes': output_nodes, 'outputs': interface['outputs'], 'changes': changes, 'backend_url': self.backend.url}
 
     def update_status(self):
         return {**self.updates.status(), "busy": self.update_busy, "error": self.update_error,
@@ -247,9 +355,16 @@ class App:
     def resolve_request(self, data):
         if not isinstance(data, dict):
             raise ValueError("生成请求须为对象")
+        if 'output_nodes' in data and data.get('kind') != 'package':
+            raise ValueError('输出分支选择仅用于工作流包')
         if data.get("kind") == "package":
+            if data.get('editor_backend') and data['editor_backend'] != self.backend.url:
+                raise ValueError('此原生工作流的参数来自另一推理后端，请切回该后端或重新进入工作流应用参数')
             package = self.packages.get(data.get("package_id"))
-            return {"kind": "api", "prompt": apply_values(package, data.get("values", {}))}
+            prompt = apply_values(package, data.get("values", {}))
+            if 'output_nodes' in data:
+                prompt = select_outputs(prompt, data['output_nodes'], self.object_info())
+            return {"kind": "api", "prompt": prompt}
         return data
 
     def diagnostics(self, data):
@@ -732,7 +847,7 @@ class App:
                                           if isinstance(v, list) and len(v) > 1 and v[0] == "execution_error" and isinstance(v[1], dict)]
                                 job["error"] = "\n".join(errors)[:4000] or "后端执行失败或被中断"
                             outputs = []
-                            for node_result in item.get("outputs", {}).values():
+                            for output_node_id, node_result in item.get("outputs", {}).items():
                                 for key in ("images", "gifs", "videos", "video", "audio", "audios"):
                                     values = node_result.get(key, [])
                                     if not isinstance(values, list):
@@ -747,7 +862,7 @@ class App:
                                         subfolder = entry.get("subfolder", "")
                                         url = self.register_media(filename, subfolder, entry.get("type", "output"), old["backend"])
                                         out_type = "video" if suffix in (".mp4", ".webm") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
-                                        outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type, "storage_type": entry.get("type", "output")})
+                                        outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type, "storage_type": entry.get("type", "output"), "node_id": str(output_node_id)})
                             job["outputs"] = outputs
                     elif job_id in running:
                         job["status"] = "running"
@@ -799,7 +914,7 @@ def make_server(app, port=0):
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-src http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -881,6 +996,10 @@ def make_server(app, port=0):
                     self.respond(app.job_list())
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/recipe", path):
                     self.respond(app.recipe(path.split("/")[3]))
+                elif path == '/api/editor-workflows':
+                    self.respond(app.editor_workflows.list())
+                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}', path):
+                    self.respond(app.editor_workflows.get(path.rsplit('/', 1)[-1]))
                 elif path == "/api/packages":
                     self.respond({"packages": app.packages.list()})
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}", path):
@@ -1024,6 +1143,38 @@ def make_server(app, port=0):
                     result = app.environment()
                 elif path == "/api/diagnostics":
                     result = app.diagnostics(data)
+                elif path == '/api/editor-workflows/inspect':
+                    checked = parse_editor_document(data.get('source_json'))
+                    result = {'nodes': len(checked['nodes']), 'links': len(checked['links'])}
+                elif path == '/api/editor-workflows':
+                    document = data.get('document')
+                    if document is None and isinstance(data.get('source_json'), str):
+                        document = json.loads(data['source_json'].lstrip('\ufeff'))
+                    result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'))
+                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure)', path):
+                    workflow_id, action = path.split('/')[3:5]
+                    if action == 'session':
+                        result = app.editor_session(workflow_id, 'http://' + self.headers['Host'])
+                    elif action == 'draft':
+                        with app.lock:
+                            current = app.editor_workflows.get(workflow_id)
+                            if data.get('base_revision', current['revision']) != current['revision']:
+                                raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
+                            result = current if current['document'] == data.get('document') else app.editor_workflows.save_revision(workflow_id, data.get('document'))
+                    elif action == 'apply':
+                        result = app.apply_editor(workflow_id, data)
+                    elif action == 'configure':
+                        result = app.apply_editor(workflow_id, data, configure=True)
+                    elif action == 'interface':
+                        result = app.editor_interface(workflow_id, data)
+                    else:
+                        result = {'source_json': app.editor_workflows.export(workflow_id)}
+                elif path == '/api/editor-sessions/close':
+                    with app.lock:
+                        session = app.editor_sessions.pop(data.get('session_id'), None)
+                    if session:
+                        session['proxy'].close()
+                    result = {'ok': True}
                 elif path == "/api/packages/inspect":
                     result = inspect_document(transport_document(data), app.info)
                 elif path == "/api/packages":

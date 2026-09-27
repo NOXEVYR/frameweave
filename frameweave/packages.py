@@ -24,6 +24,7 @@ MODEL_INPUTS = {"ckpt_name", "unet_name", "clip_name", "vae_name", "lora_name", 
 PACKAGE_ID = re.compile(r"p-[0-9a-f]{24}\Z")
 METADATA_FIELDS = {"favorite", "archived"}
 MAX_METADATA_BYTES = 64 * 1024
+MAX_INSPECTION_FIELDS = 4096
 
 
 def encoded(value):
@@ -243,13 +244,31 @@ def normalize_document(document):
     return result
 
 
-def inspect_document(document, info=None):
+def _limit_inspection_fields(fields, field_limit):
+    if field_limit is not None and (type(field_limit) is not int or
+                                    not 1 <= field_limit <= MAX_INSPECTION_FIELDS):
+        raise ValueError("field_limit 须为 1–4096 之间的整数或 None")
+    limit = MAX_INSPECTION_FIELDS if field_limit is None else field_limit
+    if field_limit is None and len(fields) > MAX_INSPECTION_FIELDS:
+        raise ValueError("工作流候选输入超过 4096 项，请拆分工作流后检查")
+    if len(fields) <= limit:
+        return fields
+    media = [field for field in fields if field['type'] in {'image', 'audio'}]
+    if len(media) > limit:
+        raise ValueError(f'工作流有超过 {limit} 个独立媒体输入，请在内部拆分工作流后应用')
+    ranked = sorted(fields, key=lambda field: (field['type'] not in {'image', 'audio'}, not field['recommended']))
+    keep = {field['id'] for field in ranked[:limit]}
+    return [field for field in fields if field['id'] in keep]
+
+
+def inspect_document(document, info=None, *, field_limit=64):
     encoded(document)
     if not isinstance(document, dict):
         raise ValueError("请导入 JSON 工作流对象")
     if "format" in document or "fields" in document:
         result = normalize_document(document)
-        return {**result, "fields": [{**field, "recommended": True} for field in result["fields"]]}
+        fields = [{**field, "recommended": True} for field in result["fields"]]
+        return {**result, "fields": _limit_inspection_fields(fields, field_limit)}
     source = document.get("prompt", document)
     prompt = normalize_prompt(source)
     fields, info = [], info or {}
@@ -266,7 +285,7 @@ def inspect_document(document, info=None):
         schema = info.get(node["class_type"], {})
         specs, _ = _expanded_inputs(schema, node["inputs"]) if isinstance(schema, dict) else ({}, set())
         for name, value in node["inputs"].items():
-            if not scalar(value) or len(fields) >= 64 or (type(value) is int and abs(value) > 9007199254740991):
+            if not scalar(value) or (type(value) is int and abs(value) > 9007199254740991):
                 continue
             kind = "boolean" if type(value) is bool else "integer" if type(value) is int else "number" if type(value) is float else "text"
             spec, meta = _spec(specs[name]) if name in specs else (None, {})
@@ -295,6 +314,7 @@ def inspect_document(document, info=None):
                         if math.isfinite(clamped):
                             field[bound] = clamped
             fields.append(field)
+    fields = _limit_inspection_fields(fields, field_limit)
     return {"name": "我的生成工作流", "description": "", "prompt": prompt, "fields": fields,
             "requirements": {"nodes": sorted({node["class_type"] for node in prompt.values()})}}
 

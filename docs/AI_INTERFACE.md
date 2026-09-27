@@ -95,3 +95,7 @@ AI 提交的任务与界面使用相同记录。打开 **生成队列 → 放入
 
 
 0.10 新增 `fw_audio_capabilities`（只读）和 `fw_upload_audio`（上传参考音频）。音频通过 `fw_generate` 的 package 请求运行，仍须固定 request_id。SDXL 请求支持 models.sdxl_clip_l / sdxl_clip_g 成对覆盖、models.vae，以及 refine 对象：enabled、width、height、steps、denoise、upscale_method；先用 fw_compile 验证当前接口。
+
+0.11 的原生编辑器与外层参数接口使用本机 HTTP API：`/api/editor-workflows` 管理原生文档，`/<id>/interface` 检查字段，`/<id>/configure` 配置已应用的外层接口，`/<id>/apply` 接收当前原生编辑会话的编译结果。写入沿用启动令牌与同源检查，不因导入或保存自动生成。编译必须由已加载扩展的原生编辑器完成；不要根据 `widgets_values` 数组位置猜测执行图。
+
+执行已应用工作流仍调用 `fw_compile` / `fw_generate`，`kind=package` 携带 `package_id`、`values`；可增加 `editor_backend` 与 `output_nodes`（原生输出节点 ID 数组），用于约束后端和执行分支。接口变更发生冲突时须处理 `requires_resolution`，不能把错误重试当作确认。原生编辑 HTTP 路由尚未单独包装成 MCP 工具。

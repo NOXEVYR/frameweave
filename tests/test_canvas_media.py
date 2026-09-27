@@ -101,6 +101,19 @@ class CanvasMediaTests(unittest.TestCase):
         self.assertIn(PNG, self.uploads()[0][2])
         self.assert_no_generation()
 
+    def test_uploaded_preview_url_serves_same_bytes_after_client_restart(self):
+        status, _, result = self.transfer()
+        self.assertEqual(status, 200)
+        before = self.request('GET', result['url'])
+        self.assertEqual(before[0], 200)
+        self.stop_client()
+        self.start_client()
+        after = self.request('GET', result['url'])
+        self.assertEqual(after[0], 200)
+        self.assertEqual(after[2], before[2])
+        self.assertEqual(after[2], PNG)
+        self.assert_no_generation()
+
     def test_repeated_transfer_is_upload_only_and_uses_new_nonoverwriting_names(self):
         first, second = self.transfer()[2], self.transfer()[2]
         self.assertNotEqual(first["name"], second["name"])

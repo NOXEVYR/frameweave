@@ -47,7 +47,11 @@ class CanvasStore:
                 raise ValueError("画布记录损坏，原文件已保留") from None
             return record
 
-    def list(self):
+    def list(self, offset=0, limit=200, query=''):
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError('画布分页参数无效')
+        if not isinstance(query, str) or len(query) > 120:
+            raise ValueError('画布搜索内容过长')
         with self.lock:
             entries, unreadable = [], 0
             if self.root.is_dir():
@@ -58,7 +62,11 @@ class CanvasStore:
                     except (OSError, ValueError, KeyError):
                         unreadable += 1
             entries.sort(key=lambda x: x['created_at'], reverse=True)
-            return {'canvases': entries[:200], 'total': len(entries), 'unreadable': unreadable,
+            total = len(entries)
+            entries = [entry for entry in entries if query.casefold() in entry['name'].casefold()]
+            end = offset + limit
+            return {'canvases': entries[offset:end], 'total': total, 'matched': len(entries),
+                    'offset': offset, 'next_offset': end if end < len(entries) else None, 'unreadable': unreadable,
                     'directory': str(self.root.resolve())}
 
     @staticmethod

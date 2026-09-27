@@ -269,9 +269,12 @@ class UpdateManagerTests(unittest.TestCase):
         target = manager.staging_dir / "PrismCanvas-v1.2.0-Windows-x64.zip"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"keep my existing file")
-        with self.assertRaises(UpdateError):
-            manager.stage()
+        result = manager.stage()
         self.assertEqual(target.read_bytes(), b"keep my existing file")
+        self.assertTrue(result['staged']['verified'])
+        self.assertNotEqual(Path(result['staged']['path']), target)
+        self.assertTrue(Path(result['staged']['path']).is_relative_to(manager.staging_dir.resolve()))
+        self.assertTrue(result['staged']['recovery_note'])
 
 
 if __name__ == "__main__":

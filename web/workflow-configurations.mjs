@@ -44,7 +44,7 @@ export function createWorkflowConfigurations(host) {
     dialog.addEventListener('close',()=>dialog.remove(),{once:true}); return dialog;
   }
   async function save(node) {
-    const bundle = await host.bundle();
+    const bundle = await host.bundle(node.id);
     const dialog = openDialog('保存工作流配置');
     const label=el('label','配置名称'); label.className='field';
     const name=el('input');name.value=node.data.title;name.maxLength=120;name.setAttribute('aria-label','配置名称');label.append(name);
@@ -67,11 +67,12 @@ export function createWorkflowConfigurations(host) {
     const list=el('div');list.className='workspace-library-list';
     dialog.append(note,search,status,list);frameDialog(dialog);dialog.showModal();
     try {
-      const response=await host.api('/api/canvases');if(!dialog.isConnected)return;
-      status.textContent='配置和画布按保存时间排列；仅载入参数，不启动生成。';
+      let response=await host.api('/api/canvases');if(!dialog.isConnected)return;
+      let loading=false, searchRevision=0;
+      status.textContent='按名称搜索全部已保存记录；仅载入参数，不启动生成。';
       function render(){
         list.replaceChildren();
-        const rows=response.canvases.filter(item=>item.name.toLowerCase().includes(search.value.toLowerCase()));
+        const rows=response.canvases;
         if(!rows.length)list.append(el('p','暂无已保存配置。先建立外层参数，再点“保存此工作流配置”；已有“我的画布”记录也会出现在这里。'));
         for(const item of rows){
           const row=el('div');row.className='workflow-configuration-row';
@@ -92,8 +93,22 @@ export function createWorkflowConfigurations(host) {
           };
           row.append(title,detail,inspect,children);list.append(row);
         }
+        if(response.next_offset != null){
+          const more=el('button','加载更早的配置');more.className='button quiet';
+          more.onclick=async()=>{if(loading)return;loading=true;more.disabled=true;const revision=searchRevision;
+            try{const next=await host.api(`/api/canvases?offset=${response.next_offset}&q=${encodeURIComponent(search.value)}`);
+              if(dialog.isConnected&&revision===searchRevision){response={...next,canvases:[...response.canvases,...next.canvases]};render();}
+            }catch(error){if(dialog.isConnected&&revision===searchRevision)status.textContent=error.message;}finally{loading=false;more.disabled=false;}};
+          list.append(more);
+        }
       }
-      search.oninput=render;render();
+      let timer;
+      search.oninput=()=>{const revision=++searchRevision;clearTimeout(timer);timer=setTimeout(async()=>{
+        try{const result=await host.api(`/api/canvases?q=${encodeURIComponent(search.value)}`);
+          if(dialog.isConnected&&revision===searchRevision){response=result;render();}
+        }catch(error){if(dialog.isConnected&&revision===searchRevision)status.textContent=error.message;}
+      },200);};
+      dialog.addEventListener('close',()=>clearTimeout(timer),{once:true});render();
     }catch(error){status.textContent=error.message;}
   }
   return {save,choose};

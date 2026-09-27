@@ -9,6 +9,15 @@ const element = (tag, className = '', text) => { const item = document.createEle
 const statusNames = { running: '运行中', stopping: '停止后续中', paused: '已暂停', completed: '全部完成', failed: '已停止：任务失败' };
 const stepNames = { pending: '等待前序', preparing: '准备输入', submitting: '提交中', uncertain: '提交待确认', running: '执行中', completed: '完成', failed: '失败' };
 
+export function configurationScope(graph, nodeId) {
+  const target = graph.nodes.find(node => node.id === nodeId);
+  if (!target) throw new Error('工作流节点已经移除，请重新选择');
+  const ids = new Set([nodeId]);
+  const edges = graph.edges.filter(edge => edge.target === nodeId && graph.nodes.some(node => node.id === edge.source && node.type === 'prompt'));
+  edges.forEach(edge => ids.add(edge.source));
+  return { nodes: graph.nodes.filter(node => ids.has(node.id)), edges };
+}
+
 export function createWorkflowCanvas(host) {
   let runner, dialog, statePanel, runSelected, runAll, resume, stop, clear, lastRunSignature = '', operation = '';
   const button = (text, id, fn, style = 'button quiet') => {
@@ -120,9 +129,9 @@ export function createWorkflowCanvas(host) {
     try { return await runner.resume(); } finally { operation = ''; renderState(runner.getState()); }
   }
 
-  async function buildBundle() {
+  async function buildBundle(nodeId = null) {
     await host.loadPackages();
-    const canvas = JSON.parse(serializeGraph(host.graph(), host.viewport()));
+    const canvas = JSON.parse(serializeGraph(nodeId ? configurationScope(host.graph(), nodeId) : host.graph(), host.viewport()));
     const ids = [...new Set(canvas.nodes.filter(n => n.data.kind === 'package' && n.data.package_id).map(n => n.data.package_id))];
     const packages = [];
     for (const id of ids) { const result = await host.api(`/api/packages/${encodeURIComponent(id)}/export`, {}); if (!result.document) throw new Error('工作流包不完整，无法导出集合'); packages.push(result.source_json ? { id, source_json: result.source_json } : { id, document: result.document }); }

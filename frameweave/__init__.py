@@ -1,3 +1,3 @@
 """PrismCanvas 棱光, with the compatible FrameWeave data and API identity."""
 
-__version__ = "0.11.2"
+__version__ = "0.11.3"

@@ -234,13 +234,33 @@ class UpdateManager:
         if not release or not release.get("update_available"):
             raise UpdateError("当前没有可暂存的新版本")
 
+        if self._staged and self._staged.get('version') == release['version']:
+            try:
+                info = self._verify_existing_stage(Path(self._staged['path']), release)
+            except (UpdateError, OSError):
+                pass
+            else:
+                if self._staged.get('recovery_note'):
+                    info['recovery_note'] = self._staged['recovery_note']
+                self._staged, self._last_error = info, None
+                return self.status()
+
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         filename = release["name"]
         destination = self.staging_dir / filename
+        recovery_note = ''
         if destination.exists():
-            info = self._verify_existing_stage(destination, release)
-            self._staged = info
-            return self.status()
+            try:
+                info = self._verify_existing_stage(destination, release)
+            except UpdateError:
+                # Preserve the existing bytes and retry in a new owned directory.
+                # Never delete or rename a potentially user-supplied old file.
+                destination = Path(tempfile.mkdtemp(prefix='retry-', dir=self.staging_dir)) / filename
+                recovery_note = '原暂存包校验失败，已原样保留；本次下载使用新的暂存目录。'
+            else:
+                self._staged = info
+                self._last_error = None
+                return self.status()
 
         temp_path: Path | None = None
         try:
@@ -290,6 +310,7 @@ class UpdateManager:
                 "exe_sha256": release["exe_sha256"],
                 "verified": True,
                 "installed": False,
+                **({'recovery_note': recovery_note} if recovery_note else {}),
             }
         except UpdateError as exc:
             self._last_error = str(exc)

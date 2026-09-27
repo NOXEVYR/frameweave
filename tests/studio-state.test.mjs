@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from '../web/studio-state.mjs';
-import { studioModelNames } from '../web/generation-studio.mjs';
+import { studioExternalModelOptions, studioModelNames, studioSdxlEncoderNames } from '../web/generation-studio.mjs';
 test('independent text generation includes exact models and LoRA strengths', () => {
   const d = { ...newDraft('txt2img'), positive: '光与山', models: { checkpoint: 'XL.safetensors' }, loras: [{ name: 'style.safetensors', strength_model: .8, strength_clip: .4 }] };
   const r = buildStudioRequest(d);
@@ -92,6 +92,24 @@ test('SDXL external encoders require a live compatible DualCLIPLoader pair while
   assert.throws(() => buildStudioRequest({ ...draft, models: { ...draft.models, sdxl_clip_g: '' } }, '', options), /同时选择/);
   assert.throws(() => buildStudioRequest(draft, '', { sdxl_clip: { available: false, reason: '缺少 DualCLIPLoader' } }), /缺少 DualCLIPLoader/);
   assert.throws(() => buildStudioRequest({ ...draft, models: { ...draft.models, sdxl_clip_g: 'other.safetensors' } }, '', options), /实时模型列表/);
+});
+test('SDXL external encoder choices refresh from the active engine and keep stale draft values disabled', () => {
+  const engineA = { generation_options: { sdxl_clip: { available: true, clip_name1: ['a-l.safetensors'], clip_name2: ['a-g.safetensors'] } } };
+  const engineB = { generation_options: { sdxl_clip: { available: true, clip_name1: ['b-l.safetensors'], clip_name2: ['b-g.safetensors'] } } };
+  let activeEngine = engineA;
+  const currentDraft = { sdxl_clip_l: 'a-l.safetensors', sdxl_clip_g: 'a-g.safetensors' };
+  assert.deepEqual(studioSdxlEncoderNames(activeEngine, 'sdxl_clip_l'), ['a-l.safetensors']);
+  assert.deepEqual(studioSdxlEncoderNames(activeEngine, 'sdxl_clip_g'), ['a-g.safetensors']);
+  activeEngine = engineB;
+  const left = studioExternalModelOptions(studioSdxlEncoderNames(activeEngine, 'sdxl_clip_l'), currentDraft.sdxl_clip_l);
+  const right = studioExternalModelOptions(studioSdxlEncoderNames(activeEngine, 'sdxl_clip_g'), currentDraft.sdxl_clip_g);
+  assert.deepEqual(left.map(option => option.value), ['', 'b-l.safetensors', 'a-l.safetensors']);
+  assert.deepEqual(right.map(option => option.value), ['', 'b-g.safetensors', 'a-g.safetensors']);
+  assert.equal(left[2].label, 'a-l.safetensors · 当前列表未找到');
+  assert.equal(left[2].disabled, true); assert.equal(left[2].missing, true);
+  assert.equal(right[2].disabled, true); assert.equal(right[2].missing, true);
+  assert.equal(left[1].disabled, false);
+  assert.deepEqual(studioExternalModelOptions(['b-l.safetensors'], 'b-l.safetensors').map(option => option.value), ['', 'b-l.safetensors']);
 });
 test('SDXL refine is omitted when disabled and requires explicit live backend capability when enabled', () => {
   const base = { ...newDraft('img2img', 'sdxl_i2i'), positive: 'rerender', references: [{ name: 'input.png' }] };

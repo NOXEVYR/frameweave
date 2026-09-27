@@ -38,6 +38,7 @@ from .editor_backends import inspect_backend_fit
 from .workspace_services import PROFILES, performance_plan, result_location
 from .packages import (PackageStore, apply_values, inspect_document,
                        normalize_document, transport_document)
+from .recovery import recover_records, job_record, media_record
 from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
 MAX_JSON = 28 * 1024 * 1024
@@ -105,6 +106,8 @@ class App:
         self.jobs = {}
         self.media = {}
         self.uploaded = set()
+        self.recovery_warnings = []
+        self.recovery_protected_files = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
         self.canvases = CanvasStore(self.data_dir / "canvases")
         self.editor_workflows = EditorWorkflowStore(self.data_dir / "editor-workflows")
@@ -113,17 +116,26 @@ class App:
         self.environment_lock = threading.Lock()
         self.environment_snapshot = None
         self.environment_at = 0
-        try:
-            old = json.loads((self.data_dir / "jobs.json").read_text(encoding="utf-8"))
-            for job in old[-200:]:
-                if isinstance(job, dict) and re.fullmatch(r"[\w-]{1,100}", job.get("id", "")):
-                    self.jobs[job["id"]] = job
-                    if job.get("backend") != self.backend.url and job.get("status") not in TERMINAL:
-                        job["status"], job["error"] = "failed", "后端地址已变化；请在原后端检查任务"
-                    for output in job.get("outputs", []):
-                        self.register_media(output["filename"], output.get("subfolder", ""), "output", job.get("backend"))
-        except (OSError, ValueError, KeyError, TypeError, RecursionError):
-            self.jobs = {}
+        old, warnings, protected = recover_records(self.data_dir / 'jobs.json', job_record, 200)
+        if protected:
+            self.recovery_protected_files.add('jobs.json')
+        self.recovery_warnings.extend(warnings)
+        for job in old:
+            self.jobs[job['id']] = job
+            if job['backend'] != self.backend.url and job['status'] not in TERMINAL:
+                job['status'], job['error'] = 'failed', '后端地址已变化；请在原后端检查任务'
+            for output in job['outputs']:
+                output['url'] = self.register_media(output['filename'], output['subfolder'], output['storage_type'], job['backend'])
+        inputs, warnings, protected = recover_records(self.data_dir / 'input-media.json', media_record, 10000)
+        if protected:
+            self.recovery_protected_files.add('input-media.json')
+        self.recovery_warnings.extend(warnings)
+        for item in inputs:
+            if item['storage_type'] != 'input':
+                continue
+            self.register_media(item['filename'], item['subfolder'], 'input', item['backend'])
+            if item['backend'] == self.backend.url:
+                self.uploaded.add('/'.join(filter(None, [item['subfolder'], item['filename']])))
 
         if self.settings["auto_start_engine"]:
             threading.Thread(target=self.start_saved_engine, daemon=True).start()
@@ -443,6 +455,23 @@ class App:
         with self.lock:
             return self._upload(data)
 
+    def persist_input_media(self):
+        if 'input-media.json' in self.recovery_protected_files:
+            raise OSError('输入素材原始记录尚未成功备份，暂停覆盖；请先备份本地工作区')
+        records = [{'backend': backend, 'filename': query['filename'],
+                    'subfolder': query['subfolder'], 'storage_type': 'input'}
+                   for backend, query in self.media.values() if query['type'] == 'input']
+        if len(records) > 10000:
+            raise ValueError('输入素材登记已达上限，请先备份工作区后整理素材')
+        atomic_json(self.data_dir / 'input-media.json', records)
+
+    def check_input_storage(self):
+        # Reject known persistence failures before creating a backend file.
+        if 'input-media.json' in self.recovery_protected_files:
+            raise ValueError('输入素材记录无法安全保存，未上传；请先备份本地工作区、修复磁盘问题并重启客户端')
+        if sum(query['type'] == 'input' for _, query in self.media.values()) >= 10000:
+            raise ValueError('输入素材登记已达上限，未上传；请先备份工作区后整理素材')
+
     def _upload(self, data):
         if not isinstance(data.get("data"), str):
             raise ValueError("请上传图片内容")
@@ -454,6 +483,7 @@ class App:
 
     def upload_audio(self, data):
         with self.lock:
+            self.check_input_storage()
             try:
                 content = base64.b64decode(data.get('data', ''), validate=True)
             except (ValueError, TypeError, binascii.Error):
@@ -480,6 +510,7 @@ class App:
             safe_relative(relative)
             url = self.register_media(result['name'], result.get('subfolder', ''), 'input')
             self.uploaded.add(relative)
+            self.persist_input_media()
             self.info_at = 0
             return {'name': relative, 'url': url, 'backend': self.backend.url}
 
@@ -495,6 +526,7 @@ class App:
             return result_location(job, data.get('index', 0), profiles, open_folder=data.get('open', False))
 
     def _upload_content(self, content, *, complete=False):
+        self.check_input_storage()
         if not 8 <= len(content) <= MAX_IMAGE_BYTES:
             raise ValueError("参考图大小须在 8 字节到 20 MiB 之间")
         if content.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -523,6 +555,7 @@ class App:
         url = self.register_media(returned_name, subfolder, "input")
         backend_name = f"{subfolder}/{returned_name}" if subfolder else returned_name
         self.uploaded.add(backend_name)
+        self.persist_input_media()
         self.info_at = 0
         return {"name": backend_name, "url": url, "backend": self.backend.url}
 
@@ -623,6 +656,8 @@ class App:
         """Called under lock. Prepare storage before any inference side effect."""
         if self.exit_pending or self.closed.is_set():
             raise ValueError("棱光正在退出，未提交生成任务")
+        if 'jobs.json' in self.recovery_protected_files:
+            raise ValueError('任务记录无法安全保存，未提交生成；请先备份本地工作区、修复磁盘问题并重启客户端')
         if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
             raise ValueError("最多同时保留 24 个未结束任务")
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2)
@@ -792,6 +827,8 @@ class App:
             return self.public_job(self.jobs[result["id"]])
 
     def persist_jobs(self):
+        if 'jobs.json' in self.recovery_protected_files:
+            raise OSError('任务原始记录尚未成功备份，暂停覆盖；请先备份本地工作区')
         atomic_json(self.data_dir / "jobs.json", list(self.jobs.values())[-200:])
 
     def job_list(self):
@@ -990,7 +1027,7 @@ def make_server(app, port=0):
             path = urllib.parse.urlsplit(self.path).path
             try:
                 if path == "/api/bootstrap":
-                    self.respond({"application": "PrismCanvas", "version": __version__, "csrf": app.csrf, "settings": app.settings,
+                    self.respond({"application": "PrismCanvas", "version": __version__, "csrf": app.csrf, "settings": app.settings, "recovery_warnings": app.recovery_warnings,
                                   "presets": [{"id": "draft", "label": "构图试样", "steps": 20, "width": 768, "height": 448, "seconds": 4},
                                               {"id": "balanced", "label": "标准制作", "steps": 20, "width": 1344, "height": 768, "seconds": 5},
                                               {"id": "quality", "label": "细节优先", "steps": 25, "width": 1344, "height": 768, "seconds": 5}]})
@@ -1001,7 +1038,10 @@ def make_server(app, port=0):
                 elif path == '/api/performance-plan':
                     self.respond(performance_plan(app.settings['performance_profile'], app.status()))
                 elif path == '/api/canvases':
-                    self.respond(app.canvases.list())
+                    params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                    self.respond(app.canvases.list(offset=int(params.get('offset', ['0'])[0]),
+                                                  limit=int(params.get('limit', ['200'])[0]),
+                                                  query=params.get('q', [''])[0]))
                 elif re.fullmatch(r'/api/canvases/[0-9a-f]{32}', path):
                     self.respond(app.canvases.get(path.rsplit('/', 1)[-1]))
                 elif path == '/api/audio-capabilities':

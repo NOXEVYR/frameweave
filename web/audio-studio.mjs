@@ -1,12 +1,21 @@
 import { defaultValues, fieldType, validateValues } from './packages.mjs';
 
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+const uploadSerialsByDraft = new WeakMap();
 const node = (tag, className = '', text) => {
   const element = document.createElement(tag);
   element.className = className;
   if (text !== undefined) element.textContent = text;
   return element;
 };
+
+function beginFieldUpload(draft, fieldId) {
+  let serials = uploadSerialsByDraft.get(draft);
+  if (!serials) { serials = new Map(); uploadSerialsByDraft.set(draft, serials); }
+  const serial = (serials.get(fieldId) || 0) + 1;
+  serials.set(fieldId, serial);
+  return () => serials.get(fieldId) === serial;
+}
 
 /** Join local package documents with the live backend's AUDIO-schema result. */
 export function audioPackageChoices(capability, packages, backend) {
@@ -50,7 +59,7 @@ function typeOf(field) {
 }
 
 /** Render the data-only scalar/media bindings exposed by one imported workflow package. */
-export function renderAudioFields(container, { pack, draft, api, backend, currentBackend = () => backend, onChange, reportError }) {
+export function renderAudioFields(container, { pack, draft, api, backend, currentBackend = () => backend, isCurrent = () => true, onChange, reportError }) {
   container.replaceChildren();
   for (const field of pack?.fields || []) {
     const type = typeOf(field), label = field.label || field.id;
@@ -61,24 +70,35 @@ export function renderAudioFields(container, { pack, draft, api, backend, curren
       input = node('input'); input.type = 'file'; input.accept = type === 'audio' ? 'audio/wav,audio/mpeg,audio/flac,audio/ogg,.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp';
       input.setAttribute('aria-label', label);
       const value = draft.values?.[field.id] || '';
-      const existing = node('small', 'audio-upload-name', value ? `已上传：${value}` : type === 'audio' ? '选择 WAV、MP3、FLAC、OGG、M4A 或 AAC 音频' : '选择 PNG、JPEG 或 WebP 图片');
+      const existing = node('small', 'audio-upload-name', value ? `已上传：${value}` : type === 'audio' ? '选择 WAV、MP3、FLAC 或 OGG 音频' : '选择 PNG、JPEG 或 WebP 图片');
       input.addEventListener('change', async () => {
         const file = input.files?.[0];
         if (!file) return;
+        const isLatestUpload = beginFieldUpload(draft, field.id);
         try {
           const startedBackend = currentBackend();
+          const valuesAtStart = draft.values;
+          const stillCurrent = () => draft.package_id === pack.id
+            && draft.values === valuesAtStart
+            && currentBackend() === startedBackend
+            && startedBackend === backend
+            && isLatestUpload()
+            && isCurrent({ pack, field, backend: startedBackend, draft }) !== false;
+          const staleMessage = '工作流包、输入字段或推理引擎已切换；请在当前工作流重新选择并上传素材';
+          if (!stillCurrent()) throw new Error(staleMessage);
           if (file.size > MAX_AUDIO_BYTES) throw new Error('输入素材每个最多 20 MiB');
           if (type === 'audio' && !/\.(wav|mp3|flac|ogg)$/i.test(file.name)) throw new Error('参考音频当前支持 WAV、MP3、FLAC、OGG');
           if (type === 'image' && !/^image\/(png|jpeg|webp)$/i.test(file.type)) throw new Error('图片输入支持 PNG、JPEG 或 WebP');
           const data = await readBase64(file);
+          if (!stillCurrent()) throw new Error(staleMessage);
           const uploaded = await api(type === 'audio' ? '/api/upload-audio' : '/api/upload', { name: file.name, data });
-          if (!uploaded?.name || currentBackend() !== startedBackend || startedBackend !== backend || uploaded.backend && uploaded.backend !== startedBackend) throw new Error('上传素材没有绑定到当前推理引擎；请重新选择并上传');
+          if (!uploaded?.name || !stillCurrent() || uploaded.backend && uploaded.backend !== startedBackend) throw new Error(staleMessage);
           draft.values ||= {}; draft.mediaBackends ||= {};
           draft.values[field.id] = uploaded.name; draft.mediaBackends[field.id] = uploaded.backend || startedBackend;
           existing.textContent = `已上传：${file.name}`;
           onChange();
-        } catch (error) { reportError(error); }
-        finally { input.value = ''; }
+        } catch (error) { if (isLatestUpload()) reportError(error); }
+        finally { if (isLatestUpload()) input.value = ''; }
       });
       wrap.append(input, existing);
       if (field.required && !value) wrap.append(node('small', 'field-error', '必需输入'));
@@ -110,6 +130,19 @@ export function renderAudioFields(container, { pack, draft, api, backend, curren
 
 export function initialAudioValues(pack) {
   return defaultValues(pack?.fields || []);
+}
+
+/** Reject a delayed upload when its category, package, backend, or field schema changed. */
+export function audioUploadContextMatches(expected, current, fieldId) {
+  return current?.epoch === expected?.epoch
+    && current?.category === expected?.category
+    && current?.draft === expected?.draft
+    && current?.packageId === expected?.packageId
+    && current?.backend === expected?.backend
+    && current?.capabilitiesBackend === expected?.backend
+    && current?.stale !== true
+    && Array.isArray(current?.fields)
+    && current.fields.some(field => field?.id === fieldId);
 }
 
 const SAFE_AUDIO_REASONS = new Map([

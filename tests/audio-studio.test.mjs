@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { audioIntegrationRequest, audioPackageChoices, buildAudioPackageRequest } from '../web/audio-studio.mjs';
+import { audioIntegrationRequest, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields } from '../web/audio-studio.mjs';
 
 const backend = 'http://127.0.0.1:8188';
 const packageDoc = { id: 'p-audio', name: '参考音频配音', fields: [
@@ -64,4 +64,140 @@ test('audio integration note treats malformed versions and unknown backend reaso
   assert.match(note, /未知/);
   assert.match(note, /暂无可安全汇总的原因/);
   assert.doesNotMatch(note, /private|safetensors|model/);
+});
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase(); this.children = []; this.listeners = {}; this.attributes = {};
+    this.classList = { add: value => { this.className = `${this.className || ''} ${value}`.trim(); } };
+  }
+  append(...items) { this.children.push(...items); }
+  replaceChildren(...items) { this.children = items; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes[name] = value; }
+}
+
+function fakeDom(t) {
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const oldReader = Object.getOwnPropertyDescriptor(globalThis, 'FileReader');
+  globalThis.document = { createElement: tag => new FakeElement(tag) };
+  globalThis.FileReader = class {
+    readAsDataURL() { this.result = 'data:audio/wav;base64,dGVzdA=='; this.onload(); }
+  };
+  t.after(() => {
+    if (oldDocument) Object.defineProperty(globalThis, 'document', oldDocument); else delete globalThis.document;
+    if (oldReader) Object.defineProperty(globalThis, 'FileReader', oldReader); else delete globalThis.FileReader;
+  });
+}
+
+function walk(element, predicate) {
+  if (predicate(element)) return element;
+  for (const child of element.children || []) { const match = walk(child, predicate); if (match) return match; }
+  return null;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(yes => { resolve = yes; });
+  return { promise, resolve };
+}
+
+function audioUploadView(t, { pack, draft, api, currentBackend = () => backend, isCurrent = () => true, errors = [] }) {
+  fakeDom(t);
+  const container = new FakeElement('div');
+  renderAudioFields(container, { pack, draft, api, backend, currentBackend, isCurrent, onChange() {}, reportError: error => errors.push(error) });
+  return { container, input: walk(container, item => item.tagName === 'INPUT' && item.type === 'file'), errors };
+}
+
+function uploadContext() {
+  const draft = { package_id: 'p-audio', values: {}, mediaBackends: {} };
+  const expected = { epoch: 1, category: 'voice', draft, packageId: 'p-audio', backend };
+  const current = { ...expected, capabilitiesBackend: backend, stale: false, fields: packageDoc.fields };
+  return { draft, expected, current };
+}
+
+test('delayed audio uploads are discarded after package, category, backend, or field changes', async t => {
+  for (const change of ['package', 'category', 'backend', 'field']) {
+    await t.test(`reject stale ${change} context`, async t => {
+      let finishUpload, started;
+      const apiStarted = new Promise(resolve => { started = resolve; });
+      const apiResult = new Promise(resolve => { finishUpload = resolve; });
+      const context = uploadContext();
+      const api = (path, body) => { started({ path, body }); return apiResult; };
+      const { input, errors } = audioUploadView(t, {
+        pack: { ...packageDoc, fields: [packageDoc.fields[1]] }, draft: context.draft, api,
+        isCurrent: ({ field }) => audioUploadContextMatches(context.expected, context.current, field.id),
+      });
+      input.files = [{ name: 'reference.wav', size: 8, type: 'audio/wav' }];
+      const upload = input.listeners.change();
+      const request = await apiStarted;
+      assert.equal(request.path, '/api/upload-audio');
+      if (change === 'package') context.current = { ...context.current, packageId: 'p-other' };
+      if (change === 'category') context.current = { ...context.current, category: 'music', epoch: 2 };
+      if (change === 'backend') context.current = { ...context.current, backend: 'http://127.0.0.1:9999', capabilitiesBackend: 'http://127.0.0.1:9999', epoch: 2 };
+      if (change === 'field') context.current = { ...context.current, fields: [] };
+      if (change === 'package') context.draft.package_id = 'p-other';
+      finishUpload({ name: 'input/reference.wav', backend });
+      await upload;
+      assert.equal(context.draft.values.voice_audio, undefined);
+      assert.equal(context.draft.mediaBackends.voice_audio, undefined);
+      assert.equal(errors.length, 1);
+      assert.match(errors[0].message, /已切换/);
+    });
+  }
+});
+
+test('same-field uploads commit only the latest selection when responses arrive in reverse order', async t => {
+  const pack = { ...packageDoc, fields: [packageDoc.fields[1]] };
+  const draft = { package_id: pack.id, values: {}, mediaBackends: {} };
+  const errors = [];
+  const firstStarted = deferred(), secondStarted = deferred(), firstResult = deferred(), secondResult = deferred();
+  let requestCount = 0;
+  const api = (path, body) => {
+    const index = requestCount++;
+    if (index === 0) { firstStarted.resolve({ path, body }); return firstResult.promise; }
+    secondStarted.resolve({ path, body }); return secondResult.promise;
+  };
+  const { input } = audioUploadView(t, { pack, draft, api, errors });
+  input.files = [{ name: 'reference-a.wav', size: 8, type: 'audio/wav' }];
+  const first = input.listeners.change();
+  assert.equal((await firstStarted.promise).body.name, 'reference-a.wav');
+  input.files = [{ name: 'reference-b.wav', size: 8, type: 'audio/wav' }];
+  const second = input.listeners.change();
+  assert.equal((await secondStarted.promise).body.name, 'reference-b.wav');
+
+  secondResult.resolve({ name: 'input/reference-b.wav', backend });
+  await second;
+  assert.equal(draft.values.voice_audio, 'input/reference-b.wav');
+  firstResult.resolve({ name: 'input/reference-a.wav', backend });
+  await first;
+  assert.equal(draft.values.voice_audio, 'input/reference-b.wav');
+  assert.deepEqual(draft.mediaBackends, { voice_audio: backend });
+  assert.equal(errors.length, 0);
+});
+
+test('audio picker advertises and accepts only WAV, MP3, FLAC, and OGG', async t => {
+  const pack = { ...packageDoc, fields: [packageDoc.fields[1]] };
+  const draft = { package_id: pack.id, values: {}, mediaBackends: {} };
+  const uploaded = [];
+  const errors = [];
+  const { container, input } = audioUploadView(t, {
+    pack, draft, api: async (path, body) => { uploaded.push({ path, body }); return { name: `input/${body.name}`, backend }; }, errors,
+  });
+  assert.match(input.accept, /\.wav/); assert.match(input.accept, /\.mp3/); assert.match(input.accept, /\.flac/); assert.match(input.accept, /\.ogg/);
+  assert.doesNotMatch(input.accept, /m4a|aac/i);
+  assert.match(walk(container, item => item.className === 'audio-upload-name').textContent, /WAV、MP3、FLAC 或 OGG/);
+  for (const extension of ['wav', 'mp3', 'flac', 'ogg']) {
+    input.files = [{ name: `reference.${extension}`, size: 8, type: 'audio/octet-stream' }];
+    await input.listeners.change();
+    assert.equal(draft.values.voice_audio, `input/reference.${extension}`);
+  }
+  for (const extension of ['m4a', 'aac']) {
+    input.files = [{ name: `reference.${extension}`, size: 8, type: 'audio/mp4' }];
+    await input.listeners.change();
+    assert.equal(draft.values.voice_audio, 'input/reference.ogg');
+  }
+  assert.equal(uploaded.length, 4);
+  assert.equal(errors.length, 2);
+  assert.ok(errors.every(error => /WAV、MP3、FLAC、OGG/.test(error.message)));
 });

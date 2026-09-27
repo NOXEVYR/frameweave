@@ -1,5 +1,5 @@
 import { STUDIO_MODES, newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from './studio-state.mjs';
-import { audioIntegrationRequest, audioPackageChoices, buildAudioPackageRequest, renderAudioFields, initialAudioValues } from './audio-studio.mjs';
+import { audioIntegrationRequest, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields, initialAudioValues } from './audio-studio.mjs';
 
 const STORAGE = 'prismcanvas.studio.v1';
 const node = (tag, className = '', text) => { const n = document.createElement(tag); n.className = className; if (text !== undefined) n.textContent = text; return n; };
@@ -19,10 +19,24 @@ export function studioModelNames(names, families, key, kind, search = '') {
   });
 }
 
+export function studioSdxlEncoderNames(engine, key) {
+  const field = key === 'sdxl_clip_l' ? 'clip_name1' : key === 'sdxl_clip_g' ? 'clip_name2' : '';
+  const names = field && engine?.generation_options?.sdxl_clip?.[field];
+  return Array.isArray(names) ? [...new Set(names.map(item => typeof item === 'string' ? item : item?.name).filter(name => typeof name === 'string' && name))] : [];
+}
+
+export function studioExternalModelOptions(names, current) {
+  const candidates = [...new Set((Array.isArray(names) ? names : []).filter(name => typeof name === 'string' && name))];
+  const options = [{ value: '', label: '不使用外置覆盖', disabled: false }];
+  for (const name of candidates) options.push({ value: name, label: name, disabled: false });
+  if (current && !candidates.includes(current)) options.push({ value: current, label: `${current} · 当前列表未找到`, disabled: true, missing: true });
+  return options;
+}
+
 export function createGenerationStudio(host) {
   let active = 'canvas', drafts = Object.fromEntries(Object.keys(STUDIO_MODES).map(mode => [mode, newDraft(mode)]));
   let kindDrafts = {}, pending = {}, selectedJobs = {}, busy = new Set(), panels = new Map(), lastMedia = new Map(), lastCatalog = new Map(), initialized = false, storageWarned = false;
-  let audioDrafts = { voice: newAudioDraft(), music: newAudioDraft() }, audioCategory = 'voice', audioChoices = { stale: true, available: false, packages: [] }, audioCapability = null, audioCapabilitiesBackend = '', audioLoading = false, audioLoadError = '';
+  let audioDrafts = { voice: newAudioDraft(), music: newAudioDraft() }, audioCategory = 'voice', audioChoices = { stale: true, available: false, packages: [] }, audioCapability = null, audioCapabilitiesBackend = '', audioLoading = false, audioLoadError = '', audioContextEpoch = 0, audioObservedBackend = null;
   const root = document.querySelector('#studio-root');
   const save = (critical = false) => {
     try { localStorage.setItem(STORAGE, JSON.stringify({ drafts, kindDrafts, pending, selectedJobs, audioDrafts, audioCategory })); }
@@ -31,8 +45,15 @@ export function createGenerationStudio(host) {
   const action = (text, className, fn) => { const b = node('button', className, text); b.type = 'button'; b.addEventListener('click', () => Promise.resolve().then(fn).catch(host.reportError)); return b; };
   const pause = container => container?.querySelectorAll('video,audio').forEach(media => media.pause());
   const backend = () => host.engine().backend_url || '';
+  function syncAudioBackendContext() {
+    const current = backend();
+    if (audioObservedBackend !== null && audioObservedBackend !== current) audioContextEpoch++;
+    audioObservedBackend = current;
+    return current;
+  }
   function newAudioDraft() { return { package_id: '', values: {}, valuesByPackage: {}, mediaBackends: {}, mediaBackendsByPackage: {} }; }
   function open(mode) {
+    syncAudioBackendContext();
     if (mode !== 'canvas' && !STUDIO_MODES[mode] && mode !== 'audio') return;
     pause(root); active = mode; document.body.dataset.workspace = mode; document.body.classList.remove('canvas-focus');
     document.querySelectorAll('.workspace-nav[data-workspace]').forEach(button => { button.classList.toggle('active', button.dataset.workspace === mode); button.setAttribute('aria-pressed', String(button.dataset.workspace === mode)); });
@@ -95,7 +116,14 @@ export function createGenerationStudio(host) {
   function explicitModelSelector(mode, key, label, names, target, change) {
     const wrap = node('label', 'studio-field studio-model'), title = node('span', '', label), select = node('select');
     select.setAttribute('aria-label', label); select.dataset.model = key;
-    const update = () => setOptions(select, [['', '不使用外置覆盖'], ...names.map(name => [name, name])], target());
+    const update = () => {
+      const current = target(); select.replaceChildren();
+      for (const choice of studioExternalModelOptions(names(), current)) {
+        const option = node('option', '', choice.label); option.value = choice.value; option.disabled = choice.disabled;
+        if (choice.missing) option.dataset.missing = 'true'; select.append(option);
+      }
+      select.value = current || '';
+    };
     select.addEventListener('change', () => { change(select.value); save(); });
     wrap.append(title, select); wrap.updateCatalog = update; update(); return wrap;
   }
@@ -176,8 +204,8 @@ export function createGenerationStudio(host) {
       clipBlock.append(node('summary', '', 'SDXL 外置文本编码器'));
       if (clip.available && clip.types?.includes('sdxl')) {
         clipBlock.append(node('small', 'studio-help', '需要同时指定 CLIP-L 与 CLIP-G。留空则继续使用 Checkpoint 内置编码器。'));
-        for (const [key, label, names] of [['sdxl_clip_l', 'CLIP-L 文件', clip.clip_name1 || []], ['sdxl_clip_g', 'CLIP-G 文件', clip.clip_name2 || []]]) {
-          clipBlock.append(explicitModelSelector(mode, key, label, names, () => draft.models[key] || '', value => { draft.models[key] = value; }));
+        for (const [key, label] of [['sdxl_clip_l', 'CLIP-L 文件'], ['sdxl_clip_g', 'CLIP-G 文件']]) {
+          clipBlock.append(explicitModelSelector(mode, key, label, () => studioSdxlEncoderNames(host.engine(), key), () => draft.models[key] || '', value => { draft.models[key] = value; }));
         }
       } else {
         clipBlock.append(node('p', 'studio-help disabled-capability', clip.reason || `当前后端未声明兼容的 DualCLIPLoader（缺少实时 SDXL 类型或编码器选项）。${(clip.missing || []).join('、')}`));
@@ -250,7 +278,8 @@ export function createGenerationStudio(host) {
   function audioKey() { return `audio_${audioCategory}`; }
   function currentAudioPackage(category = audioCategory) { return audioChoices.packages.find(pack => pack.id === audioDrafts[category]?.package_id) || null; }
   async function refreshAudioCapabilities(force = false) {
-    const selectedBackend = backend();
+    const selectedBackend = syncAudioBackendContext();
+    if (force) audioContextEpoch++;
     if (audioLoading || !force && audioCapabilitiesBackend === selectedBackend && !audioChoices.stale) return;
     audioLoading = true; audioLoadError = '';
     try {
@@ -268,6 +297,7 @@ export function createGenerationStudio(host) {
   }
   function selectAudioPackage(category, packageId) {
     const draft = audioDrafts[category];
+    if (draft.package_id !== packageId) audioContextEpoch++;
     if (draft.package_id) {
       draft.valuesByPackage[draft.package_id] = structuredClone(draft.values || {});
       draft.mediaBackendsByPackage[draft.package_id] = { ...(draft.mediaBackends || {}) };
@@ -288,12 +318,12 @@ export function createGenerationStudio(host) {
     const layout = node('div', 'studio-layout'), form = node('div', 'studio-form'), results = node('div', 'studio-results');
     const categoryTabs = node('div', 'audio-category-tabs');
     for (const [id, label] of [['voice', '声音'], ['music', '音乐']]) {
-      const tab = action(label, `button audio-category-tab${audioCategory === id ? ' active' : ''}`, () => { audioCategory = id; saveAudioDrafts(); renderAudio(); refreshAudio(); });
+      const tab = action(label, `button audio-category-tab${audioCategory === id ? ' active' : ''}`, () => { if (audioCategory !== id) audioContextEpoch++; audioCategory = id; saveAudioDrafts(); renderAudio(); refreshAudio(); });
       tab.setAttribute('aria-pressed', String(audioCategory === id)); categoryTabs.append(tab);
     }
     form.append(categoryTabs);
     const block = node('section', 'studio-section'); block.append(node('h2', '', audioCategory === 'voice' ? '声音工作流' : '音乐工作流'));
-    const draft = audioDrafts[audioCategory];
+    const category = audioCategory, draft = audioDrafts[category], renderEpoch = audioContextEpoch;
     const picker = node('label', 'studio-field'), pickerTitle = node('span', '', 'AUDIO 工作流包'), select = node('select'); select.setAttribute('aria-label', `${audioCategory === 'voice' ? '声音' : '音乐'}工作流包`);
     const listed = audioChoices.packages || [];
     const options = [['', listed.length ? '选择一个工作流包' : '暂无本地工作流包']];
@@ -310,7 +340,15 @@ export function createGenerationStudio(host) {
       block.append(node('p', supported ? 'studio-help audio-package-ready' : 'studio-help disabled-capability', supported ? `当前后端已确认 ${chosen.audio_outputs?.length || chosen.capability?.audio_outputs?.length || 1} 个 AUDIO 输出。此页面选择用途为“${audioCategory === 'voice' ? '声音' : '音乐'}”，工作流包本身不做自动用途猜测。` : chosen.reason || '此包尚未通过当前后端实时 schema 检查；不会尝试提交。'));
       if (chosen.requirements?.nodes?.length) block.append(node('small', 'studio-help', `所需节点：${chosen.requirements.nodes.join('、')}`));
       const dynamic = node('div', 'audio-package-fields');
-      renderAudioFields(dynamic, { pack: chosen, draft, api: host.api, backend: backend(), currentBackend: backend, onChange: () => { draft.valuesByPackage[chosen.id] = structuredClone(draft.values); draft.mediaBackendsByPackage[chosen.id] = { ...draft.mediaBackends }; saveAudioDrafts(); refreshAudio(); }, reportError: host.reportError });
+      const expectedUploadContext = { epoch: renderEpoch, category, draft, packageId: chosen.id, backend: backend() };
+      renderAudioFields(dynamic, { pack: chosen, draft, api: host.api, backend: backend(), currentBackend: backend, isCurrent: ({ field }) => {
+        syncAudioBackendContext();
+        const currentDraft = audioDrafts[category], currentPack = currentAudioPackage(category);
+        return audioUploadContextMatches(expectedUploadContext, {
+          epoch: audioContextEpoch, category: audioCategory, draft: currentDraft, packageId: currentDraft.package_id,
+          backend: backend(), capabilitiesBackend: audioCapabilitiesBackend, stale: audioChoices.stale, fields: currentPack?.fields,
+        }, field.id);
+      }, onChange: () => { draft.valuesByPackage[chosen.id] = structuredClone(draft.values); draft.mediaBackendsByPackage[chosen.id] = { ...draft.mediaBackends }; saveAudioDrafts(); refreshAudio(); }, reportError: host.reportError });
       block.append(dynamic);
     }
     if (!audioLoading && !listed.some(item => item.eligible === true && item.available !== false)) {
@@ -336,6 +374,7 @@ export function createGenerationStudio(host) {
   }
   function refreshAudio() {
     if (!initialized || active !== 'audio') return;
+    syncAudioBackendContext();
     if (!audioLoading && audioCapabilitiesBackend !== backend()) { refreshAudioCapabilities(true); return; }
     const panel = panels.get('audio'); if (!panel) return;
     const key = audioKey(), draft = audioDrafts[audioCategory], pack = currentAudioPackage(), entry = pending[key], submitting = busy.has(key);
@@ -498,6 +537,7 @@ export function createGenerationStudio(host) {
     }
   }
   function refresh() {
+    syncAudioBackendContext();
     if (!initialized || active === 'canvas') return;
     if (active === 'audio') { refreshAudio(); return; }
     const panel = panels.get(active); if (!panel) return;

@@ -249,9 +249,10 @@ function save(immediate = false) {
       localStorage.setItem(JOB_MAP_KEY, JSON.stringify(jobNodes));
       localStorage.setItem(TITLE_STORAGE_KEY, projectTitle);
       $('#save-state').textContent = '浏览器草稿已保存';
-    } catch { $('#save-state').textContent = '存储已满，请导出'; }
+      return true;
+    } catch { $('#save-state').textContent = '草稿保存失败，请导出或保存本地版本'; return false; }
   };
-  if (immediate) write(); else saveTimer = setTimeout(write, 500);
+  if (immediate) return write(); else saveTimer = setTimeout(write, 500);
 }
 function undo() {
   finishKeyboardMove();
@@ -1619,7 +1620,7 @@ document.addEventListener('keydown', event => {
 });
 document.addEventListener('keyup', event => { if (event.key.startsWith('Arrow')) finishKeyboardMove(); if (event.code === 'Space') { spaceDown = false; canvas.classList.toggle('hand', tool === 'hand'); } });
 window.addEventListener('blur', () => { finishKeyboardMove(); spaceDown = false; closeNodeMenu(); canvas.classList.toggle('hand', tool === 'hand'); });
-window.addEventListener('beforeunload', event => { save(true); releaseMedia(document); if (nativeEditor.isOpen()) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { const saved = save(true); releaseMedia(document); if (!saved || nativeEditor.isOpen()) { event.preventDefault(); event.returnValue = ''; } });
 window.addEventListener('pagehide', () => { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); if ($('#aiDialog').open) $('#aiDialog').close(); clearAiConnection(); document.querySelectorAll('video,audio').forEach(media => media.pause()); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); }
@@ -1727,6 +1728,7 @@ async function initialize() {
   try {
     const bootstrap = await api('/api/bootstrap'); csrf = bootstrap.csrf; settings = { ...settings, ...bootstrap.settings };
     if (bootstrap.version) $('.alpha').textContent = bootstrap.version;
+    workspaceTools.showRecovery(bootstrap.recovery_warnings || []);
     await studio.init();
     await refreshEngine(); renderInspector(); await pollJobs();
     loadPackages().catch(reportError);
@@ -1737,7 +1739,7 @@ async function initialize() {
   // A minimized editor still owns its draft and workflow scheduler.
   setInterval(() => { api('/api/heartbeat').catch(() => {}); }, 30000);
 }
-const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { if (hasActiveJobs() || workflowCanvas.isRunning() || studio.hasPending()) throw new Error('请等待生成与画布调度完成，并查询待确认提交后再退出。'); save(true); } });
+const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { if (hasActiveJobs() || workflowCanvas.isRunning() || studio.hasPending()) throw new Error('请等待生成与画布调度完成，并查询待确认提交后再退出。'); if (!save(true)) throw new Error('浏览器草稿保存失败，本次退出已取消。请先导出或保存本地画布版本，确认后再手动关闭窗口。'); } });
 const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
 initializeCanvasActions();
 studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
@@ -1746,9 +1748,13 @@ workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () =>
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });
 workflowCanvas.init();
-const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle: () => workflowCanvas.buildBundle(),
+const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle: nodeId => workflowCanvas.buildBundle(nodeId),
   async install(bundle, target) {
     if (workflowCanvas.isRunning() || nativeEditor.isOpen()) throw new Error('请先结束当前画布调度或关闭内部编辑器，再载入配置');
+    const identity = currentCanvasIdentity();
+    const canReplace = () => target && getNode(target.id) === target && !target.data.package_id && !graph.edges.some(edge => edge.source === target.id || edge.target === target.id);
+    const checkCapacity = () => { if (!canReplace() && graph.nodes.length >= 500) throw new Error('画布最多 500 个节点，请先移除节点再载入配置'); };
+    checkCapacity();
     const incoming = parseGraph(bundle.canvas).nodes[0];
     const entry = bundle.packages.find(item => item.id === incoming.data.package_id);
     const {package: pack} = await api('/api/packages', entry.source_json ? {source_json:entry.source_json} : entry.document);
@@ -1758,7 +1764,9 @@ const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle:
       editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json})).id;
     }
     await loadPackages();
-    const replace = target && getNode(target.id) === target && !target.data.package_id && !graph.edges.some(edge => edge.source === target.id || edge.target === target.id);
+    if (identity !== currentCanvasIdentity()) throw new Error('画布已切换，配置未放入新画布；已登记的工作流仍在包库');
+    checkCapacity();
+    const replace = canReplace();
     const node = replace ? target : addPackageNode(pack);
     mutate(() => {
       node.data = {...structuredClone(incoming.data), package_id:pack.id,

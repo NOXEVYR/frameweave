@@ -10,6 +10,7 @@ export function createUpdateCenter(host) {
       currentVersion = data.current_version; stagedVersion = data.staged?.version || ''; autoUpdate = data.auto_update;
       status.textContent = data.error || data.last_error || (data.busy ? '正在检查 / 下载并校验…' : data.staged?.verified ? `版本 ${data.staged.version} 已校验，可退出安装` : data.update_available ? `发现 ${data.latest_version} · ${Math.round((data.release?.bytes || 0) / 1024 / 1024 * 10) / 10} MiB` : data.last_checked ? `当前 ${data.current_version} · 无更高版本` : `当前 ${data.current_version} · 尚未检查`);
       document.querySelector('#update-check').disabled = data.busy;
+      if (data.staged?.recovery_note) status.textContent += ` ${data.staged.recovery_note}`;
       document.querySelector('#update-download').disabled = data.busy || !data.update_available || Boolean(data.staged?.verified);
       document.querySelector('#update-install').disabled = data.busy || !data.staged?.verified || !data.install_supported;
     } catch (error) { status.textContent = error.message; }

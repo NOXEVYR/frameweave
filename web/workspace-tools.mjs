@@ -22,9 +22,14 @@ export function createWorkspaceTools(host) {
   }
   let library, results, gpuInfo, profile, name, list, location, resultList, resultFilter, saveButton;
   let snapshotBusy = false;
+  let canvasOffset = 0, canvasSearch, previousCanvases, nextCanvases, listRevision = 0, searchTimer, recoveryDialog, recoveryButton;
   async function refreshCanvases() {
-    const data = await host.api('/api/canvases');
-    location.textContent = `本地保存目录：${data.directory}。共 ${data.total} 个版本，显示最近 200 个。${data.unreadable ? `另有 ${data.unreadable} 个记录暂不可读，原文件已保留。` : ''}`;
+    const revision = ++listRevision;
+    const data = await host.api(`/api/canvases?offset=${canvasOffset}&q=${encodeURIComponent(canvasSearch.value)}`);
+    if (revision !== listRevision) return;
+    previousCanvases.disabled = !canvasOffset; nextCanvases.disabled = data.next_offset == null;
+    nextCanvases.dataset.offset = data.next_offset ?? '';
+    location.textContent = `本地保存目录：${data.directory}。共 ${data.total} 个版本，匹配 ${data.matched ?? data.total} 个，显示 ${data.canvases.length ? canvasOffset + 1 : 0}–${canvasOffset + data.canvases.length}。${data.unreadable ? `另有 ${data.unreadable} 个记录暂不可读，原文件已保留。` : ''}`;
     list.replaceChildren();
     if (!data.canvases.length) list.append(el('p', 'muted', '还没有保存的画布。输入名称，保存当前画布与它引用的工作流包。'));
     for (const item of data.canvases) {
@@ -39,7 +44,7 @@ export function createWorkspaceTools(host) {
     }
   }
   async function openCanvases() {
-    name.value = host.title(); library.showModal(); list.textContent = '正在读取画布库…'; await refreshCanvases();
+    name.value = host.title(); canvasOffset = 0; canvasSearch.value = ''; library.showModal(); list.textContent = '正在读取画布库…'; await refreshCanvases();
   }
   async function saveCanvas() {
     if (snapshotBusy) return;
@@ -48,6 +53,7 @@ export function createWorkspaceTools(host) {
     try {
       const document = await host.workflow().buildBundle(); document.name = title;
       await host.api('/api/canvases', { document }); host.setTitle(title);
+      canvasOffset = 0; canvasSearch.value = '';
       host.toast('已保存新版本，之前的画布版本仍保留'); await refreshCanvases();
     } finally { snapshotBusy = false; saveButton.disabled = false; }
   }
@@ -86,7 +92,12 @@ export function createWorkspaceTools(host) {
     const field = el('label', 'field', '画布名称'); name = el('input'); name.id = 'canvas-save-name'; name.maxLength = 120; name.setAttribute('aria-label', '画布名称'); field.append(name);
     saveButton = button('保存当前画布为新版本', 'canvas-save-version', saveCanvas, 'button primary');
     list = el('div', 'workspace-library-list'); list.id = 'canvas-library-list'; location = el('p', 'field-help path-text');
-    library.append(el('p', 'muted', '保存节点、连线、视角及引用的工作流定义；不复制模型或媒体。载入不会启动生成，原画布可以撤销恢复。'), field, saveButton, location, list); frameDialog(library);
+    canvasSearch = el('input'); canvasSearch.type = 'search'; canvasSearch.placeholder = '搜索全部已保存画布'; canvasSearch.setAttribute('aria-label', '搜索全部画布');
+    canvasSearch.addEventListener('input', () => { ++listRevision; clearTimeout(searchTimer); searchTimer = setTimeout(() => { canvasOffset = 0; refreshCanvases().catch(host.reportError); }, 200); });
+    previousCanvases = button('上一页', 'canvas-previous', () => { canvasOffset = Math.max(0, canvasOffset - 200); return refreshCanvases(); });
+    nextCanvases = button('下一页', 'canvas-next', () => { canvasOffset = Number(nextCanvases.dataset.offset); return refreshCanvases(); });
+    const paging = el('div', 'wrap-actions'); paging.append(previousCanvases, nextCanvases);
+    library.append(el('p', 'muted', '保存节点、连线、视角及引用的工作流定义；不复制模型或媒体。载入不会启动生成，原画布可以撤销恢复。'), field, saveButton, canvasSearch, location, list, paging); frameDialog(library);
     document.querySelector('.project-actions').prepend(button('我的画布 / 保存', 'canvas-library-button', openCanvases, 'button primary compact'));
     results = dialog('results-dialog', '生成产物');
     resultFilter = el('select'); resultFilter.id = 'result-media-filter'; resultFilter.setAttribute('aria-label', '产物类型');
@@ -100,6 +111,15 @@ export function createWorkspaceTools(host) {
     for (const value of ['auto', '8', '12', '16', '24', '32', '48']) { const o = el('option', '', value === 'auto' ? '自动 · 当前 GPU 可用显存' : `${value} GiB 显存预算`); o.value = value; profile.append(o); }
     gpuInfo = el('p', 'field-help'); section.append(profile, gpuInfo, el('p', 'field-help', '保存预算后，在图片或视频生成页点击“按 GPU 建议填充”。保留你手动设置的模型、种子和提示词。'), button('快捷键与操作说明', 'settings-shortcuts', () => document.querySelector('#help-dialog').showModal()));
     head.after(section); document.querySelectorAll('dialog.modal').forEach(frameDialog);
+    recoveryDialog = dialog('recovery-dialog', '本地记录恢复提醒');
+    recoveryButton = button('查看本地记录恢复提醒', 'recovery-details', () => recoveryDialog.showModal());
+    recoveryButton.hidden = true; section.append(recoveryButton);
   }
-  return { init, openCanvases, openResults, refreshSettings };
+  function showRecovery(warnings) {
+    if (!Array.isArray(warnings) || !warnings.length) return;
+    for (const warning of warnings) recoveryDialog.append(el('p', 'form-note', warning));
+    recoveryDialog.append(el('p', 'muted', '有效记录已恢复。请先保留恢复备份，避免直接删除或覆盖原文件；此提醒也可在软件设置中重新打开。'));
+    frameDialog(recoveryDialog); recoveryButton.hidden = false; recoveryDialog.showModal();
+  }
+  return { init, openCanvases, openResults, refreshSettings, showRecovery };
 }

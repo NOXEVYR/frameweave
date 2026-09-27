@@ -19,6 +19,21 @@ def bundle(name="Daily board"):
 
 
 class CanvasStoreTests(unittest.TestCase):
+    def test_older_canvases_remain_searchable_and_pageable(self):
+        for i in range(203):
+            self.store.save(bundle(f'版本 {i:03d}'))
+        first = self.store.list()
+        second = self.store.list(offset=first['next_offset'])
+        self.assertEqual(len(first['canvases']), 200)
+        self.assertEqual(len(second['canvases']), 3)
+        self.assertEqual(len({item['id'] for item in first['canvases'] + second['canvases']}), 203)
+        oldest = self.store.list(query='版本 000')
+        self.assertEqual(oldest['matched'], 1)
+        self.assertEqual(oldest['canvases'][0]['name'], '版本 000')
+        for values in ({'offset': -1}, {'limit': 201}, {'offset': True}, {'query': 'x' * 121}):
+            with self.assertRaises(ValueError):
+                self.store.list(**values)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

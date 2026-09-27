@@ -317,6 +317,37 @@ class EditorProxyTests(unittest.TestCase):
             self.assertEqual(status, 403, (method, path))
         self.assertEqual(len(self.backend_server.records), before)
 
+    def test_manager_component_loads_allows_only_empty_body_post(self):
+        cookie = self._bootstrap()
+        for path in ("/manager/component/loads", "/api/manager/component/loads"):
+            before = len(self.backend_server.records)
+            status, _, body = self._raw_request(
+                "POST", path, cookie=cookie,
+                headers={"Origin": self.origin}, body=b"")
+            self.assertEqual(status, 200, path)
+            self.assertEqual(json.loads(body), {"accepted": 0})
+            self.assertEqual(len(self.backend_server.records), before + 1)
+            method, forwarded_path, headers = self.backend_server.records[-1]
+            self.assertEqual((method, forwarded_path), ("POST", path))
+            self.assertEqual(headers.get("Content-Length", "0"), "0")
+
+        denied = (
+            ("POST", "/manager/component/loads?path=components.json", b"" , {}),
+            ("POST", "/api/manager/component/loads?path=components.json", b"", {}),
+            ("POST", "/manager/component/loads", b"{}", {}),
+            ("POST", "/api/manager/component/loads", b"{}", {}),
+            ("POST", "/manager/component/loads", None, {"Transfer-Encoding": "chunked"}),
+            ("PUT", "/manager/component/loads", b"", {}),
+            ("POST", "/manager/component/save", b"", {}),
+        )
+        forwarded = len(self.backend_server.records)
+        for method, path, request_body, extra_headers in denied:
+            status, _, _ = self._raw_request(
+                method, path, cookie=cookie,
+                headers={"Origin": self.origin, **extra_headers}, body=request_body)
+            self.assertIn(status, {400, 403}, (method, path, status))
+        self.assertEqual(len(self.backend_server.records), forwarded)
+
     def test_websocket_is_confined_to_ws_and_relays_raw_frames(self):
         cookie = self._bootstrap()
         client = socket.create_connection(("127.0.0.1", int(self.host.rsplit(":", 1)[1])), timeout=5)

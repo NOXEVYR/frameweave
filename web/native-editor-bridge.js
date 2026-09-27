@@ -6,7 +6,81 @@ const config = window.__PRISM_EDITOR__;
 const state = { ready: false, loaded: false, claimed: false, source: null, lostOnLoad: [], pending: 0, seen: new Set(), tail: Promise.resolve(), nativeTail: Promise.resolve() };
 const authorizedLoads = new WeakSet();
 const clone = value => JSON.parse(JSON.stringify(value));
-const graph = () => app.rootGraph || app.graph;
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function canonicalJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJSON(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function validateApiPrompt(value) {
+  let prompt;
+  try {
+    const raw = JSON.stringify(value);
+    if (typeof raw !== 'string' || new TextEncoder().encode(raw).length > 16 * 1024 * 1024) throw new Error();
+    prompt = JSON.parse(raw);
+  } catch { throw new Error('invalid-api-prompt'); }
+  if (!isRecord(prompt) || !Object.keys(prompt).length
+      || Object.values(prompt).some(node => !isRecord(node)
+        || typeof node.class_type !== 'string' || !node.class_type
+        || !isRecord(node.inputs))) throw new Error('invalid-api-prompt');
+  return prompt;
+}
+function apiPromptsEquivalent(expected, actual) {
+  const expectedPrompt = validateApiPrompt(expected);
+  const actualPrompt = validateApiPrompt(actual);
+  for (const [nodeId, expectedNode] of Object.entries(expectedPrompt)) {
+    const actualNode = actualPrompt[nodeId];
+    const actualMeta = actualNode?._meta;
+    const expectedMeta = expectedNode._meta;
+    // ComfyUI's graphToPrompt adds its UI title to every node. Ignore only
+    // that newly-added display field; declared titles and all other metadata
+    // remain part of the semantic comparison.
+    if (isRecord(actualMeta) &&
+        !(isRecord(expectedMeta) && Object.hasOwn(expectedMeta, 'title')) &&
+        typeof actualMeta.title === 'string' && actualMeta.title.length > 0) {
+      delete actualMeta.title;
+      if (!isRecord(expectedMeta) && Object.keys(actualMeta).length === 0) delete actualNode._meta;
+    }
+  }
+  return canonicalJSON(expectedPrompt) === canonicalJSON(actualPrompt);
+}
+function graph() {
+  // New ComfyUI frontends expose non-logging readiness accessors. Prefer them:
+  // reading `app.rootGraph`/`app.graph` while GraphCanvas is mounting logs an
+  // initialization error and can hand API imports an unconfigured graph.
+  if ('rootGraphOrUndefined' in app) return app.rootGraphOrUndefined || null;
+  if (app.isGraphReady === false) return null;
+  try { return app.rootGraph || app.graph || null; } catch { return null; }
+}
+function canvasReady(root) {
+  let canvas;
+  if ('canvasOrUndefined' in app) canvas = app.canvasOrUndefined;
+  else {
+    if (app.isGraphReady === false) return false;
+    try { canvas = app.canvas; } catch { return false; }
+  }
+  if (!canvas) return false;
+  const canvasRef = app.canvasElRef;
+  if (canvasRef && !canvasRef.value) return false;
+  const element = canvasRef?.value || canvas.canvas;
+  if (element?.isConnected === false) return false;
+  return !canvas.graph || !root || canvas.graph === root;
+}
+function frontendReady() {
+  const root = graph();
+  if (!root || !window.LiteGraph?.registered_node_types) return false;
+  // ComfyUI's current GraphView sets the module-level canvas before publishing
+  // the mounted app on window. The editor's Pinia canvas store is still null
+  // during that gap, so `loadApiJson` would fail in beforeLoadNewGraph().
+  if (window.app !== app) return false;
+  if (window.graph && window.graph !== root) return false;
+  if (app.vueAppReady === false) return false;
+  // Current ComfyUI frontends keep this splash element mounted until the
+  // startup workflow and restored tabs have finished loading. The app/canvas
+  // objects become visible earlier, while startup can still clear the graph.
+  if (typeof document !== 'undefined' && document.querySelector?.('#splash-loader')?.isConnected) return false;
+  return canvasReady(root);
+}
 const blockedQueue = async () => { throw new Error('请返回棱光画布执行工作流；此窗口仅用于编辑。'); };
 
 function send(message) {
@@ -164,7 +238,7 @@ async function patchWidgets(patches) {
     root.change?.();
     app.canvas?.setDirty?.(true, true);
     return { result: { applied: prepared.map(({ identity }) => ({ node_id: String(identity.node_id), widget_name: identity.widget_name })), unsupported: [] } };
-  } catch {
+  } catch (error) {
     let rolledBack = false;
     for (const item of prepared) item.widget.value = item.previousValue;
     try {
@@ -174,6 +248,50 @@ async function patchWidgets(patches) {
       rolledBack = true;
     } catch { state.loaded = false; }
     return { error: rolledBack ? '控件联动失败，已恢复修改前的工作流。' : '控件联动失败且恢复失败，请重新加载工作流。', result: { applied: [], unsupported: prepared.map(({ identity }) => ({ ...identity, reason: 'callback_failed' })), rolled_back: rolledBack } };
+  }
+}
+
+async function importApiPrompt(value) {
+  const prototypeImporter = Object.getPrototypeOf(app)?.loadApiJson;
+  if (typeof prototypeImporter !== 'function') throw new Error('api-import-unavailable');
+  const prompt = validateApiPrompt(value);
+  await state.nativeTail;
+  const before = clone(graph().serialize());
+  try {
+    // Invoke ComfyUI's awaited implementation directly. Some extension
+    // instance wrappers call it without returning its Promise.
+    await prototypeImporter.call(app, prompt, 'PrismCanvas preset', { deferWarnings: true });
+    await state.nativeTail;
+    const workflow = clone(graph().serialize());
+    const summary = summarize(workflow);
+    if (summary.missing.length) throw new Error('missing-node-types');
+    // Pass the serialized root graph explicitly. Current ComfyUI frontends may
+    // have another active canvas object while the native root graph is loaded.
+    const compiled = await app.graphToPrompt(graph());
+    if (!compiled?.workflow || !isRecord(compiled.output) || !Object.keys(compiled.output).length) {
+      throw new Error('invalid-output');
+    }
+    // Deliberately include every API field, including fields unknown to this
+    // bridge. Only object key order is irrelevant; arrays and IDs stay exact.
+    if (!apiPromptsEquivalent(prompt, compiled.output)) {
+      throw new Error('semantic-mismatch');
+    }
+    state.source = workflow;
+    state.lostOnLoad = [];
+    return { workflow, output: clone(compiled.output), ...describeControls(compiled.output), ...summary };
+  } catch {
+    try {
+      authorizedLoads.add(before);
+      await app.loadGraphData(before, false, false);
+      await state.nativeTail;
+      state.source = before;
+      state.lostOnLoad = [];
+      state.loaded = true;
+    } catch {
+      state.loaded = false;
+      throw new Error('api-import-rollback-failed');
+    }
+    throw new Error('api-import-unverified');
   }
 }
 
@@ -205,7 +323,9 @@ async function handle(message) {
     } else {
       if (!state.loaded) throw new Error('not-loaded');
       await state.nativeTail;
-      if (action === 'patch') {
+      if (action === 'importApi') {
+        result = await importApiPrompt(message.prompt);
+      } else if (action === 'patch') {
         send({ requestId, action, ...await patchWidgets(message.patches) });
         return;
       }
@@ -221,12 +341,12 @@ async function handle(message) {
         const compiled = await app.graphToPrompt();
         if (!compiled?.workflow || !compiled?.output || typeof compiled.output !== 'object' || !Object.keys(compiled.output).length) throw new Error('invalid-output');
         result = { workflow: compiled.workflow, output: compiled.output, ...describeControls(compiled.output) };
-      } else throw new Error('invalid-action');
+      } else if (action !== 'importApi') throw new Error('invalid-action');
     }
     send({ requestId, action, result });
-  } catch {
+  } catch (error) {
     // Native errors can include prompts, local paths, or entire node payloads.
-    const errors = { load: '工作流加载失败，请检查文件格式与节点扩展。', snapshot: '无法保存编辑快照，请先成功加载工作流。', compile: '原生工作流编译失败，请检查节点与连线后重试。', patch: '参数回写失败，请先成功加载工作流并检查控件。' };
+    const errors = { load: '工作流加载失败，请检查文件格式与节点扩展。', snapshot: '无法保存编辑快照，请先成功加载工作流。', compile: '原生工作流编译失败，请检查节点与连线后重试。', patch: '参数回写失败，请先成功加载工作流并检查控件。', importApi: error.message === 'api-import-unavailable' ? '当前 ComfyUI 前端不支持 API 工作流导入，未修改原生工作流。' : error.message === 'api-import-rollback-failed' ? '预设转换失败且无法恢复临时图，请关闭此编辑器后重新打开原工作流。' : error.message === 'invalid-api-prompt' ? '预设 API 工作流格式无效，未修改原生工作流。' : 'ComfyUI 前端无法无损转换此预设，已恢复原工作流；预设内容仍保留。' };
     send({ requestId, action, error: errors[action] || '不支持的编辑器请求。' });
   }
 }
@@ -234,7 +354,7 @@ async function handle(message) {
 function receive(event) {
   const message = event.data;
   if (event.source !== window.parent || event.origin !== config.parentOrigin || !message || message.source !== 'prism-parent' || message.nonce !== config.bridgeNonce) return;
-  if (typeof message.requestId !== 'string' || !message.requestId || message.requestId.length > 128 || !['load', 'snapshot', 'compile', 'patch'].includes(message.action)) return;
+  if (typeof message.requestId !== 'string' || !message.requestId || message.requestId.length > 128 || !['load', 'snapshot', 'compile', 'patch', 'importApi'].includes(message.action)) return;
   if (state.seen.has(message.requestId)) {
     send({ requestId: message.requestId, action: message.action, error: '重复的编辑器请求已忽略。' });
     return;
@@ -264,8 +384,8 @@ if (config && typeof config.parentOrigin === 'string' && typeof config.bridgeNon
       // later startup restore. Document ownership above handles that lifecycle.
       let attempts = 0;
       const ready = () => {
-        if (!graph() || !window.LiteGraph?.registered_node_types) {
-          if (++attempts < 200) window.setTimeout(ready, 25);
+        if (!frontendReady()) {
+          if (++attempts < 2000) window.setTimeout(ready, 25);
           return;
         }
         app.queuePrompt = blockedQueue;

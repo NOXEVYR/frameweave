@@ -6,6 +6,8 @@
 
 功能完整、稳定和易用优先，资源占用适度控制。必要组件按实际成本引入，优先复用已有模型和引擎，避免重复权重与无意义的后台工作。
 
+> **0.11.4 源码预览**：图片和视频可直接拖入画布或上传到素材节点，导入立即预览；输入端口按类型、用途和顺序分开，支持按住鼠标拖线。生成结果可接入 Qwen 多图编辑或重绘，内置预设可进入 ComfyUI 修改并应用到外层。画布、生成工作台和队列显示当前节点、采样步数与后端中间预览。见[素材、连接与实时生成指南](docs/CANVAS_MEDIA.md)。Windows 稳定包仍为 0.11.1。
+
 > **0.11.3 源码预览**：完成一轮整体可用性检查，修复历史恢复、参考素材跨重启预览、保存失败退出、旧画布与配置搜索、音频上传竞争、编码器候选刷新及损坏更新包重试。详见[检查范围、修复与剩余限制](docs/USABILITY_AUDIT.md)。Windows 候选尚未完成启动验收，稳定下载与自动更新仍为 0.11.1。
 
 > **0.11.2**：原生导入后直接提取外层参数，配置独立保存和复用；SaveVideo 根据当前后端校验格式与编码参数。左键空白拖动框选，中键或空格＋左键平移；未配置节点会在整链运行前阻止提交。
@@ -32,7 +34,7 @@
 
 ## 开始使用
 
-**[下载 Windows 0.11.1 稳定便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip)** · [下载 0.11.3 预览源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.3-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
+**[下载 Windows 0.11.1 稳定便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip)** · [下载 0.11.4 预览源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.4-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
 
 新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/NOXEVYR/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 

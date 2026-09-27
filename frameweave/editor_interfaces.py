@@ -27,10 +27,13 @@ _TYPE_GROUPS = {
     "sampling": "采样参数",
     "size": "尺寸与时长",
     "custom": "其他参数",
+    "media": "参考素材",
 }
 
 
 def _role(field, node_type, node_title=""):
+    if field.get("type") == "video":
+        return "video_reference", _TYPE_GROUPS["media"]
     name = field["input"].lower()
     label = field.get("label", "")
     node_name = node_type.lower()
@@ -92,7 +95,7 @@ def inspect_interface(prompt, info):
     fields = copy.deepcopy(inspected["fields"])
     for field in fields:
         node = normalized[field["node_id"]]
-        if field["type"] in {"image", "audio"}:
+        if field["type"] in {"image", "audio", "video"}:
             field["default"] = copy.deepcopy(node["inputs"][field["input"]])
         meta = prompt.get(field["node_id"], {}).get("_meta", {}) if isinstance(prompt, dict) else {}
         title = meta.get("title", "") if isinstance(meta, dict) else ""

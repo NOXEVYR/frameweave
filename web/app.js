@@ -1,7 +1,8 @@
+import { liveProgressText } from './job-progress.mjs';
 import { createUpdateCenter } from './update-center.mjs';
 document.title = `棱光 PrismCanvas · 工作区 ${location.port}`;
 import { createEngineCenter } from './engine-center.mjs';
-import { createNode, createDemo, connect, removeNodes, generationPayload, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
+import { createNode, createDemo, connect, removeNodes, generationPayload, generationInputPorts, edgeInputField, canConnect, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
 import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, redactLocalText, publicChecksReport } from './packages.mjs';
 import { filterJobs, filterPackages } from './library.mjs';
 import { placeFragment } from './canvas-layout.mjs';
@@ -14,6 +15,7 @@ import { chooseEditorInterface, resolveEditorConflicts } from './editor-interfac
 import { editorConnectionSummary, applyEditorInterfaceGraph } from './editor-canvas-interface.mjs';
 import { chooseWorkflowBackend, workflowBackendTarget } from './editor-backend-picker.mjs';
 import { createWorkflowConfigurations } from './workflow-configurations.mjs';
+import { validateMediaFile, importPosition, prepareLocalImages } from './canvas-images.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
@@ -49,7 +51,13 @@ const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copy
   applyInterface: configureNativeInterface,
   releaseSession(session_id) { fetch('/api/editor-sessions/close', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-FW-Token': csrf }, body: JSON.stringify({ session_id }), keepalive: true }).catch(() => {}); },
   async applied(node, result) {
-    const updated = applyEditorInterfaceGraph(graph, node.id, result);
+    let source = graph;
+    if (node.data.kind !== 'package') {
+      source = clone(graph);
+      for(const edge of source.edges.filter(e=>e.target===node.id)) edge.targetField=edgeInputField(graph,edge);
+      source.nodes.find(n=>n.id===node.id).data.kind='package';
+    }
+    const updated = applyEditorInterfaceGraph(source, node.id, result);
     packages = [...packages.filter(pack => pack.id !== result.package.id), result.package];
     mutate(() => {
       graph = updated;
@@ -58,11 +66,13 @@ const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copy
 });
 
 async function configureNativeInterface(node, compiled = null, session = null) {
-  const previousFields = packages.find(pack => pack.id === node.data.package_id)?.fields || [];
+  const previousFields = packages.find(pack => pack.id === node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
   const prefix = `/api/editor-workflows/${node.data.editor_id}`;
   const info = await api(`${prefix}/interface`, compiled ? { prompt: compiled.output } : { package_id: node.data.package_id, values: node.data.packageValues, previous_baseline: node.data.editor_baseline });
   const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
-  const connections = editorConnectionSummary(graph, node.id, oldOutputs);
+  const connectionGraph=clone(graph);
+  if(node.data.kind!=='package') for(const edge of connectionGraph.edges.filter(e=>e.target===node.id)) edge.targetField=edgeInputField(graph,edge);
+  const connections = editorConnectionSummary(connectionGraph, node.id, oldOutputs);
   if (!compiled) info.outputs = info.outputs.map(item => ({ ...item, label: oldOutputs.find(old => old.id === item.id)?.label || item.label }));
   const selection = await chooseEditorInterface({ ...info, previousFields, previousValues: node.data.packageValues, previousBaseline: node.data.editor_baseline, selectedOutputs: oldOutputs.length ? oldOutputs : node.data.editor_outputs || [], connections });
   if (!selection) return null;
@@ -112,6 +122,8 @@ let connecting = null;
 let tool = 'select';
 let spaceDown = false;
 let uploadTarget = null;
+const referenceImports = new Map();
+const referenceImportTickets = new Map();
 let workflowTarget = null;
 let saveTimer;
 let pollBusy = false;
@@ -359,8 +371,9 @@ function drawMinimap() {
 }
 function edgePath(a, b) { const spread = Math.max(65, Math.abs(b.x - a.x) * .45); return `M ${a.x} ${a.y} C ${a.x + spread} ${a.y}, ${b.x - spread} ${b.y}, ${b.x} ${b.y}`; }
 function svgElement(tag, attributes) { const element = document.createElementNS('http://www.w3.org/2000/svg', tag); Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, String(value))); return element; }
-function portPoint(node, direction) {
-  const port = document.getElementById(`fw-node-${node.id}`)?.querySelector(`.port.${direction}`);
+function portPoint(node, direction, field = '') {
+  const ports = [...(document.getElementById(`fw-node-${node.id}`)?.querySelectorAll(`.port.${direction}`) || [])];
+  const port = ports.find(item => item.dataset.field === field) || ports[0];
   if (port?.getClientRects().length) {
     const rect = port.getBoundingClientRect();
     return viewPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
@@ -372,15 +385,15 @@ function renderEdges() {
   edgeCanvasVisible = canvas.offsetParent !== null;
   edgesLayer.replaceChildren();
   const anchors = new Map();
-  const anchor = (node, direction) => {
-    const key = `${node.id}:${direction}`;
-    if (!anchors.has(key)) anchors.set(key, portPoint(node, direction));
+  const anchor = (node, direction, field = '') => {
+    const key = `${node.id}:${direction}:${field}`;
+    if (!anchors.has(key)) anchors.set(key, portPoint(node, direction, field));
     return anchors.get(key);
   };
   for (const edge of graph.edges) {
     const from = getNode(edge.source), to = getNode(edge.target);
     if (!from || !to) continue;
-    const a = anchor(from, 'output'), b = anchor(to, 'input');
+    const a = anchor(from, 'output'), b = anchor(to, 'input', edgeInputField(graph, edge));
     const path = edgePath(a, b);
     const hit = svgElement('path', { d: path, class: 'edge-hit', 'data-edge-id': edge.id });
     hit.addEventListener('click', event => { event.stopPropagation(); selectedEdge = edge.id; selected.clear(); renderSelection(); renderEdges(); renderInspector(); });
@@ -442,31 +455,62 @@ function preview(output) {
   $('#preview-download').download = output.filename || 'frameweave-output';
   if (!$('#preview-dialog').open) $('#preview-dialog').showModal();
 }
-function port(node, direction) {
+function beginConnection(node) {
+  const point = portPoint(node, 'output');
+  connecting = {source:node.id,point:{x:point.x+80,y:point.y}};
+  canvas.classList.add('connecting'); $('#canvas-hint').textContent = '按住拖到对应输入端口后松手 · 也可依次点击 · Esc 取消'; renderEdges(); renderSelection();
+}
+function finishConnection(node, field = '') {
+  if (!connecting) return;
+  const source = connecting.source;
+  if (node.data.kind === 'package' && !field) { cancelConnection(); return workflowCanvas.connectNodes(source,node.id); }
+  const options = field ? {targetField:field} : {};
+  if (field && getNode(source)?.type === 'prompt') options.sourceField = field === 'negative' ? 'negative' : 'text';
+  mutate(() => connect(graph,source,node.id,options)); cancelConnection(); toast('节点已连接');
+}
+let portDrag = null, suppressPortClick = false;
+const expandedInputs = new Set();
+function port(node, direction, field = '', label = '') {
   const element = button('', `port ${direction}${connecting?.source === node.id && direction === 'output' ? ' armed' : ''}`, () => {
-    if (direction === 'output') {
-      const point = portPoint(node, 'output');
-      connecting = { source: node.id, point: { x: point.x + 80, y: point.y } };
-      canvas.classList.add('connecting');
-      $('#canvas-hint').textContent = '点击目标输入端口连接 · Esc 取消';
-      renderEdges(); renderSelection();
-    } else if (connecting) {
-      const source = connecting.source;
-      if (node.data.kind === 'package') { cancelConnection(); return workflowCanvas.connectNodes(source, node.id); }
-      mutate(() => connect(graph, source, node.id));
-      cancelConnection(); toast('节点已连接');
-    } else toast('先点击来源节点的右侧输出端口');
-  }, `${node.data.title} · ${direction === 'input' ? '输入' : '输出'}端口`);
+    if (suppressPortClick) { suppressPortClick = false; return; }
+    if (direction === 'output') beginConnection(node);
+    else if (connecting) return finishConnection(node,field);
+    else toast('从来源节点右侧端口拖到此处即可连接');
+  }, `${node.data.title} · ${label || (direction === 'input' ? '输入' : '输出')}端口`);
   element.dataset.port = direction;
+  element.dataset.field = field;
+  element.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || direction !== 'output') return;
+    event.stopPropagation(); beginConnection(node); portDrag = {id:event.pointerId,x:event.clientX,y:event.clientY,moved:false};
+    canvas.setPointerCapture(event.pointerId); event.preventDefault();
+  });
   return element;
+}
+function inputPorts(node, body) {
+  const fields = generationInputPorts(node,graph).filter(field=>['text','image','video'].includes(field.type));
+  if (!fields.length) return;
+  const list = el('div','node-input-ports');
+  const connected = new Set(graph.edges.filter(e=>e.target===node.id).map(e=>edgeInputField(graph,e)));
+  const imageFields = fields.filter(f=>f.type==='image');
+  const showCount = Math.max(2,1+imageFields.reduce((max,f,i)=>connected.has(f.id)?Math.max(max,i+1):max,0));
+  const visible = expandedInputs.has(node.id) || node.data.kind === 'package' ? fields : fields.filter(f=>f.type!=='image'||imageFields.indexOf(f)<showCount);
+  for (const field of visible) {
+    const row = el('div',`node-input-row type-${field.type}`);
+    const bound = graph.edges.find(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id);
+    const socket = port(node,'input',field.id,field.label); row.append(socket,el('span','input-port-label',field.label),el('span','input-port-type',{text:'文本',image:'图片',video:'视频'}[field.type]||field.type));
+    if (bound) { row.classList.add('connected'); row.title = `来自：${getNode(bound.source)?.data.title || '来源'}；选中连线可删除`; }
+    list.append(row);
+  }
+  if (visible.length < fields.length) list.append(button(`展开全部 ${imageFields.length} 个图片输入`,'node-action',()=>{expandedInputs.add(node.id); document.activeElement?.blur(); const card=document.getElementById(`fw-node-${node.id}`);if(card)card._signature='';renderNodes();}));
+  body.append(list);
 }
 function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '左键框选 · 中键平移 · 双击新建 · 滚轮缩放'; renderEdges(); renderSelection(); }
 function renderNodes() {
   const remaining = new Map([...nodesLayer.children].map(card => [card.dataset.nodeId, card]));
   graph.nodes.forEach((node, index) => {
     const previous = remaining.get(node.id); remaining.delete(node.id);
-    const signature = JSON.stringify([node.data, index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => [edge, getNode(edge.source)?.data]), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
-    if (previous && previous._node === node && (previous._signature === signature || previous.contains(document.activeElement))) {
+    const signature = JSON.stringify([node.data, referenceImports.get(node.id), index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => [edge, getNode(edge.source)?.data]), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
+    if (previous && previous._node === node && (previous._signature === signature || previous.contains(document.activeElement) && document.activeElement.matches('input,textarea,select,[contenteditable=true]'))) {
       previous.style.left = `${node.x}px`; previous.style.top = `${node.y}px`; previous.classList.toggle('selected', selected.has(node.id));
       if (nodesLayer.children[index] !== previous) nodesLayer.insertBefore(previous, nodesLayer.children[index] || null);
       return;
@@ -486,6 +530,7 @@ function renderNodes() {
       body.append(text); card.append(body);
       const footer = el('div', 'node-footer'); footer.append(el('span', '', `${node.data.text.length} 字 · 可连接多个生成节点`), button('复制提示词 ↗', 'node-action', () => copyText(node.data.text))); card.append(footer, port(node, 'output'));
     } else if (node.type === 'generation') {
+      inputPorts(node,body);
       const pack = node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null;
       const labels = el('div', 'port-label'); labels.append(el('span', '', node.data.kind === 'package' ? 'INPUT / 连线与表单' : 'INPUT / 提示词与参考'), el('span', '', 'OUTPUT'));
       body.append(labels, el('span', 'model-chip', node.data.kind === 'package' ? '可复用工作流包' : node.data.kind.startsWith('h3') ? 'MiniMax H3 · 本地推理' : node.data.kind === 'api' ? 'API 工作流 · 高级' : `${node.data.kind.startsWith('qwen21_') ? 'Qwen Image 2.1' : node.data.kind === 'krea' ? 'Krea 2' : 'SDXL'} · 本地推理`));
@@ -497,7 +542,7 @@ function renderNodes() {
       body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '连接提示词或上游图片，也可在右侧填写输入。运行时自动完成上游依赖。' : node.data.editor_id ? '先提取外层参数，或复用已保存的完整工作流配置。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
       if (pack) {
         const inputs = el('div', 'node-workflow-inputs');
-        for (const definition of pack.fields.filter(f => ['text', 'image'].includes(f.type)).slice(0, 6)) {
+        for (const definition of pack.fields.filter(f => ['text', 'image', 'video'].includes(f.type)).slice(0, 6)) {
           const link = workflowCanvas?.describeInput(node.id, definition);
           inputs.append(el('span', '', `${link ? '●' : '○'} ${definition.label}${link ? ` ← ${getNode(link.edge.source)?.data.title || '来源'}` : ''}`));
         }
@@ -506,23 +551,34 @@ function renderNodes() {
       if (node.data.editor_id && !pack) {
         body.append(button('提取外层参数', 'button primary prepare-workflow', () => nativeEditor.prepare(node)), button('复用已保存配置', 'button quiet reuse-workflow', () => workflowConfigurations.choose(node)));
       }
-      if (node.data.editor_id) body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => nativeEditor.open(node)));
+      body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => openNodeWorkflow(node)));
       if (node.data.editor_id && pack) body.append(button('配置外层参数与输出', 'button quiet', () => configureNativePanel(node)));
-      const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id;
-      body.append(run); card.append(body);
+      const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || node.data.kind==='package' && !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id;
+      const live = el('div','node-live-progress'); live.dataset.liveNode = node.id; live.hidden = true;
+      const detail = el('p','live-detail'); const bar = el('progress'); bar.max = 100; bar.setAttribute('aria-label','当前节点采样进度'); const img = el('img','live-preview'); img.alt = '采样中间预览，尚未完成'; img.hidden = true;
+      live.append(detail,bar,img); body.append(run,live); card.append(body);
       const footer = el('div', 'node-footer');
       const status = el('span', 'node-status', '○ 等待提交'); status.dataset.nodeStatus = node.id;
-      footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer, port(node, 'input'), port(node, 'output'));
+      footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer, ...(node.data.kind==='package'||generationInputPorts(node,graph).length ? [] : [port(node,'input')]), port(node, 'output'));
     } else if (node.type === 'reference') {
-      if (node.data.url) body.append(outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.name }, 'reference-media'));
-      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '选择参考图片'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此图片' : 'PNG · JPG · WebP · 最大 20 MiB')); body.append(drop); }
-      body.append(el('div', 'reference-name', node.data.name || '参考图保存在本机推理服务中')); card.append(body);
+      const pending = referenceImports.get(node.id);
+      if (pending?.previewURL) { const media = el(pending.mediaType === 'video' ? 'video' : 'img', 'reference-media'); media.src = pending.previewURL; media.draggable = false; if (pending.mediaType === 'video') { media.controls = true; media.preload = 'metadata'; } body.append(media); }
+      else if (node.data.url) { const media = outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.localFilename || node.data.name }, 'reference-media', node.data.mediaType === 'video'); media.draggable = false; body.append(media); }
+      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '点击选素材，或拖到这里'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此素材' : '图片 / 视频 · 无需启动推理引擎')); body.append(drop); }
+      body.append(el('div', 'reference-name', node.data.localFilename || node.data.name || '图片 20 MiB · 视频 200 MiB'));
+      const importState = referenceImports.get(node.id);
+      if (importState?.message) body.append(el('p', `reference-import-state${importState.error ? ' error' : ''}`, importState.message));
+      else if (node.data.localAssetId) body.append(el('p', 'reference-import-state', '素材已保存在客户端 · 生成时自动传入引擎'));
+      card.append(body);
       const footer = el('div', 'node-footer'); footer.append(el('span', '', { start: '首帧参考', end: '尾帧参考', reference: '角色 / 场景参考' }[node.data.role] || '参考素材'), button('更换素材', 'node-action', () => chooseReference(node.id))); card.append(footer, port(node, 'output'));
     } else {
       const outputs = Array.isArray(node.data.outputs) ? node.data.outputs : [];
       if (outputs.length) {
         body.append(outputMedia(outputs[0], outputs[0].type === 'video' ? 'output-video' : 'output-image'));
         const caption = el('div', 'output-caption'); caption.append(el('span', '', outputs[0].type === 'video' ? 'VIDEO · 本地输出' : 'IMAGE · 本地输出'), button('大图预览 ↗', 'node-action', () => preview(outputs[0]))); body.append(caption);
+        if (outputs[0].type === 'image') {
+          const edit = el('div','inspector-actions'); edit.append(button('接入 Qwen 多图编辑','button quiet compact',()=>editOutput(node,outputs[0],'qwen21_edit')),button('接入重绘','button quiet compact',()=>editOutput(node,outputs[0],'sdxl_i2i'))); body.append(edit);
+        }
         if (outputs.length > 1) body.append(button(`查看全部 ${outputs.length} 个输出 →`, 'node-action', () => switchTab('jobs')));
       } else {
         const placeholder = el('div', 'output-placeholder'), headline = el('strong', '', '等待第一帧灵感'), detail = el('p', '', '连接生成节点并运行，实际图像与视频将在这里呈现。');
@@ -684,6 +740,19 @@ function renderPackageInputs(wrap, node) {
       control.append(input, el('span', '', label));
     } else if (type === 'select') {
       control = field(label, String((definition.options || []).findIndex(option => Object.is(option, value))), selectedIndex => change(definition.options[Number(selectedIndex)]), { select: (definition.options || []).map((option, index) => ({ value: String(index), label: String(option) })) });
+    } else if (type === 'video') {
+      control = field(label,value,change,{help:'可从画布的视频素材节点连接，或选择 MP4 / WebM / MOV（最大 200 MiB）。'});
+      const input=el('input');input.type='file';input.accept='.mp4,.webm,.mov';input.hidden=true;
+      const upload=button('选择参考视频','button quiet compact',()=>input.click());
+      input.addEventListener('change',()=>{
+        const file=input.files?.[0];input.value='';if(!file)return;upload.disabled=true;
+        const identity=currentCanvasIdentity(), packageId=node.data.package_id, backend=settings.backend_url;
+        (async()=>{const asset=await storeLocalMedia(file);if(asset.media_type!=='video')throw new Error('请选择视频素材');
+          const uploaded=await api(`/api/assets/media/${asset.asset_id}/backend-input`,{package_id:packageId,field_id:definition.id});
+          if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||node.data.package_id!==packageId||backend!==settings.backend_url||uploaded.backend!==backend)throw new Error('工作流或引擎已变化，本次视频已保存在本地，请重新选择');
+          change(uploaded.name,uploaded.backend);renderInspector();toast('视频已接入此工作流输入');
+        })().catch(reportError).finally(()=>{upload.disabled=false;});
+      });control.append(upload,input);
     } else if (type === 'image' || type === 'audio') {
       control = field(label, value, change, { help: type === 'audio' ? '上传 WAV / MP3 / FLAC / OGG，最大 20 MiB。' : '上传 PNG / JPG / WebP，或使用后端已有的相对文件名。' });
       const input = el('input'); input.type = 'file'; input.accept = type === 'audio' ? '.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp'; input.hidden = true;
@@ -712,7 +781,7 @@ function renderPackageInputs(wrap, node) {
     }
     control.dataset.packageField = definition.id;
     const mapping = el('span', 'field-help package-mapping', `节点 ${definition.node_id} · ${definition.input}`); control.append(mapping);
-    if (['text', 'image'].includes(type)) {
+    if (['text', 'image', 'video'].includes(type)) {
       const connected = workflowCanvas?.describeInput(node.id, definition), connections = el('div', 'workflow-field-link');
       if (connected) {
         control.querySelectorAll('input,textarea,select,button').forEach(input => { input.disabled = true; });
@@ -803,13 +872,13 @@ function renderPackageDraft() {
   $('#package-field-count').textContent = `${packageDraft.fields.filter(item => item.selected).length} / ${packageDraft.fields.length} 个输入`;
   for (const item of packageDraft.fields) {
     const row = el('div', `package-field-row${item.selected ? ' included' : ''}`);
-    const select = el('input'); select.type = 'checkbox'; select.checked = item.selected; select.disabled = ['image', 'audio'].includes(fieldType(item)); select.setAttribute('aria-label', `暴露 ${item.label || item.input}`);
+    const select = el('input'); select.type = 'checkbox'; select.checked = item.selected; select.disabled = ['image', 'audio', 'video'].includes(fieldType(item)); select.setAttribute('aria-label', `暴露 ${item.label || item.input}`);
     if (select.disabled) select.title = '图像输入必须开放，使用者运行时需上传自己的参考图';
     select.addEventListener('change', () => { item.selected = select.checked; row.classList.toggle('included', item.selected); $('#package-field-count').textContent = `${packageDraft.fields.filter(field => field.selected).length} / ${packageDraft.fields.length} 个输入`; });
     const body = el('div', 'package-field-body');
     const input = el('input'); input.type = 'text'; input.maxLength = 100; input.value = item.label; input.setAttribute('aria-label', `输入名称 ${item.node_id}.${item.input}`); input.addEventListener('change', () => { item.label = input.value.trim() || item.input; input.value = item.label; });
     body.append(input, el('span', 'package-mapping', `节点 ${item.node_id} → ${item.input} · ${fieldType(item)}${item.recommended ? ' · 推荐' : ''}`));
-    const preview = ['image', 'audio'].includes(item.type) ? '运行时选择参考媒体' : item.default === undefined ? '没有默认值' : String(item.default).slice(0, 120);
+    const preview = ['image', 'audio', 'video'].includes(item.type) ? '运行时选择参考媒体' : item.default === undefined ? '没有默认值' : String(item.default).slice(0, 120);
     body.append(el('span', 'field-help package-default', `默认：${preview}`)); row.append(select, body); list.append(row);
   }
   if (!packageDraft.fields.length) list.append(el('p', 'model-note', '没有可暴露的基础输入。仍可保存为使用固定参数的工作流包。'));
@@ -817,7 +886,7 @@ function renderPackageDraft() {
 async function inspectPackageDocument(document, name = '', sourceJSON = '') {
   const result = await api('/api/packages/inspect', sourceJSON ? { source_json: sourceJSON } : { document });
   if (!result.prompt || !Array.isArray(result.fields)) throw new Error('本地服务未返回有效的工作流输入定义');
-  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: ['image', 'audio'].includes(fieldType(item)) || document.format === 'frameweave-workflow' || item.recommended !== false })) };
+  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: ['image', 'audio', 'video'].includes(fieldType(item)) || document.format === 'frameweave-workflow' || item.recommended !== false })) };
   $('#package-name').value = name || result.name || '新建工作流包'; $('#package-description').value = result.description || '';
   if (sourceJSON && document.format === 'frameweave-workflow') {
     packageDraft.sourceJSON = sourceJSON;
@@ -848,6 +917,23 @@ async function packageCurrentNode() {
   const result = await api('/api/compile', generationPayload(graph, node.id));
   await inspectPackageDocument({ prompt: result.prompt }, node.data.title);
 }
+async function openNodeWorkflow(node) {
+  if(node.data.editor_id) return nativeEditor.open(node);
+  const identity=currentCanvasIdentity();
+  await prepareWorkflowBackend([node.id]);
+  if(!engine.online) throw new Error('请先连接推理引擎，读取预设对应的真实节点与模型');
+  await prepareCanvasImages([node.id]);
+  const compiledSnapshot=serializeGraph(graph), signature=stableStringify(node.data), backend=settings.backend_url;
+  const prompt=(await api('/api/compile',generationPayload(graph,node.id))).prompt;
+  if((await api('/api/status')).backend_url!==backend)throw new Error('编译期间引擎已切换，请重新进入工作流');
+  const saved=await api('/api/editor-workflows',{name:node.data.title,document:{version:0.4,nodes:[],links:[],last_node_id:0,last_link_id:0}});
+  if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||compiledSnapshot!==serializeGraph(graph)) throw new Error('画布已改变，未替换原节点');
+  const draft=clone(node);draft.data.editor_id=saved.id;draft.data.editor_backend=settings.backend_url;
+  await nativeEditor.openApiPrompt(draft,prompt,()=>{
+    if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||signature!==stableStringify(node.data))throw new Error('原节点已更改，内部草稿已另存；未替换当前节点');
+    mutate(()=>{node.data.editor_id=saved.id;node.data.editor_backend=draft.data.editor_backend;});
+  });
+}
 function renderInspector() {
   const content = $('#inspector-content'); releaseMedia(content); content.replaceChildren();
   if (selectedEdge) {
@@ -867,10 +953,22 @@ function renderInspector() {
   wrap.append(el('p', 'inspector-description', { prompt: '写下画面、光线与运动，将文字连接到生成节点。', reference: '角色、场景或首尾帧，让每一次生成有据可循。', generation: '精确设定每一帧，让创作保持可控。', result: '实际输出与任务记录，完整保存在本地。' }[node.type]));
   wrap.append(field('节点名称', node.data.title, value => editNode(node.id, 'title', value || '未命名节点')));
   if (node.type === 'generation') {
+    const ports = generationInputPorts(node,graph);
+    if (ports.length) {
+      const details=el('details','input-port-settings'); details.append(el('summary','',`输入端口用途与连接 · ${ports.length} 项`));
+      for(const port of ports) {
+        const edge = graph.edges.find(e=>e.target===node.id&&edgeInputField(graph,e)===port.id);
+        const row=field(port.id,port.label,value=>mutate(()=>{node.data.inputLabels={...(node.data.inputLabels||{})};if(value.trim())node.data.inputLabels[port.id]=value.trim().slice(0,80);else delete node.data.inputLabels[port.id];}),{help:edge?`来自 ${getNode(edge.source)?.data.title}；此名称只说明用途，不会改变工作流本身的输入顺序。`:'可命名为场景参考、人物参考等；请在提示词中明确各图用途。'});
+        if(edge) row.append(button('断开此输入','node-action',()=>mutate(()=>{graph.edges=graph.edges.filter(e=>e.id!==edge.id);})));details.append(row);
+      }
+      wrap.append(details);
+    }
     section(wrap, '生成模式', '01 / MODEL');
     wrap.append(field('模型与任务', node.data.kind, kind => {
       if (kind === 'package' && node.data.kind !== 'package') { renderInspector(); openPackages().catch(reportError); return; }
       if (node.data.kind === 'package' && kind !== 'package' && graph.edges.some(edge => edge.target === node.id && edge.targetField)) { renderInspector(); throw new Error('此工作流已有输入连接，请先断开连接，再切换为其他生成模式'); }
+      const candidate=clone(graph);candidate.nodes.find(n=>n.id===node.id).data.kind=kind;
+      try {parseGraph(serializeGraph(candidate));} catch(error) {renderInspector();throw new Error(`现有连线不适用于此模式，请先调整输入连接：${error.message}`);}
       mutate(() => {
       node.data.kind = kind; node.data.title = KIND_NAMES[kind]; node.data.models = {};
       if (Object.hasOwn(node.data, 'loras')) node.data.loras = [];
@@ -893,15 +991,16 @@ function renderInspector() {
       if (node.data.kind.startsWith('qwen21_')) wrap.append(el('p', 'model-note', 'Qwen Image 2.1 使用专用主模型、Qwen3-VL 8B 编码器和 2.1 VAE；旧版 Qwen Image 权重不通用。默认 40 步，实际性能需本机生成验证。'));
       if (node.data.kind === 'qwen21_edit') wrap.append(el('p', 'form-note', '按连接顺序输入 1–10 张参考图片，用提示词说明各图用途与修改要求。条件编辑固定 denoise=1。'));
       if (node.data.kind === 'qwen21_edit') {
-        const references = graph.edges.filter(edge => edge.target === node.id && getNode(edge.source)?.type === 'reference');
+        const references = graph.edges.filter(edge => edge.target === node.id && /^image_/.test(edgeInputField(graph,edge))).sort((a,b)=>Number(edgeInputField(graph,a).split('_')[1])-Number(edgeInputField(graph,b).split('_')[1]));
         references.forEach((edge, index) => {
           const source = getNode(edge.source), row = el('div', 'qwen-reference-order');
           row.append(el('p', 'form-note', `${index === 0 ? '编辑目标' : '参考图'} · 图 ${index + 1}：${source.data.title}${source.data.name ? '' : ' · 尚未上传'}`));
           const controls = el('div', 'inspector-actions');
           for (const [delta, label] of [[-1, '上移'], [1, '下移']]) {
             const move = button(label, 'button quiet compact', () => mutate(() => {
-              const from = graph.edges.indexOf(edge), to = graph.edges.indexOf(references[index + delta]);
-              if (from >= 0 && to >= 0) [graph.edges[from], graph.edges[to]] = [graph.edges[to], graph.edges[from]];
+              const other=references[index+delta], first=edgeInputField(graph,edge), second=edgeInputField(graph,other);
+              for(const item of references) item.targetField=edgeInputField(graph,item);
+              edge.targetField=second;other.targetField=first;
             }));
             move.disabled = index + delta < 0 || index + delta >= references.length;
             move.setAttribute('aria-label', `画布图 ${index + 1} ${label}`); controls.append(move);
@@ -939,7 +1038,8 @@ function renderInspector() {
       renderLoraFields(wrap, node);
     }
     const actions = el('div', 'inspector-actions'); actions.append(button('检查缺失项', 'button quiet', () => runDiagnostics(node)), button('导出执行 JSON', 'button quiet', () => compileNode(node))); wrap.append(actions);
-    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
+    wrap.append(button('↗ 进入工作流 · 内部调参','button quiet inspector-run',()=>openNodeWorkflow(node)));
+    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || node.data.kind==='package' && !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
     wrap.append(el('p', 'form-note', '速度与质量取决于后端、模型、显存和参数。生成任务通过本机服务执行，可在队列中查看耗时与取消。'));
   } else if (node.type === 'prompt') {
     wrap.append(field('正向提示词', node.data.text, value => editNode(node.id, 'text', value), { multiline: true, rows: 9 }), field('负向提示词', node.data.negative, value => editNode(node.id, 'negative', value), { multiline: true, rows: 3 }));
@@ -947,9 +1047,9 @@ function renderInspector() {
   } else if (node.type === 'reference') {
     if (node.data.url) wrap.append(outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.name }, 'reference-media'));
     wrap.append(field('参考角色', node.data.role, value => editNode(node.id, 'role', value), { select: [{ value: 'reference', label: '角色 / 场景参考' }, { value: 'start', label: '首帧' }, { value: 'end', label: '尾帧' }] }));
-    wrap.append(el('p', 'form-note', node.data.name || '还未导入素材。'));
-    wrap.append(button('选择本地参考图片', 'button quiet inspector-run', () => chooseReference(node.id)));
-    wrap.append(el('p', 'form-note', '素材将发送给已连接的本机推理服务，保存在其输入目录。导出画布只记录引用，不打包原始文件。'));
+    wrap.append(el('p', 'form-note', node.data.localFilename || node.data.name || '还未导入素材。'));
+    wrap.append(button('选择图片 / 视频素材', 'button quiet inspector-run', () => chooseReference(node.id)));
+    wrap.append(el('p', 'form-note', '素材先保存在客户端，生成时自动传入对应引擎。导出画布只记录引用，不打包原始媒体；迁移设备时需同时保留客户端素材目录。'));
   } else {
     if (node.data.outputs?.length) node.data.outputs.forEach(output => { wrap.append(outputMedia(output, 'output-image'), button('打开大预览', 'button quiet inspector-run', () => preview(output))); });
     else wrap.append(el('p', 'model-note', '尚无真实生成结果。连接生成节点，检查环境后提交任务。'));
@@ -1313,6 +1413,16 @@ function acceptCanvasWorkflowJob(id, job) {
 }
 function duration(seconds) { seconds = Math.max(0, Math.floor(Number(seconds) || 0)); return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`; }
 function updateNodeJobStatus() {
+  document.querySelectorAll('[data-live-node]').forEach(element => {
+    const job = jobs.find(item=>jobNodes[item.id]===element.dataset.liveNode);
+    element.hidden = !job || !['queued','running'].includes(job.status);
+    if (element.hidden) return;
+    element.querySelector('.live-detail').textContent = liveProgressText(job);
+    const bar = element.querySelector('progress'), progress = progressPercent(job.progress);
+    if (progress === null) bar.removeAttribute('value'); else bar.value = progress;
+    const img = element.querySelector('.live-preview'); img.hidden = !job.preview_url;
+    if (job.preview_url && img.getAttribute('src') !== job.preview_url) img.src = job.preview_url;
+  });
   document.querySelectorAll('[data-node-status]').forEach(element => {
     const job = jobs.find(item => jobNodes[item.id] === element.dataset.nodeStatus);
     element.classList.toggle('error', job?.status === 'failed');
@@ -1327,6 +1437,7 @@ function updateNodeJobStatus() {
     else element.textContent = { queued: '引擎开始执行后，生成状态会自动更新。', running: '图像与视频生成完成后会自动出现在这里。', failed: '在任务列表查看错误详情，修复后可再次生成。', cancelled: '原始参数仍保留，可在任务列表复用或再次生成。', completed: '此任务没有可预览的图像或视频输出，请检查工作流输出节点。' }[job?.status] || '请保持本地服务运行，或在任务列表查看记录。';
   });
 }
+
 function jobTitle(job) { return getNode(jobNodes[job.id])?.data.title || job.summary?.package_name || KIND_NAMES[job.kind] || `任务 ${job.id.slice(0, 8)}`; }
 function resultForJob(id) { return graph.nodes.find(node => node.type === 'result' && node.data.jobId === id); }
 function placeJobOnCanvas(id, focus = true) {
@@ -1402,13 +1513,14 @@ function newJobView(id) {
   const time = el('div', 'job-time'), elapsed = el('span'); time.append(elapsed, el('span', '', id.slice(0, 8)));
   const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '生成进度');
   const state = el('div', 'progress-state'), error = el('p', 'job-error'), warning = el('p', 'job-warning'), provenance = el('p', 'job-provenance'), thumbs = el('div', 'job-thumbs');
+  const livePreview = el('img', 'live-preview'); livePreview.alt = '采样中间预览，尚未完成'; livePreview.hidden = true;
   const actions = el('div', 'job-actions');
   const reuse = button('复用参数', 'job-action', () => reuseJob(id), '把原任务参数添加为独立节点，不会自动开始生成');
   const locate = button('放入画布', 'job-action', () => placeJobOnCanvas(id), '在当前画布中查看任务结果，不会重新提交生成');
   const retry = button('再次生成', 'job-action', () => retryJob(id), '以原任务参数和随机种子再提交一次，由当前引擎重新校验');
   const cancel = button('取消任务', 'job-action job-cancel', async () => { cancel.disabled = true; try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, {}); toast('已发送取消请求'); await pollJobs(); } finally { cancel.disabled = false; } });
-  actions.append(locate, reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, thumbs, actions);
-  return { card, title, status, elapsed, track, bar, state, error, warning, provenance, thumbs, locate, reuse, retry, cancel, outputSignature: '' };
+  actions.append(locate, reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, livePreview, thumbs, actions);
+  return { card, title, status, elapsed, track, bar, state, error, warning, provenance, livePreview, thumbs, locate, reuse, retry, cancel, outputSignature: '' };
 }
 function renderJobs() {
   $('#job-count').textContent = String(jobs.filter(job => ['queued', 'running'].includes(job.status)).length);
@@ -1433,11 +1545,14 @@ function renderJobs() {
     write(view.elapsed, `耗时 ${duration(job.elapsed)}`);
     const progress = progressPercent(job.progress); view.bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`;
     const active = ['queued', 'running'].includes(job.status);
+    view.track.classList.toggle('indeterminate', active && progress === null);
+    view.livePreview.hidden = !active || !job.preview_url;
+    if (active && job.preview_url && view.livePreview.getAttribute('src') !== job.preview_url) view.livePreview.src = job.preview_url;
     const progressValue = job.status === 'completed' ? 100 : progress;
     if (progressValue === null) view.track.removeAttribute('aria-valuenow'); else view.track.setAttribute('aria-valuenow', String(Math.round(progressValue)));
     view.track.setAttribute('aria-valuetext', progressValue === null ? STATUS_NAMES[job.status] || job.status : `${Math.round(progressValue)}%`);
     view.state.hidden = !active;
-    write(view.state, progress !== null ? `${Math.round(progress)}% · ${job.status === 'queued' ? '排队中' : '正在生成'}` : job.status === 'queued' ? '等待引擎执行' : '推理进行中 · 后端暂未提供逐步进度');
+    write(view.state, liveProgressText(job));
     write(view.error, String(job.error || '')); view.error.hidden = !job.error;
     const warnings = [job.retry_warning, job.storage_warning].filter(Boolean).join('\n'); write(view.warning, warnings); view.warning.hidden = !warnings;
     const attached = !!resultForJob(job.id);
@@ -1483,7 +1598,21 @@ function switchTab(tab) {
   $('#tab-jobs').classList.toggle('active', !properties); $('#tab-jobs').setAttribute('aria-selected', String(!properties));
   $('#properties-panel').hidden = !properties; $('#jobs-panel').hidden = properties;
 }
-function chooseReference(id = null) { uploadTarget = id; $('#reference-input').click(); }
+function chooseReference(id = null) { uploadTarget = {id, identity: currentCanvasIdentity()}; $('#reference-input').click(); }
+async function editOutput(source, output, kind) {
+  const identity = currentCanvasIdentity();
+  if (graph.nodes.length > 498) throw new Error('画布容量不足，请整理节点后再接入编辑');
+  const url = mediaURL(output.url); if (!url || output.type !== 'image') throw new Error('请选择有效的本地图片结果');
+  const response = await fetch(url); if (!response.ok) throw new Error('原生成图片暂不可读取，请检查对应引擎和输出文件');
+  const blob = await response.blob(); const file = new File([blob],output.filename || 'generated.png',{type:blob.type});
+  const asset = await storeLocalMedia(file);
+  if (identity !== currentCanvasIdentity() || getNode(source.id) !== source) throw new Error('画布已变化，原图片已保留，请重新选择');
+  const ref = createNode('reference',source.x+nodeSize(source).width+64,source.y,{title:'编辑素材 · '+source.data.title,localAssetId:asset.asset_id,localMedia:true,localFilename:file.name,url:`/api/assets/media/${asset.asset_id}`,mediaType:'image'});
+  const gen = createNode('generation',ref.x+360,ref.y,{kind,title:KIND_NAMES[kind],width:1024,height:1024,steps:kind==='qwen21_edit'?40:25,denoise:kind==='qwen21_edit'?1:.65});
+  placeNewNodes([ref,gen]);
+  mutate(()=>{graph.nodes.push(ref,gen);connect(graph,ref.id,gen.id,{targetField:'image_1'});selected=new Set([gen.id]);});
+  centerOnNode(gen);revealInspector();switchTab('properties');toast('已连接现有图片，可继续调参；不会重新生成原图');
+}
 async function uploadImage(file) {
   if (!/^image\/(png|jpeg|webp)$/.test(file.type)) throw new Error('参考素材支持 PNG、JPG、WebP 图片。视频输出可在生成后预览。');
   if (file.size > 20 * 1024 * 1024) throw new Error('初版单张参考图上限为 20 MiB，请先缩小图片。');
@@ -1495,12 +1624,57 @@ async function uploadImage(file) {
   if (!uploaded.backend || uploaded.backend !== uploadBackend || settings.backend_url !== uploadBackend) throw new Error('上传期间推理引擎发生了切换，或服务未确认图片来源。本次图片不会写入画布，请在目标引擎下重新上传。');
   return uploaded;
 }
-async function uploadFile(file, target) {
-  const uploaded = await uploadImage(file);
-  if (settings.backend_url !== uploaded.backend) throw new Error('上传期间推理引擎发生了切换，本次图片来源无法确认。请在目标引擎下重新上传。');
-  if (target && getNode(target)) mutate(() => { const node = getNode(target); node.data = { ...node.data, name: uploaded.name, url: uploaded.url, uploadBackend: uploaded.backend, mediaType: file.type.startsWith('video/') ? 'video' : 'image' }; });
-  else addNode('reference', { title: file.name.replace(/\.[^.]+$/, '').slice(0, 50), name: uploaded.name, url: uploaded.url, uploadBackend: uploaded.backend, mediaType: file.type.startsWith('video/') ? 'video' : 'image' });
-  toast('素材已保存到本地');
+async function importReferenceFiles(files, targetId = null, point = null, identity = currentCanvasIdentity()) {
+  if (!files.length) return;
+  const target = targetId ? getNode(targetId) : null;
+  if (identity !== currentCanvasIdentity() || targetId && target?.type !== 'reference') throw new Error('原参考节点或画布已改变，请重新选择素材');
+  if (graph.nodes.length + files.length - (target ? 1 : 0) > 500) throw new Error('素材数量超过画布剩余容量，请减少选择或整理节点');
+  const origin = point || (target ? {x: target.x + 360, y: target.y} : viewPoint(canvas.getBoundingClientRect().left + 60, canvas.getBoundingClientRect().top + 120));
+  const ticket = Symbol('media import');
+  if (target) referenceImportTickets.set(targetId,ticket);
+  let count = 0;
+  for (let index = 0; index < files.length; index++) {
+    const file = files[index];
+    let destination = null, previewURL = null;
+    try {
+      if (target && (getNode(targetId) !== target || referenceImportTickets.get(targetId) !== ticket)) break;
+      if (currentCanvasIdentity() !== identity) throw new Error('画布已切换，素材未放入新画布');
+      const mediaType = validateMediaFile(file);
+      destination = index === 0 && target ? target : addNode('reference', {title:file.name.replace(/\.[^.]+$/, '').slice(0,50),mediaType}, importPosition(origin,index-(target?1:0)),true);
+      referenceImportTickets.set(destination.id,ticket);
+      previewURL = URL.createObjectURL(file);
+      referenceImports.set(destination.id,{ticket,previewURL,mediaType,message:'预览已就绪 · 正在保存到客户端…'}); renderNodes();
+      const asset = await storeLocalMedia(file);
+      if (target && (getNode(targetId) !== target || referenceImportTickets.get(targetId) !== ticket)) break;
+      if (!/^[a-f0-9]{64}$/.test(asset?.asset_id || '') || asset.media_type !== mediaType) throw new Error('客户端没有返回有效的本地素材');
+      if (currentCanvasIdentity() !== identity) throw new Error('画布已切换，本地素材已保存，请在目标画布重新选择');
+      if (getNode(destination.id) !== destination || referenceImportTickets.get(destination.id) !== ticket) continue;
+      const values = {localAssetId:asset.asset_id, localMedia:true, localFilename:file.name, name:'', uploadBackend:'', url:`/api/assets/media/${asset.asset_id}`, mediaType};
+      const candidate=clone(graph);Object.assign(candidate.nodes.find(n=>n.id===destination.id).data,values);
+      try{parseGraph(serializeGraph(candidate));}catch(error){throw new Error(`素材与现有输入端口不匹配，请先断开对应连线：${error.message}`);}
+      referenceImports.delete(destination.id); mutate(() => Object.assign(destination.data, values));
+      count++;
+    } catch(error) {
+      if (destination && getNode(destination.id) === destination && referenceImports.get(destination.id)?.ticket === ticket) { referenceImports.set(destination.id, {ticket,message:`保存失败：${error.message}。请重新选择素材。`,error:true}); renderNodes(); }
+      reportError(new Error(`${file.name}：${error.message}`));
+      if (currentCanvasIdentity() !== identity) break;
+    } finally { if (previewURL) URL.revokeObjectURL(previewURL); }
+  }
+  if (count) toast(`已将 ${count} 个素材保存到客户端，推理引擎未启动也可预览`);
+}
+async function storeLocalMedia(file) {
+  validateMediaFile(file);
+  const inferred={png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',mp4:'video/mp4',webm:'video/webm',mov:'video/quicktime'}[file.name.split('.').pop().toLowerCase()];
+  const response = await fetch(`/api/assets/media?name=${encodeURIComponent(file.name)}`, {method:'POST',headers:{'Content-Type':file.type || inferred || 'application/octet-stream','X-FW-Token':csrf},body:file});
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || `保存素材失败（${response.status}）`);
+  return result;
+}
+async function prepareCanvasImages(targets) {
+  const before = serializeGraph(graph), identity = currentCanvasIdentity(), backend = settings.backend_url;
+  const updates = await prepareLocalImages(clone(graph), targets, backend, api);
+  if (identity !== currentCanvasIdentity() || backend !== settings.backend_url || before !== serializeGraph(graph)) throw new Error('准备图片期间画布或引擎已变化，未提交生成，请重新运行');
+  if (updates.length) mutate(() => { for (const update of updates) Object.assign(getNode(update.id).data, {name:update.name,uploadBackend:update.uploadBackend}); });
 }
 
 canvas.addEventListener('dblclick', event => {
@@ -1552,6 +1726,7 @@ canvas.addEventListener('pointerdown', event => {
 });
 canvas.addEventListener('pointermove', event => {
   const point = viewPoint(event.clientX, event.clientY);
+  if (portDrag && event.pointerId === portDrag.id && Math.hypot(event.clientX-portDrag.x,event.clientY-portDrag.y)>4) portDrag.moved = true;
   if (connecting) { connecting.point = point; renderEdges(); }
   if (!pointer) return;
   if (pointer.mode === 'pan') {
@@ -1569,6 +1744,18 @@ canvas.addEventListener('pointermove', event => {
   }
 });
 function finishPointer(event) {
+  if (portDrag && event.pointerId === portDrag.id) {
+    const drag = portDrag; portDrag = null;
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    if (drag.moved || event.type === 'pointercancel') {
+      suppressPortClick = true; setTimeout(()=>{suppressPortClick=false;},0);
+      const target = document.elementFromPoint(event.clientX,event.clientY)?.closest('.port.input');
+      const node = getNode(target?.closest('.node')?.dataset.nodeId);
+      if (event.type !== 'pointercancel' && node) Promise.resolve().then(()=>finishConnection(node,target.dataset.field)).catch(error=>{cancelConnection();reportError(error);});
+      else cancelConnection();
+    }
+    return;
+  }
   if (!pointer) return;
   if (pointer.mode === 'drag') pushHistory(pointer.before);
   if (pointer.mode === 'pan') save();
@@ -1578,10 +1765,17 @@ function finishPointer(event) {
 canvas.addEventListener('pointerup', finishPointer);
 canvas.addEventListener('pointercancel', finishPointer);
 canvas.addEventListener('auxclick', event => { if (event.button === 1) event.preventDefault(); });
-canvas.addEventListener('dragover', event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); });
+function clearImageDrop() { canvas.classList.remove('image-drop-active'); nodesLayer.querySelectorAll('.image-drop-target').forEach(node => node.classList.remove('image-drop-target')); }
+canvas.addEventListener('dragover', event => {
+  if (!Array.from(event.dataTransfer?.types || []).includes('Files')) return;
+  event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; clearImageDrop(); canvas.classList.add('image-drop-active');
+  const card = event.target.closest('.node'); if (getNode(card?.dataset.nodeId)?.type === 'reference') card.classList.add('image-drop-target');
+});
+canvas.addEventListener('dragleave', event => { if (!canvas.contains(event.relatedTarget)) clearImageDrop(); });
 canvas.addEventListener('drop', event => {
-  event.preventDefault(); const files = [...event.dataTransfer.files];
-  (async () => { for (const file of files) await uploadFile(file, null); })().catch(reportError);
+  event.preventDefault(); clearImageDrop();
+  const card = event.target.closest('.node'), id = card?.dataset.nodeId;
+  importReferenceFiles(Array.from(event.dataTransfer?.files || []), getNode(id)?.type === 'reference' ? id : null, viewPoint(event.clientX,event.clientY)).catch(reportError);
 });
 function finishKeyboardMove() { if (keyboardMoveBefore !== null) { pushHistory(keyboardMoveBefore); keyboardMoveBefore = null; } }
 document.addEventListener('keydown', event => {
@@ -1652,7 +1846,7 @@ bind('#export-diagnostics', () => { downloadJSON(publicChecksReport(diagnosticCh
 bind('#settings-button', () => openSettings());
 bind('#packages-button', openPackages); bind('#import-package', () => $('#package-input').click()); bind('#refresh-packages', loadPackages);
 bind('#package-current-node', packageCurrentNode);
-bind('#package-select-recommended', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = ['image', 'audio'].includes(fieldType(item)) || item.recommended !== false; }); renderPackageDraft(); } });
+bind('#package-select-recommended', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = ['image', 'audio', 'video'].includes(fieldType(item)) || item.recommended !== false; }); renderPackageDraft(); } });
 bind('#package-select-all', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = true; }); renderPackageDraft(); } });
 $('#package-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
@@ -1696,7 +1890,7 @@ $('#project-input').addEventListener('change', event => {
 });
 $('#reference-input').addEventListener('change', event => {
   const files = [...(event.target.files || [])]; const target = uploadTarget; event.target.value = ''; uploadTarget = null;
-  (async () => { for (let index = 0; index < files.length; index++) await uploadFile(files[index], index === 0 ? target : null); })().catch(reportError);
+  importReferenceFiles(files, target?.id, null, target?.identity).catch(reportError);
 });
 $('#workflow-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; const target = workflowTarget; event.target.value = ''; if (!file) return;
@@ -1743,7 +1937,7 @@ const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { 
 const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
 initializeCanvasActions();
 studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
-workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend,
+workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend, prepareInputs: prepareCanvasImages,
   connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });

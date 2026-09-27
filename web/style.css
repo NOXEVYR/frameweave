@@ -954,6 +954,10 @@ select {
   font-size:24px;
   color:#7e634b
 }
+.canvas.image-drop-active, #canvas.image-drop-active { outline: 3px solid #4b66d9; outline-offset: -4px; }
+.node.image-drop-target { outline: 4px solid #4b66d9; }
+.reference-import-state { font-size: 12px; line-height: 1.5; color: #536886; margin: 8px 0 0; }
+.reference-import-state.error { color: #b33b28; }
 .reference-name {
   margin-top:10px;
   color:#606b7e;
@@ -2420,3 +2424,16 @@ kbd {
     scroll-behavior:auto!important
   }
 }
+.node-input-ports { display:grid; gap:7px; margin:12px -20px 18px; }
+.node-input-row { position:relative; display:flex; align-items:center; gap:10px; min-height:30px; padding:3px 20px; background:#f6f8ff; border-block:1px solid #e4e9f5; font-size:12px; }
+.node-input-row .port.input { position:absolute; left:-8px; top:50%; transform:translateY(-50%); }
+.input-port-label { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.input-port-type { font-size:10px; color:#607391; }
+.node-input-row.connected { background:#e9f5f0; }
+.node-input-row.type-video .port { background:#ca8e72; }
+.node-input-row.type-text .port { background:#927dc7; }
+.port { touch-action:none; }
+.node-live-progress { padding:12px; margin-top:12px; background:#eef2ff; border-radius:10px; }
+.live-detail { margin:0 0 8px; font-size:12px; color:#354b81; }
+.node-live-progress progress { width:100%; height:8px; accent-color:var(--accent); }
+.live-preview { width:100%; max-height:240px; object-fit:contain; margin-top:8px; border-radius:6px; }

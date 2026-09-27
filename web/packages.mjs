@@ -32,7 +32,7 @@ export function fieldType(field) {
   if (['integer', 'int'].includes(type)) return 'integer';
   if (['number', 'float'].includes(type)) return 'number';
   if (['boolean', 'bool'].includes(type)) return 'boolean';
-  if (['image', 'audio'].includes(type)) return type;
+  if (['image', 'audio', 'video'].includes(type)) return type;
   if (Array.isArray(field.options) || ['select', 'choice', 'enum'].includes(type)) return 'select';
   return 'text';
 }

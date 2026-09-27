@@ -12,12 +12,14 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,14 +32,17 @@ from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
 from .engines import EngineManager
 from .updates import UpdateManager, UpdateError
+from .progress import ProgressStream
 from .canvas_store import CanvasStore
 from .editor_workflows import EditorWorkflowStore, _parse_document as parse_editor_document
 from .editor_proxy import EditorProxy
 from .editor_interfaces import inspect_interface, reconcile_interface, select_outputs
 from .editor_backends import inspect_backend_fit
+from .local_assets import (LocalImageAssets, LocalMediaAssets, MAX_LOCAL_IMAGE_BYTES,
+                           MAX_LOCAL_VIDEO_BYTES)
 from .workspace_services import PROFILES, performance_plan, result_location
 from .packages import (PackageStore, apply_values, inspect_document,
-                       normalize_document, transport_document)
+                       normalize_document, transport_document, validate_package_media_field)
 from .recovery import recover_records, job_record, media_record
 from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
 
@@ -71,6 +76,8 @@ class App:
         self.csrf = secrets.token_urlsafe(32)
         self.client_id = "frameweave-" + uuid.uuid4().hex
         self.lock = threading.RLock()
+        self.transfer_locks_guard = threading.Lock()
+        self.transfer_locks = {}
         self.closed = threading.Event()
         self.last_seen = time.monotonic()
         self.settings = {"backend_url": "http://127.0.0.1:8188", "model_roots": [], "comfy_roots": []}
@@ -104,12 +111,17 @@ class App:
         self.info = {}
         self.info_at = 0
         self.jobs = {}
+        self.progress = ProgressStream(self)
         self.media = {}
         self.uploaded = set()
         self.recovery_warnings = []
         self.recovery_protected_files = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
         self.canvases = CanvasStore(self.data_dir / "canvases")
+        self.local_assets = LocalImageAssets(self.data_dir)
+        self.local_media_assets = LocalMediaAssets(self.data_dir)
+        self.video_output_assets = {}
+        self.local_media_upload_cache = {}
         self.editor_workflows = EditorWorkflowStore(self.data_dir / "editor-workflows")
         self.editor_sessions = {}
         threading.Thread(target=self._close_editors_on_exit, daemon=True).start()
@@ -357,6 +369,34 @@ class App:
                 self.info_at = time.monotonic()
             return self.info
 
+    def _object_info_for_backend(self, backend):
+        info = backend.request("/object_info", timeout=30)
+        if not isinstance(info, dict):
+            raise BackendError("后端 object_info 格式不正确")
+        with self.lock:
+            if self.backend is backend:
+                self.info = info
+                self.info_at = time.monotonic()
+        return info
+
+    @contextmanager
+    def _transfer_lock(self, key):
+        with self.transfer_locks_guard:
+            entry = self.transfer_locks.get(key)
+            if entry is None:
+                entry = {"lock": threading.Lock(), "users": 0}
+                self.transfer_locks[key] = entry
+            entry["users"] += 1
+        entry["lock"].acquire()
+        try:
+            yield
+        finally:
+            entry["lock"].release()
+            with self.transfer_locks_guard:
+                entry["users"] -= 1
+                if entry["users"] == 0 and self.transfer_locks.get(key) is entry:
+                    self.transfer_locks.pop(key, None)
+
     def status(self):
         try:
             stats = self.backend.request("/system_stats", timeout=4)
@@ -481,6 +521,223 @@ class App:
             raise ValueError("图片编码无效") from None
         return self._upload_content(content)
 
+    def create_local_image_asset(self, data):
+        if set(data) != {"name", "data"}:
+            raise ValueError("本地图片导入只接受 name 和 data")
+        saved = self.local_assets.create(data.get("name"), data.get("data"))
+        return {**saved, "url": f"/api/assets/images/{saved['asset_id']}"}
+
+    def sync_local_image_asset(self, asset_id):
+        with self.lock:
+            content, _mime = self.local_assets.read(asset_id)
+            result = self._upload_content(content, complete=True)
+            return {**result, "asset_id": asset_id}
+
+    def create_local_media_asset(self, name, source, content_length, content_type):
+        saved = self.local_media_assets.create_from_stream(name, source, content_length, content_type)
+        return {**saved, "url": f"/api/assets/media/{saved['asset_id']}"}
+
+    def sync_local_media_asset(self, asset_id, package_id=None, field_id=None, *, schema=None,
+                               expected_backend=None, source=None):
+        content, mime, media_type = self.local_media_assets.read(asset_id)
+        if media_type == "image":
+            if package_id is not None or field_id is not None:
+                raise ValueError("图片同步只接受空对象")
+            with self.lock:
+                if expected_backend is not None and self.backend is not expected_backend:
+                    raise ValueError("同步期间后端已变化，请重新选择输入素材")
+                result = self._upload_content(content, complete=True)
+                return {**result, "asset_id": asset_id, "media_type": media_type}
+
+        if media_type != "video" or package_id is None or field_id is None:
+            raise ValueError("视频同步必须绑定工作流包字段")
+        with self.lock:
+            backend = self.backend
+            if expected_backend is not None and backend is not expected_backend:
+                raise ValueError("同步期间后端已变化，请重新选择输入素材")
+        package = self.packages.get(package_id)
+        live_schema = schema if schema is not None else self._object_info_for_backend(backend)
+        validate_package_media_field(package, field_id, live_schema, media_type)
+        cache_key = (asset_id, backend.url)
+
+        with self._transfer_lock(("local-media-upload", asset_id, backend.url)):
+            with self.lock:
+                if self.backend is not backend:
+                    raise ValueError("同步期间后端已变化，请重新选择输入素材")
+                if source is not None:
+                    self._check_video_source_locked(*source)
+                cached = self.local_media_upload_cache.get(cache_key)
+                if cached is not None:
+                    media_key = cached.get("url", "").rsplit("/", 1)[-1]
+                    registered = self.media.get(media_key)
+                    if registered and registered[0] == backend.url and registered[1].get("type") == "input":
+                        self.uploaded.add(cached["name"])
+                        self.info_at = 0
+                        self.persist_input_media()
+                        return {**cached, "asset_id": asset_id, "media_type": media_type,
+                                "package_id": package_id, "field_id": field_id}
+                    self.local_media_upload_cache.pop(cache_key, None)
+                self.check_input_storage()
+
+            extension = {"video/mp4": ".mp4", "video/webm": ".webm",
+                         "video/quicktime": ".mov"}.get(mime)
+            if extension is None:
+                raise ValueError("视频媒体格式不受支持")
+            name = "prismcanvas-" + uuid.uuid4().hex + extension
+            acknowledgement = backend.upload(name, content, mime)
+            if (not isinstance(acknowledgement, dict)
+                    or not isinstance(acknowledgement.get("name"), str)
+                    or not acknowledgement["name"]
+                    or acknowledgement.get("type", "input") != "input"):
+                raise BackendError("后端未确认视频输入上传")
+            returned_name = acknowledgement["name"]
+            subfolder = acknowledgement.get("subfolder", "")
+            relative = "/".join(filter(None, [subfolder, returned_name]))
+            safe_relative(relative)
+            with self.lock:
+                if source is not None:
+                    self._check_video_source_locked(*source)
+                url = self.register_media(returned_name, subfolder, "input", backend=backend.url)
+                if self.backend is backend:
+                    self.uploaded.add(relative)
+                    self.info_at = 0
+                result = {"name": relative, "url": url, "backend": backend.url}
+                self.local_media_upload_cache[cache_key] = result
+                self.persist_input_media()
+            return {**result, "asset_id": asset_id, "media_type": media_type,
+                    "package_id": package_id, "field_id": field_id}
+
+    def _check_video_source_locked(self, job_id, index, expected_backend, expected_output, expected_query):
+        if self.backend.url != expected_backend.url:
+            raise ValueError("结果来源后端已变化，请恢复原后端后重试")
+        job = self.jobs.get(job_id)
+        if not job:
+            raise ValueError("任务不属于此客户端")
+        if job.get("status") != "completed":
+            raise ValueError("只能复用已完成任务的视频结果")
+        if job.get("backend") != expected_backend.url:
+            raise ValueError("结果来自另一个后端，请先恢复原后端连接")
+        outputs = [output for output in job.get("outputs", [])
+                   if isinstance(output, dict) and output.get("type") == "video"]
+        if not 0 <= index < len(outputs):
+            raise ValueError("视频结果索引越界，或此任务没有视频输出")
+        output = outputs[index]
+        url = output.get("url", "")
+        if not isinstance(url, str) or not re.fullmatch(r"/api/media/[0-9a-f]{32}", url):
+            raise ValueError("结果视频没有有效的本地媒体登记")
+        registered = self.media.get(url.rsplit("/", 1)[-1])
+        if not registered:
+            raise ValueError("结果视频未登记或已不可用")
+        media_backend, query = registered
+        if (media_backend != job["backend"] or query.get("type") not in {"output", "temp"}
+                or query.get("filename") != output.get("filename")
+                or query.get("subfolder", "") != output.get("subfolder", "")):
+            raise ValueError("结果视频与任务媒体登记不一致")
+        if expected_output is not None and output != expected_output:
+            raise ValueError("任务视频输出在传输期间发生变化")
+        if expected_query is not None and query != expected_query:
+            raise ValueError("任务视频登记在传输期间发生变化")
+        return output, query
+
+    def media_input(self, job_id, data):
+        """Copy an owned completed video output to a local asset and bind it to a package field."""
+        if (not isinstance(data, dict) or set(data) != {"output_index", "package_id", "field_id"}
+                or type(data.get("output_index")) is not int
+                or not isinstance(data.get("package_id"), str) or not data["package_id"]
+                or not isinstance(data.get("field_id"), str) or not data["field_id"]):
+            raise ValueError("视频结果复用需要 output_index、package_id 和 field_id，不接受 URL 或文件路径")
+        index, package_id, field_id = data["output_index"], data["package_id"], data["field_id"]
+        with self.lock:
+            backend = self.backend
+            output, query = self._check_video_source_locked(job_id, index, backend, None, None)
+            output, query = copy.deepcopy(output), copy.deepcopy(query)
+        filename = output.get("filename", "")
+        extension = Path(filename).suffix.lower()
+        mime = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}.get(extension)
+        if mime is None:
+            raise ValueError("只能复用 MP4、WebM 或 MOV 视频结果")
+        filename = safe_relative(query["filename"])
+        subfolder = safe_relative(query["subfolder"]) if query.get("subfolder") else ""
+        if "/" in filename:
+            raise ValueError("结果视频文件名无效")
+        source = (job_id, index, backend, output, query)
+        source_key = (backend.url, job_id, index, filename, subfolder, query["type"])
+
+        with self._transfer_lock(("job-video-output", *source_key)):
+            with self.lock:
+                self._check_video_source_locked(job_id, index, backend, output, query)
+            package = self.packages.get(package_id)
+            live_schema = self._object_info_for_backend(backend)
+            validate_package_media_field(package, field_id, live_schema, "video")
+            with self.lock:
+                self._check_video_source_locked(job_id, index, backend, output, query)
+                asset_id = self.video_output_assets.get(source_key)
+            if asset_id:
+                try:
+                    cached_stream, _size, cached_mime, cached_type = self.local_media_assets.open(asset_id)
+                    cached_stream.close()
+                    if cached_type != "video" or cached_mime != mime:
+                        raise ValueError("缓存视频类型与任务输出不一致")
+                except FileNotFoundError:
+                    with self.lock:
+                        self.video_output_assets.pop(source_key, None)
+                    asset_id = None
+
+            if not asset_id:
+                view_query = {"filename": filename, "subfolder": subfolder, "type": query["type"]}
+                request = urllib.request.Request(
+                    backend.url + "/view?" + urllib.parse.urlencode(view_query),
+                    headers={"Accept-Encoding": "identity"})
+                spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b", dir=self.data_dir)
+                try:
+                    with backend.opener.open(request, timeout=120) as response:
+                        if response.status != 200 or response.headers.get_all("Content-Range", []):
+                            raise BackendError("结果视频未返回完整响应")
+                        encodings = response.headers.get_all("Content-Encoding", [])
+                        if len(encodings) > 1 or (encodings and encodings[0].strip().lower() != "identity"):
+                            raise BackendError("结果视频使用了不支持的传输编码")
+                        lengths = response.headers.get_all("Content-Length", [])
+                        transfers = response.headers.get_all("Transfer-Encoding", [])
+                        transfer = transfers[0].strip().lower() if len(transfers) == 1 else ""
+                        if (len(transfers) > 1 or transfer not in {"", "identity", "chunked"}
+                                or (transfer == "chunked" and lengths)):
+                            raise BackendError("结果视频响应传输格式不明确")
+                        if len(lengths) > 1 or (lengths and not re.fullmatch(r"[0-9]{1,20}", lengths[0])):
+                            raise BackendError("结果视频响应长度无效")
+                        expected = int(lengths[0]) if lengths else None
+                        if expected is not None and not 8 <= expected <= MAX_LOCAL_VIDEO_BYTES:
+                            raise BackendError("结果视频响应大小超过 200 MiB 或为空")
+                        size = 0
+                        while True:
+                            chunk = response.read(min(128 * 1024, MAX_LOCAL_VIDEO_BYTES + 1 - size))
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > MAX_LOCAL_VIDEO_BYTES:
+                                raise BackendError("结果视频响应大小超过 200 MiB")
+                            spool.write(chunk)
+                        if size < 8 or (expected is not None and size != expected):
+                            raise BackendError("结果视频响应读取不完整")
+                    spool.seek(0)
+                    try:
+                        saved = self.local_media_assets.create_from_stream(filename, spool, size, mime)
+                    except ValueError as exc:
+                        raise BackendError("任务输出不是有效的完整视频：" + str(exc)) from None
+                    asset_id = saved["asset_id"]
+                    with self.lock:
+                        self._check_video_source_locked(job_id, index, backend, output, query)
+                        self.video_output_assets[source_key] = asset_id
+                except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                    raise BackendError("无法完整读取任务视频结果：" + str(exc)) from None
+                finally:
+                    spool.close()
+
+            with self.lock:
+                self._check_video_source_locked(job_id, index, backend, output, query)
+            result = self.sync_local_media_asset(asset_id, package_id, field_id,
+                                                 schema=live_schema, expected_backend=backend, source=source)
+            return {**result, "source_job": job_id, "output_index": index}
+
     def upload_audio(self, data):
         with self.lock:
             self.check_input_storage()
@@ -547,8 +804,8 @@ class App:
                 raise ValueError("结果图片数据不完整，无法作为下游输入")
         name = "frameweave-" + uuid.uuid4().hex + ext
         result = self.backend.upload(name, content, mime)
-        if not isinstance(result, dict) or (complete and (not isinstance(result.get("name"), str)
-                or not result["name"] or result.get("type", "input") != "input")):
+        if (not isinstance(result, dict) or not isinstance(result.get("name"), str)
+                or not result["name"] or result.get("type", "input") != "input"):
             raise BackendError("后端没有返回有效的图片输入登记，无法交给下游节点")
         returned_name = result.get("name", name)
         subfolder = result.get("subfolder", "")
@@ -669,6 +926,7 @@ class App:
         atomic_json(pending, result)
         try:
             try:
+                self.progress.ensure()
                 response = self.backend.request("/prompt", {"prompt": result["prompt"], "client_id": self.client_id}, timeout=30)
             except BackendError as exc:
                 if str(exc).startswith(("后端 HTTP 400:", "后端 HTTP 422:")):
@@ -722,6 +980,7 @@ class App:
             result.pop("backend", None)
         result.pop("retry_attempt", None)
         result.pop("retry_requests", None)
+        result.update(self.progress.snapshot(job))
         return result
 
     def _read_run(self, job_id):
@@ -915,11 +1174,11 @@ class App:
                                             continue
                                         filename = entry["filename"]
                                         suffix = Path(filename).suffix.lower()
-                                        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
+                                        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
                                             continue
                                         subfolder = entry.get("subfolder", "")
                                         url = self.register_media(filename, subfolder, entry.get("type", "output"), old["backend"])
-                                        out_type = "video" if suffix in (".mp4", ".webm") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
+                                        out_type = "video" if suffix in (".mp4", ".webm", ".mov") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
                                         outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type, "storage_type": entry.get("type", "output"), "node_id": str(output_node_id)})
                             job["outputs"] = outputs
                     elif job_id in running:
@@ -1055,6 +1314,9 @@ def make_server(app, port=0):
                     self.respond({"ok": True})
                 elif path == "/api/jobs":
                     self.respond(app.job_list())
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/preview", path):
+                    preview = app.progress.preview(path.split("/")[3])
+                    self.respond(preview[0], content_type=preview[1])
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/recipe", path):
                     self.respond(app.recipe(path.split("/")[3]))
                 elif path == '/api/editor-workflows':
@@ -1065,6 +1327,26 @@ def make_server(app, port=0):
                     self.respond({"packages": app.packages.list()})
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}", path):
                     self.respond({"package": app.packages.get(path.rsplit("/", 1)[-1])})
+                elif path.startswith("/api/assets/images/"):
+                    match = re.fullmatch(r"/api/assets/images/([0-9a-f]{64})", path)
+                    if not match:
+                        self.reject({"error": "本地图片标识无效"}, 404)
+                        return
+                    try:
+                        content, mime = app.local_assets.read(match[1])
+                    except FileNotFoundError:
+                        self.reject({"error": "本地图片不存在"}, 404)
+                        return
+                    self.respond(content, content_type=mime)
+                elif path.startswith("/api/assets/media/"):
+                    match = re.fullmatch(r"/api/assets/media/([0-9a-f]{64})", path)
+                    if not match:
+                        self.reject({"error": "本地媒体标识无效"}, 404)
+                        return
+                    try:
+                        self.stream_local_media(match[1])
+                    except FileNotFoundError:
+                        self.reject({"error": "本地媒体不存在"}, 404)
                 elif path.startswith("/api/media/"):
                     key = path.rsplit("/", 1)[-1]
                     with app.lock:
@@ -1119,6 +1401,96 @@ def make_server(app, port=0):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
+        def stream_local_media(self, asset_id):
+            stream, size, mime, _media_type = app.local_media_assets.open(asset_id)
+            with stream:
+                status, start, end = 200, 0, size - 1
+                ranges = self.headers.get_all("Range", [])
+                if ranges:
+                    valid = len(ranges) == 1 and len(ranges[0]) <= 128
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", ranges[0]) if valid else None
+                    if match is None or not (match.group(1) or match.group(2)):
+                        self.respond(b"", 416, mime, {"Accept-Ranges": "bytes", "Content-Range": f"bytes */{size}"})
+                        return
+                    try:
+                        if not match.group(1):
+                            suffix = int(match.group(2))
+                            if suffix <= 0:
+                                raise ValueError()
+                            start = max(0, size - suffix)
+                        else:
+                            start = int(match.group(1))
+                            end = int(match.group(2)) if match.group(2) else size - 1
+                            if start >= size or end < start:
+                                raise ValueError()
+                            end = min(end, size - 1)
+                    except ValueError:
+                        self.respond(b"", 416, mime, {"Accept-Ranges": "bytes", "Content-Range": f"bytes */{size}"})
+                        return
+                    status = 206
+
+                count = end - start + 1
+                self.send_response(status)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(count))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-src http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                stream.seek(start)
+                remaining = count
+                try:
+                    while remaining:
+                        chunk = stream.read(min(128 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def upload_local_media(self):
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type not in {"image/png", "image/jpeg", "image/webp",
+                                    "video/mp4", "video/webm", "video/quicktime"}:
+                self.reject({"error": "本地媒体 Content-Type 不受支持"}, 415)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.reject({"error": "Content-Length 无效"}, 400)
+                return
+            limit = MAX_LOCAL_IMAGE_BYTES if content_type.startswith("image/") else MAX_LOCAL_VIDEO_BYTES
+            if not 8 <= length <= limit:
+                self.reject({"error": "本地媒体请求大小超限"}, 413)
+                return
+            query = urllib.parse.urlsplit(self.path).query
+            try:
+                values = urllib.parse.parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+            except ValueError:
+                self.reject({"error": "媒体文件名无效"}, 400)
+                return
+            names = values.get("name", [])
+            if set(values) != {"name"} or len(names) != 1 or not names[0] or len(names[0]) > 1024:
+                self.reject({"error": "媒体请求只接受一个有效 name"}, 400)
+                return
+            try:
+                self.connection.settimeout(120)
+                result = app.create_local_media_asset(names[0], self.rfile, length, content_type)
+            except ValueError as exc:
+                self.reject({"error": str(exc)}, 400)
+                return
+            except OSError as exc:
+                self.reject({"error": str(exc)}, 502)
+                return
+            self.respond(result)
+
         def do_POST(self):
             path = urllib.parse.urlsplit(self.path).path
             is_mcp = path == "/mcp"
@@ -1132,6 +1504,9 @@ def make_server(app, port=0):
             app.last_seen = time.monotonic()
             if self.headers.get_all("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) > 1:
                 self.reject({"error": "请求须使用单一 Content-Length"}, 400)
+                return
+            if path == "/api/assets/media":
+                self.upload_local_media()
                 return
             if is_mcp:
                 accepted = set()
@@ -1181,6 +1556,28 @@ def make_server(app, port=0):
                     result = app.save_settings(data)
                 elif path == '/api/canvases':
                     result = app.canvases.save(data.get('document'))
+                elif path == '/api/assets/images':
+                    result = app.create_local_image_asset(data)
+                elif re.fullmatch(r'/api/assets/images/[0-9a-f]{64}/backend-input', path):
+                    if data:
+                        raise ValueError('同步本地图片只接受空对象')
+                    asset_id = path.split('/')[4]
+                    try:
+                        result = app.sync_local_image_asset(asset_id)
+                    except FileNotFoundError:
+                        self.respond({"error": "本地图片不存在"}, 404)
+                        return
+                elif re.fullmatch(r'/api/assets/media/[0-9a-f]{64}/backend-input', path):
+                    if data and (set(data) != {"package_id", "field_id"}
+                                 or any(not isinstance(value, str) or not value for value in data.values())):
+                        raise ValueError('媒体同步只接受空对象或 package_id 和 field_id')
+                    asset_id = path.split('/')[4]
+                    try:
+                        result = app.sync_local_media_asset(
+                            asset_id, data.get("package_id"), data.get("field_id"))
+                    except FileNotFoundError:
+                        self.respond({"error": "本地媒体不存在"}, 404)
+                        return
                 elif path == '/api/upload-audio':
                     result = app.upload_audio(data)
                 elif re.fullmatch(r'/api/jobs/[\w-]{1,100}/output-location', path):
@@ -1266,6 +1663,8 @@ def make_server(app, port=0):
                     result = app.cancel(path.split("/")[3])
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/image-input", path):
                     result = app.image_input(path.split("/")[3], data)
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/media-input", path):
+                    result = app.media_input(path.split("/")[3], data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/retry", path):
                     result = app.retry(path.split("/")[3], data)
                 elif path == "/api/shutdown":

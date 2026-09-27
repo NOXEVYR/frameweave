@@ -8,20 +8,43 @@ const copy = value => JSON.parse(JSON.stringify(value));
 const document = () => ({ nodes: [{ id: 1, type: 'Known', mode: 4, widgets_values: { seed: 8 } }], links: [], extra: { ue_links: [1] } });
 function harness(options = {}) {
   const replies = [], calls = [], timers = [];
-  let listener, extension, current = document();
-  const app = {
-    graph: { serialize: () => current },
+  let listener, extension, current = document(), canvasReadyChecks = 0, vueReadyChecks = 0, windowAppChecks = 0;
+  let splashPresent = Boolean(options.splashPresent);
+  const rootGraph = { serialize: () => current };
+  const appPrototype = {};
+  const app = Object.assign(Object.create(appPrototype), {
+    graph: rootGraph,
     registerExtension: value => { extension = value; },
     async loadGraphData(value) { calls.push('load'); if (options.load) await options.load(value); current = value; },
     async graphToPrompt() { calls.push('compile'); return { workflow: current, output: { 1: { class_type: 'Known', inputs: {} } } }; },
+  });
+  Object.defineProperties(app, {
+    rootGraphOrUndefined: { get: () => app.rootGraph || rootGraph },
+    canvasOrUndefined: { get: () => {
+      canvasReadyChecks += 1;
+      return options.canvasReadyAfter && canvasReadyChecks < options.canvasReadyAfter
+        ? undefined : { graph: app.rootGraph || rootGraph, canvas: { isConnected: true } };
+    } },
+    canvasElRef: { get: () => ({ value: options.canvasReadyAfter && canvasReadyChecks < options.canvasReadyAfter ? null : { isConnected: true } }) },
+    vueAppReady: { get: () => !options.vueReadyAfter || ++vueReadyChecks >= options.vueReadyAfter },
+  });
+  if (options.loadApiJson !== false) appPrototype.loadApiJson = async (prompt, name, settings) => {
+    calls.push('importApi');
+    options.loadApiJsonArguments?.(prompt, name, settings);
+    if (options.loadApiJson) await options.loadApiJson(prompt, { get: () => current, set: value => { current = value; }, app });
   };
   const parent = { postMessage: (message, origin) => replies.push({ message: copy(message), origin }) };
-  const window = { parent, __PRISM_EDITOR__: { parentOrigin: 'http://127.0.0.1:8766', bridgeNonce: 'private-session' }, LiteGraph: { registered_node_types: { Known: {} } }, addEventListener: (_name, callback) => { listener = callback; }, setTimeout: callback => timers.push(callback) };
-  vm.runInNewContext(source, { app, window, setTimeout });
+  const window = { parent, app, graph: rootGraph, __PRISM_EDITOR__: { parentOrigin: 'http://127.0.0.1:8766', bridgeNonce: 'private-session' }, LiteGraph: { registered_node_types: { Known: {} } }, addEventListener: (_name, callback) => { listener = callback; }, setTimeout: callback => timers.push(callback) };
+  if (options.windowAppReadyAfter) Object.defineProperty(window, 'app', { get: () =>
+    ++windowAppChecks >= options.windowAppReadyAfter ? app : undefined });
+  const documentObject = { querySelector: selector => selector === '#splash-loader' && splashPresent ? { isConnected: true } : null };
+  vm.runInNewContext(source, { app, window, document: documentObject, setTimeout, TextEncoder });
   const emit = (action, requestId, data = {}, overrides = {}) => listener({ source: parent, origin: window.__PRISM_EDITOR__.parentOrigin, data: { source: 'prism-parent', nonce: 'private-session', action, requestId, ...data }, ...overrides });
   const flush = () => new Promise(resolve => setImmediate(resolve));
-  const start = () => { extension.setup(); while (timers.length) timers.shift()(); };
-  return { app, window, parent, replies, calls, emit, flush, start, current: () => current };
+  const setup = () => extension.setup();
+  const runNextTimer = () => timers.shift()?.();
+  const start = () => { setup(); while (timers.length) runNextTimer(); };
+  return { app, window, parent, replies, calls, emit, flush, setup, runNextTimer, start, current: () => current, setCurrent: value => { current = value; }, setSplashPresent: value => { splashPresent = value; }, canvasReadyChecks: () => canvasReadyChecks, windowAppChecks: () => windowAppChecks };
 }
 
 test('ready is deferred and authenticated; load preserves modes, object widgets and metadata', async () => {
@@ -34,6 +57,32 @@ test('ready is deferred and authenticated; load preserves modes, object widgets 
   const snapshot = h.replies.at(-1).message.result.workflow;
   h.current().nodes[0].mode = 0; assert.equal(snapshot.nodes[0].mode, 4); assert.deepEqual(snapshot.extra.ue_links, [1]);
   await assert.rejects(h.app.queuePrompt(), /返回棱光/);
+});
+
+test('does not signal ready until the native canvas and its DOM element have mounted', () => {
+  const h = harness({ canvasReadyAfter: 4, vueReadyAfter: 4 });
+  h.start();
+  assert.equal(h.canvasReadyChecks(), 4);
+  assert.equal(h.replies.length, 1);
+  assert.equal(h.replies[0].message.action, 'ready');
+});
+
+test('does not signal ready until ComfyUI publishes the mounted app and graph', () => {
+  const h = harness({ windowAppReadyAfter: 5 });
+  h.start();
+  assert.equal(h.windowAppChecks(), 5);
+  assert.equal(h.replies.length, 1);
+  assert.equal(h.replies[0].message.action, 'ready');
+});
+
+test('does not signal ready until the ComfyUI startup splash disappears', () => {
+  const h = harness({ splashPresent: true });
+  h.setup();
+  h.runNextTimer();
+  assert.equal(h.replies.length, 0);
+  h.setSplashPresent(false);
+  h.runNextTimer();
+  assert.equal(h.replies[0].message.action, 'ready');
 });
 
 test('rejects foreign source, origin, nonce and malformed request IDs without touching graph', async () => {
@@ -254,4 +303,165 @@ test('callback changes to enum constraints cannot report a now-invalid parameter
   const reply = h.replies.at(-1).message;
   assert(reply.error); assert.equal(reply.result.rolled_back, true); assert.deepEqual(reply.result.applied, []);
   assert.equal(h.node.widgets[0].value, 'model-a');
+});
+
+test('imports API prompts through ComfyUI and returns the real native document and controls only after exact recompilation', async () => {
+  const expected = { '1': { class_type: 'Known', inputs: { seed: 77, ref: ['2', 0], extension_data: { keep: ['all', false] } }, _meta: { title: 'Unknown metadata' } }, '2': { class_type: 'Known', inputs: { seed: 4 } } };
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [77] }, { id: 2, type: 'Known' }], links: [[1, 2, 0, 1, 0, 'IMAGE']] };
+  const h = harness({
+    loadApiJsonArguments: (_prompt, name, settings) => {
+      assert.equal(name, 'PrismCanvas preset');
+      assert.deepEqual(JSON.parse(JSON.stringify(settings)), { deferWarnings: true });
+    },
+    loadApiJson: (_prompt, graph) => graph.set(converted),
+  }); h.start();
+  h.emit('load', 'load', { document: document() }); await h.flush();
+  h.app.graphToPrompt = async targetGraph => { h.calls.push('compileImported'); assert.equal(targetGraph, h.app.graph); return { workflow: converted, output: { '2': { class_type: 'Known', inputs: { seed: 4 } }, '1': { _meta: { title: 'Unknown metadata' }, inputs: { extension_data: { keep: ['all', false] }, ref: ['2', 0], seed: 77 }, class_type: 'Known' } } }; };
+  h.emit('importApi', 'convert', { prompt: expected }); await h.flush();
+  const response = h.replies.at(-1).message;
+  assert.equal(response.error, undefined);
+  assert.deepEqual(response.result.workflow, converted);
+  assert.deepEqual(response.result.output, expected);
+  assert(h.calls.includes('importApi')); assert(h.calls.includes('compileImported'));
+  assert.equal(h.current(), converted);
+  assert.equal(h.calls.some(call => /queue|generate|prompt/i.test(call)), false);
+});
+
+test('awaits ComfyUI prototype importer when an extension instance wrapper drops its Promise', async () => {
+  const expected = { 1: { class_type: 'Known', inputs: { seed: 4 } } };
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const h = harness(); h.start();
+  let importerFinished = false;
+  Object.setPrototypeOf(h.app, {
+    loadApiJson: async function (_prompt, name, settings) {
+      assert.equal(name, 'PrismCanvas preset');
+      assert.deepEqual(JSON.parse(JSON.stringify(settings)), { deferWarnings: true });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      h.setCurrent(converted);
+      importerFinished = true;
+    },
+  });
+  h.app.loadApiJson = async () => { h.calls.push('brokenExtensionWrapper'); };
+  h.emit('load', 'load', { document: document() }); await h.flush();
+  h.app.graphToPrompt = async () => ({ workflow: converted, output: expected });
+  h.emit('importApi', 'convert', { prompt: expected });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  assert.equal(importerFinished, true);
+  assert(!h.calls.includes('brokenExtensionWrapper'));
+  assert.deepEqual(h.replies.at(-1).message.result.workflow, converted);
+});
+
+test('allows only a frontend-added display title during API prompt recompilation', async () => {
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const run = async (expected, output) => {
+    const h = harness({ loadApiJson: (_prompt, graph) => graph.set(converted) }); h.start();
+    h.emit('load', 'load', { document: document() }); await h.flush();
+    h.app.graphToPrompt = async () => ({ workflow: converted, output });
+    h.emit('importApi', 'convert', { prompt: expected }); await h.flush();
+    return { h, response: h.replies.at(-1).message };
+  };
+
+  const { h: accepted, response } = await run(
+    { 1: { class_type: 'Known', inputs: { seed: 4 } } },
+    { 1: { class_type: 'Known', inputs: { seed: 4 }, _meta: { title: 'Known' } } });
+  assert.equal(response.error, undefined);
+  assert.deepEqual(accepted.current(), converted);
+
+  const declaredTitle = await run(
+    { 1: { class_type: 'Known', inputs: {}, _meta: { title: 'Original' } } },
+    { 1: { class_type: 'Known', inputs: {}, _meta: { title: 'Changed' } } });
+  assert.match(declaredTitle.response.error, /无损转换/);
+  assert.equal(JSON.stringify(declaredTitle.h.current()), JSON.stringify(document()));
+
+  const unknownMetadata = await run(
+    { 1: { class_type: 'Known', inputs: {}, _meta: { plugin: 'keep' } } },
+    { 1: { class_type: 'Known', inputs: {}, _meta: { title: 'Known' } } });
+  assert.match(unknownMetadata.response.error, /无损转换/);
+  assert.equal(JSON.stringify(unknownMetadata.h.current()), JSON.stringify(document()));
+});
+
+test('recompiles the exact imported root graph instead of an unrelated active canvas', async () => {
+  const expected = { 1: { class_type: 'Known', inputs: { seed: 4 } } };
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const h = harness({ loadApiJson: (_prompt, { set }) => set(converted) }); h.start();
+  h.emit('load', 'load', { document: document() }); await h.flush();
+  h.app.graphToPrompt = async targetGraph => ({ workflow: converted,
+    output: targetGraph === h.app.graph ? expected : {} });
+  h.emit('importApi', 'convert', { prompt: expected }); await h.flush();
+  const response = h.replies.at(-1).message;
+  assert.equal(response.error, undefined);
+  assert.deepEqual(response.result.workflow, converted);
+});
+
+test('blocks an API importer full-document reset while retaining the claimed editor draft', async () => {
+  const expected = { 1: { class_type: 'Known', inputs: { seed: 4 } } };
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const h = harness({ loadApiJson: async (_prompt, { app, set }) => {
+    await app.loadGraphData(undefined);
+    await app.loadGraphData(undefined);
+    set(converted);
+  } });
+  h.start();
+  h.emit('load', 'load', { document: document() }); await h.flush();
+  h.app.graphToPrompt = async () => ({ workflow: converted, output: expected });
+  h.emit('importApi', 'convert', { prompt: expected }); await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  assert.deepEqual(h.current(), converted);
+
+  await h.app.loadGraphData(undefined);
+  assert.equal(JSON.stringify(h.current()), JSON.stringify(converted));
+  assert(h.replies.filter(reply => reply.message.action === 'notice').length >= 2);
+});
+
+test('rolls back when API importer finalization throws even after valid native nodes were built', async () => {
+  const before = document();
+  const expected = { 1: { class_type: 'Known', inputs: { seed: 4 } } };
+  const converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const h = harness({ loadApiJson: (_prompt, { set }) => {
+    set(converted);
+    throw new Error('workflow tab activation failed after native nodes were built');
+  } });
+  h.start();
+  h.emit('load', 'load', { document: document() }); await h.flush();
+  h.app.graphToPrompt = async () => ({ workflow: converted, output: {
+    1: { class_type: 'Known', inputs: { seed: 4 }, _meta: { title: 'Known' } },
+  } });
+  h.emit('importApi', 'convert', { prompt: expected }); await h.flush();
+  const response = h.replies.at(-1).message;
+  assert.match(response.error, /无损转换/);
+  assert.equal(JSON.stringify(h.current()), JSON.stringify(before));
+  assert.deepEqual(h.calls, ['load', 'importApi', 'load']);
+});
+
+test('refuses a ComfyUI frontend without loadApiJson and leaves the bootstrap workflow intact', async () => {
+  const h = harness({ loadApiJson: false }); h.start();
+  h.app.loadApiJson = async () => { h.calls.push('unsafeInstanceImporter'); };
+  const before = copy(h.current()); h.emit('load', 'load', { document: before }); await h.flush();
+  h.emit('importApi', 'convert', { prompt: { 1: { class_type: 'Known', inputs: { seed: 4 } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /不支持 API 工作流导入/);
+  assert.equal(JSON.stringify(h.current()), JSON.stringify(before));
+  assert.deepEqual(h.calls, ['load']);
+});
+
+test('semantic mismatch including an unknown field restores the bootstrap graph and does not return an editor conversion', async () => {
+  const before = document(), converted = { nodes: [{ id: 1, type: 'Known', widgets_values: [4] }], links: [] };
+  const h = harness({ loadApiJson: (_prompt, graph) => graph.set(converted) }); h.start();
+  h.emit('load', 'load', { document: before }); await h.flush();
+  h.app.graphToPrompt = async () => ({ workflow: converted, output: { 1: { class_type: 'Known', inputs: { seed: 4, unknown_from_extension: 'changed' } } } });
+  h.emit('importApi', 'convert', { prompt: { 1: { class_type: 'Known', inputs: { seed: 4, unknown_from_extension: 'original' } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /无损转换/);
+  assert.equal(JSON.stringify(h.current()), JSON.stringify(before));
+  assert.deepEqual(h.calls, ['load', 'importApi', 'load']);
+});
+
+test('failed API import is rolled back even when the frontend throws after changing the graph', async () => {
+  const before = document();
+  const h = harness({ loadApiJson: (_prompt, graph) => { graph.set({ nodes: [], links: [] }); throw new Error('private node data'); } }); h.start();
+  h.emit('load', 'load', { document: before }); await h.flush();
+  h.emit('importApi', 'convert', { prompt: { 1: { class_type: 'Known', inputs: { seed: 4 } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /无损转换/);
+  assert.equal(JSON.stringify(h.current()), JSON.stringify(before));
+  assert(!JSON.stringify(h.replies).includes('private node data'));
 });

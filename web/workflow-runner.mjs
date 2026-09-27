@@ -2,6 +2,15 @@
 import { executionOrder, generationPayload, parseGraph, serializeGraph } from './graph.mjs';
 
 export const RUN_SCHEMA = 'frameweave.workflow-run.v1';
+export function validateRunTargets(graph, targets) {
+  const order = executionOrder(graph, targets);
+  if (!order.length) throw new Error('请选择至少一个可执行生成节点');
+  for (const id of order) {
+    const node = graph.nodes.find(item => item.id === id);
+    if (node.data.kind === 'package' && !node.data.package_id) throw new Error(`「${node.data.title}」尚未建立外层参数，请先提取参数或复用已保存配置；本次未启动任何节点。`);
+  }
+  return order;
+}
 const copy = value => value === null || value === undefined ? value : JSON.parse(JSON.stringify(value));
 const terminal = new Set(['completed', 'failed', 'cancelled']);
 const stepStates = new Set(['pending', 'preparing', 'submitting', 'uncertain', 'running', 'completed', 'failed']);
@@ -79,18 +88,20 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
       const upstream = state.steps.find(item => item.node_id === upstreamId);
       if (!upstream || upstream.state !== 'completed' || !upstream.job_id) throw new Failure('上游任务尚未成功完成，不能继续下游。');
       const selectedIndex = edge.outputIndex ?? 0;
-      const images = (upstream.outputs || []).filter(output => output.type === 'image');
+      const target=state.graph.nodes.find(node=>node.id===step.node_id);
+      const mediaType=target?.data.kind==='package' && target.data.packageFields?.find(field=>field.id===edge.targetField)?.type==='video'?'video':'image';
+      const images = (upstream.outputs || []).filter(output => output.type === mediaType);
       const candidates = edge.sourceOutput ? images.filter(output => output.node_id === edge.sourceOutput) : images;
-      if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= candidates.length) throw new Failure('上游任务没有所绑定输出节点及序号的图片；请检查输出接口，视频与音频不能直接作为图片输入。');
+      if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= candidates.length) throw new Failure(`上游任务没有所绑定输出节点及序号的${mediaType==='video'?'视频':'图片'}；请检查输出接口，视频与音频不能直接作为图片输入。`);
       const outputIndex = images.indexOf(candidates[selectedIndex]);
       let input = step.image_inputs[edge.id];
-      if (!input || input.job_id !== upstream.job_id || input.output_index !== outputIndex) {
+      if (!input || input.job_id !== upstream.job_id || input.output_index !== outputIndex || (input.media_type || 'image') !== mediaType) {
         await checkBackend(); guardStop();
         let uploaded;
-        try { uploaded = await api(`/api/jobs/${encodeURIComponent(upstream.job_id)}/image-input`, { output_index: outputIndex }); }
-        catch (error) { throw new Pause(`上游图片交接未完成：${error.message}。不会提交下游生成。`); }
+        try { uploaded = await api(`/api/jobs/${encodeURIComponent(upstream.job_id)}/${mediaType==='video'?'media-input':'image-input'}`, { output_index: outputIndex, ...(mediaType==='video'?{package_id:target.data.package_id,field_id:edge.targetField}:{}) }); }
+        catch (error) { throw new Pause(`上游素材交接未完成：${error.message}。不会提交下游生成。`); }
         if (typeof uploaded?.name !== 'string' || !uploaded.name) throw new Failure('图片交接未返回有效输入名称');
-        input = { job_id: upstream.job_id, output_index: outputIndex, name: uploaded.name, url: uploaded.url || '' };
+        input = { job_id: upstream.job_id, output_index: outputIndex, name: uploaded.name, url: uploaded.url || '', ...(mediaType==='video'?{media_type:mediaType}:{}) };
         step.image_inputs[edge.id] = input; await persist();
       }
       edgeImages[edge.id] = input.name;
@@ -178,11 +189,7 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
       validateCanvasId(canvasId);
       const frozen = parseGraph(serializeGraph(graph));
       const targets = targetIds === undefined ? frozen.nodes.filter(node => node.type === 'generation').map(node => node.id) : [...targetIds];
-      const order = executionOrder(frozen, targets); if (!order.length) throw new Error('请选择至少一个可执行生成节点');
-      for (const id of order) {
-        const node = frozen.nodes.find(item => item.id === id);
-        if (node.data.kind === 'package' && !node.data.package_id) throw new Error(`「${node.data.title}」尚未建立外层参数，请先提取参数或复用已保存配置；本次未启动任何节点。`);
-      }
+      const order = validateRunTargets(frozen, targets);
       const normalized = normalizeBackend(backend), now = new Date().toISOString();
       state = { schema: RUN_SCHEMA, id: globalThis.crypto.randomUUID(), status: 'running', backend: normalized, graph: frozen, target_ids: targets, created_at: now, updated_at: now, error: '', steps: order.map(node_id => ({ node_id, state: 'pending', request_id: null, request: null, job_id: null, job_status: null, image_inputs: {} })) };
       if (canvasId !== undefined) state.canvas_id = canvasId;

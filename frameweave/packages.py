@@ -17,7 +17,7 @@ from .workflows import _check_json_limits, _expanded_inputs, _spec
 
 FORMAT = "frameweave-workflow"
 MAX_BYTES = 2 * 1024 * 1024
-TYPES = {"text", "integer", "number", "boolean", "select", "image", "audio"}
+TYPES = {"text", "integer", "number", "boolean", "select", "image", "audio", "video"}
 ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 RESERVED = {"__proto__", "prototype", "constructor"}
 MODEL_INPUTS = {"ckpt_name", "unet_name", "clip_name", "vae_name", "lora_name", "clip_name1", "clip_name2"}
@@ -152,12 +152,12 @@ def scalar(value):
 
 def validate_value(field, value, *, template=False):
     kind, label = field["type"], field["label"]
-    if kind in {"text", "image", "audio"}:
-        if not isinstance(value, str) or len(value) > (1024 if kind in {"image", "audio"} else 64000):
+    if kind in {"text", "image", "audio", "video"}:
+        if not isinstance(value, str) or len(value) > (1024 if kind in {"image", "audio", "video"} else 64000):
             raise ValueError(f"{label} 的文本类型或长度无效")
         if not value.strip() and field.get("required") and not template:
             raise ValueError(f"请填写 {label}")
-        if kind in {"image", "audio"} and value:
+        if kind in {"image", "audio", "video"} and value:
             safe_relative(value)
     elif kind == "boolean":
         if type(value) is not bool:
@@ -194,9 +194,11 @@ def normalize_fields(fields, prompt):
         kind = item.get("type")
         if not isinstance(kind, str) or kind not in TYPES:
             raise ValueError("工作流包不支持此参数类型")
+        if kind == "video" and _MEDIA_INPUTS.get("video", {}).get(prompt[node_id]["class_type"]) != name:
+            raise ValueError("视频参数只能绑定到 LoadVideo.file 或 VHS_LoadVideo.video")
         field = {"id": field_id, "label": text(item.get("label"), "参数名称", 120),
                  "node_id": node_id, "input": name, "type": kind,
-                 "required": item.get("required", kind in {"image", "audio"}) is True}
+                 "required": item.get("required", kind in {"image", "audio", "video"}) is True}
         if kind == "select":
             options = item.get("options")
             if not isinstance(options, list) or not 1 <= len(options) <= 512 or any(not scalar(v) or (isinstance(v, str) and len(v) > 2048) for v in options):
@@ -212,7 +214,7 @@ def normalize_fields(fields, prompt):
             if field.get("min", -math.inf) > field.get("max", math.inf):
                 raise ValueError("数值下限不能大于上限")
         default = item.get("default", prompt[node_id]["inputs"][name])
-        if kind in {"image", "audio"}:
+        if kind in {"image", "audio", "video"}:
             default, field["required"] = "", True
             prompt[node_id]["inputs"][name] = ""
         field["default"] = validate_value(field, default, template=True)
@@ -237,6 +239,12 @@ def normalize_document(document):
         if node["class_type"] == "LoadAudio" and "audio" in node["inputs"]:
             if not any(field["node_id"] == node_id and field["input"] == "audio" and field["type"] == "audio" for field in fields):
                 raise ValueError("参考音频节点必须开放音频上传参数，才能在其他设备上使用工作流包")
+        if node["class_type"] == "LoadVideo" and "file" in node["inputs"]:
+            if not any(field["node_id"] == node_id and field["input"] == "file" and field["type"] == "video" for field in fields):
+                raise ValueError("LoadVideo 节点必须开放视频上传参数，才能在其他设备上使用工作流包")
+        if node["class_type"] == "VHS_LoadVideo" and "video" in node["inputs"]:
+            if not any(field["node_id"] == node_id and field["input"] == "video" and field["type"] == "video" for field in fields):
+                raise ValueError("VHS_LoadVideo 节点必须开放视频上传参数，才能在其他设备上使用工作流包")
     result = {"format": FORMAT, "version": 1, "name": text(document.get("name"), "工作流包名称", 120),
               "description": text(document.get("description", ""), "说明", 2000, empty=True),
               "prompt": prompt, "fields": fields}
@@ -253,10 +261,10 @@ def _limit_inspection_fields(fields, field_limit):
         raise ValueError("工作流候选输入超过 4096 项，请拆分工作流后检查")
     if len(fields) <= limit:
         return fields
-    media = [field for field in fields if field['type'] in {'image', 'audio'}]
+    media = [field for field in fields if field['type'] in {'image', 'audio', 'video'}]
     if len(media) > limit:
         raise ValueError(f'工作流有超过 {limit} 个独立媒体输入，请在内部拆分工作流后应用')
-    ranked = sorted(fields, key=lambda field: (field['type'] not in {'image', 'audio'}, not field['recommended']))
+    ranked = sorted(fields, key=lambda field: (field['type'] not in {'image', 'audio', 'video'}, not field['recommended']))
     keep = {field['id'] for field in ranked[:limit]}
     return [field for field in fields if field['id'] in keep]
 
@@ -274,7 +282,8 @@ def inspect_document(document, info=None, *, field_limit=64):
     fields, info = [], info or {}
     labels = {"text": "提示词", "prompt": "画面提示词", "positive": "正向提示词", "negative": "负向提示词", "seed": "随机种子",
               "noise_seed": "随机种子", "steps": "采样步数", "cfg": "提示词引导", "width": "宽度",
-              "height": "高度", "image": "参考图片", "denoise": "重绘强度", "batch_size": "生成数量", "length": "帧数"}
+              "height": "高度", "image": "参考图片", "file": "参考视频", "video": "参考视频",
+              "denoise": "重绘强度", "batch_size": "生成数量", "length": "帧数"}
     polarity = {}
     for node in prompt.values():
         for key in ("positive", "negative"):
@@ -306,13 +315,23 @@ def inspect_document(document, info=None, *, field_limit=64):
             if node["class_type"] in {"LoadImage", "LoadImageMask"} and name == "image":
                 kind, value = "image", ""
                 prompt[node_id]["inputs"][name] = ""
+            if node["class_type"] == "LoadVideo" and name == "file":
+                if schema and not _media_input_schema_supported(node["class_type"], name, schema, "video"):
+                    raise ValueError("当前后端 LoadVideo.file 未声明视频上传字段")
+                kind, value = "video", ""
+                prompt[node_id]["inputs"][name] = ""
+            if node["class_type"] == "VHS_LoadVideo" and name == "video":
+                if schema and not _media_input_schema_supported(node["class_type"], name, schema, "video"):
+                    raise ValueError("当前后端 VHS_LoadVideo.video 未声明视频上传字段")
+                kind, value = "video", ""
+                prompt[node_id]["inputs"][name] = ""
             if meta.get("audio_upload") or (name == "audio" and (node["class_type"] == "LoadAudio" or "AUDIO" in schema.get("output", [])) and isinstance(value, str)):
                 kind, value = "audio", ""
                 prompt[node_id]["inputs"][name] = ""
             label = polarity.get(node_id, labels.get(name, name)) if name == "text" else labels.get(name, name)
             field = {"id": "f_" + hashlib.sha256((node_id + "\0" + name).encode()).hexdigest()[:16],
                      "label": f"{label} · {node_id}", "node_id": node_id, "input": name,
-                     "type": kind, "default": value, "required": kind in {"image", "audio"},
+                     "type": kind, "default": value, "required": kind in {"image", "audio", "video"},
                      "recommended": name in labels and name not in MODEL_INPUTS}
             if kind == "select":
                 field["options"] = options
@@ -328,6 +347,55 @@ def inspect_document(document, info=None, *, field_limit=64):
     fields = _limit_inspection_fields(fields, field_limit)
     return {"name": "我的生成工作流", "description": "", "prompt": prompt, "fields": fields,
             "requirements": {"nodes": sorted({node["class_type"] for node in prompt.values()})}}
+
+
+_MEDIA_INPUTS = {
+    "image": {"LoadImage": "image", "LoadImageMask": "image"},
+    "video": {"LoadVideo": "file", "VHS_LoadVideo": "video"},
+}
+
+
+def _media_input_schema_supported(node_type, input_name, schema, media_type):
+    """Return whether a known file-loader widget is declared by live object_info."""
+    if _MEDIA_INPUTS.get(media_type, {}).get(node_type) != input_name or not isinstance(schema, dict):
+        return False
+    groups = schema.get("input")
+    if not isinstance(groups, dict):
+        return False
+    definition = next((groups.get(group, {}).get(input_name) for group in ("required", "optional")
+                      if isinstance(groups.get(group), dict) and input_name in groups[group]), None)
+    if definition is None:
+        return False
+    try:
+        kind, meta = _spec(definition)
+    except ValueError:
+        return False
+    if media_type == "video" and node_type == "LoadVideo":
+        return kind == "COMBO" and meta.get("video_upload") is True
+    if media_type == "video" and node_type == "VHS_LoadVideo":
+        return ((kind == "COMBO" and meta.get("video_upload") is True)
+                or isinstance(kind, list) and all(isinstance(value, str) for value in kind))
+    if media_type == "image":
+        return ((kind == "COMBO" and meta.get("image_upload") is True)
+                or isinstance(kind, list) and all(isinstance(value, str) for value in kind))
+    return False
+
+
+def validate_package_media_field(package, field_id, info, media_type):
+    """Resolve a stored package field against its node and the current live schema."""
+    if media_type not in _MEDIA_INPUTS or not isinstance(info, dict):
+        raise ValueError("媒体类型或当前后端节点信息无效")
+    normalized = normalize_document(package)
+    field = next((item for item in normalized["fields"] if item["id"] == field_id), None)
+    if field is None or field["type"] != media_type:
+        raise ValueError("工作流包字段与上传媒体类型不一致")
+    node = normalized["prompt"][field["node_id"]]
+    node_type = node["class_type"]
+    schema = info.get(node_type)
+    if (node["inputs"].get(field["input"]) != ""
+            or not _media_input_schema_supported(node_type, field["input"], schema, media_type)):
+        raise ValueError("当前工作流包字段未绑定到后端声明的兼容媒体上传节点")
+    return field, node
 
 
 def apply_values(document, values):

@@ -213,3 +213,15 @@ test('optional canvas identity is durable metadata through recovery and rejects 
     assert.throws(() => harness({ initial: { ...h.disk(), canvas_id: invalid } }).make(), /画布关联标识/);
   }
 });
+
+test('typed video workflow transfers the video-only output index and keeps submission evidence', async () => {
+  const h=harness({apiHook:(path,body)=>path.endsWith('/media-input') ? {name:'clip.webm',url:'/media/video-input'} : undefined});
+  const first=createNode('generation',0,0,{kind:'h3_t2v'});first.id='video-first';
+  const next=createNode('generation',400,0,{kind:'package',package_id:'p-video',packageFields:[{id:'clip',type:'video',label:'运动参考'}]});next.id='video-next';
+  const graph={nodes:[first,next],edges:[]};connect(graph,first.id,next.id,{targetField:'clip',sourceField:'video'});
+  const state=await h.make().start({graph,targetIds:[next.id],backend:BACKEND});
+  assert.equal(state.status,'completed');
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/media-input')).body,{output_index:0,package_id:'p-video',field_id:'clip'});
+  assert.equal(h.calls.filter(c=>c.path==='/api/generate')[1].body.request.values.clip,'clip.webm');
+  assert.equal(state.steps[1].image_inputs[graph.edges[0].id].media_type,'video');
+});

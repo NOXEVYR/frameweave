@@ -15,7 +15,7 @@ function remappedMediaOwners(node, fields, values, backend, rebindings) {
   const oldValues = node.data.packageValues || {};
   const oldOwners = node.data.packageMediaBackends || {};
   const owners = {};
-  const mediaTypes = new Set(['image', 'audio']);
+  const mediaTypes = new Set(['image', 'audio', 'video']);
   const engineChanged = Boolean(node.data.editor_backend && backend && node.data.editor_backend !== backend);
 
   for (const [oldId, oldField] of oldFields) {
@@ -93,3 +93,4 @@ export function applyEditorInterfaceGraph(graph, nodeId, result) {
   const checked = parseGraph(serializeGraph(copy));
   return { nodes: checked.nodes, edges: checked.edges };
 }
+

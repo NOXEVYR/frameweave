@@ -1,3 +1,5 @@
+import { normalizePresetPrompt } from './preset-editor.mjs';
+
 /** Original ComfyUI documents live locally; native controls run on an isolated origin. */
 export const EDITOR_LIMIT = 16 * 1024 * 1024;
 export function editorDocument(text) {
@@ -8,12 +10,12 @@ export function editorDocument(text) {
 export function createNativeWorkflowEditor(host) {
   let active = null, opening = false;
   const element = (tag, text = '') => { const item = document.createElement(tag); item.textContent = text; return item; };
-  async function open(node, backendReady = false, preparation = false) {
+  async function open(node, backendReady = false, preparation = false, presetPrompt = null, onPresetSaved = null) {
     if (active || opening) throw new Error('请先返回外层画布');
     opening = true;
-    try { await openEditor(node, backendReady, preparation); } finally { opening = false; }
+    try { await openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved); } finally { opening = false; }
   }
-  async function openEditor(node, backendReady, preparation) {
+  async function openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved) {
     let workflow = await host.api(`/api/editor-workflows/${node.data.editor_id}`);
     const selectedBackend = backendReady || (host.ensureBackend ? await host.ensureBackend(node, workflow) : null);
     if (host.ensureBackend && !selectedBackend) return;
@@ -32,7 +34,8 @@ export function createNativeWorkflowEditor(host) {
     const frame = element('iframe'); frame.title = `${workflow.name} · 内部工作流`;
     frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-downloads allow-modals');
     frame.referrerPolicy = 'no-referrer';
-    const state = { ready: false, busy: false, missing: [], pending: new Map(), session, frame, dialog };
+    const state = { ready: false, busy: false, missing: [], pending: new Map(), session, frame, dialog,
+      presetBound: !presetPrompt };
     active = state;
     const releaseOnLeave = () => host.releaseSession(session.session_id);
     window.addEventListener('pagehide', releaseOnLeave, { once: true });
@@ -45,7 +48,12 @@ export function createNativeWorkflowEditor(host) {
       });
     }
     function show(message) { status.textContent = message; }
-    function refresh() { draft.disabled = apply.disabled = !state.ready || state.busy || !!state.missing.length; back.disabled = state.busy; }
+    function refresh() {
+      const presetUnbound = Boolean(presetPrompt) && !state.presetBound;
+      draft.disabled = apply.disabled = !state.ready || state.busy || !!state.missing.length || presetUnbound;
+      original.disabled = state.busy || presetUnbound;
+      back.disabled = state.busy;
+    }
     async function action(callback) {
       if (state.busy) return;
       state.busy = true; refresh();
@@ -53,6 +61,7 @@ export function createNativeWorkflowEditor(host) {
       finally { state.busy = false; refresh(); }
     }
     async function saveDraft() {
+      if (presetPrompt && !state.presetBound) throw new Error('预设尚未绑定到外层工作流，不能保存内部草稿。');
       const result = await request('snapshot');
       const saved = await host.api(`/api/editor-workflows/${id}/draft`, { document: result.workflow, base_revision: workflow.revision });
       workflow.revision = saved.revision;
@@ -67,9 +76,13 @@ export function createNativeWorkflowEditor(host) {
       await host.api('/api/editor-sessions/close', { session_id: session.session_id });
     }
     const back = element('button', '← 返回画布'); back.className = 'button quiet';
-    back.onclick = () => action(async () => { if (state.ready && !state.missing.length) await saveDraft(); await close(); });
+    back.onclick = () => action(async () => {
+      if (state.ready && !state.missing.length && (!presetPrompt || state.presetBound)) await saveDraft();
+      await close();
+    });
     const draft = element('button', '保存内部草稿'); draft.className = 'button quiet'; draft.onclick = () => action(saveDraft);
     async function applyParameters() {
+      if (presetPrompt && !state.presetBound) throw new Error('预设尚未绑定到外层工作流，不能应用参数。');
       const result = await request('compile');
       const applied = await host.applyInterface(node, result, { session_id: session.session_id, base_revision: workflow.revision });
       if (!applied) { show('尚未选择外层参数。可以重新提取，或返回画布使用已保存配置。'); return; }
@@ -82,6 +95,7 @@ export function createNativeWorkflowEditor(host) {
     reveal.onclick = () => { preparation = false; dialog.classList.remove('native-prepare-dialog'); reveal.hidden = true; apply.textContent = '应用参数并返回'; };
     const original = element('button', '导出完整工作流'); original.className = 'button quiet';
     original.onclick = () => action(async () => {
+      if (presetPrompt && !state.presetBound) throw new Error('预设尚未绑定到外层工作流，不能导出未验证的内部图。');
       if (state.ready && !state.missing.length) {
         const result = await request('snapshot'); host.downloadJSON(result.workflow, `${workflow.name}.json`);
       } else {
@@ -100,10 +114,11 @@ export function createNativeWorkflowEditor(host) {
     });
     const switchEngine = element('button', '更换工作流引擎'); switchEngine.className = 'button quiet';
     switchEngine.onclick = () => action(async () => {
-      if (state.ready && !state.missing.length) await saveDraft();
+      const retryPreset = Boolean(presetPrompt) && !state.presetBound;
+      if (!retryPreset && state.ready && !state.missing.length) await saveDraft();
       await close();
       const target = await host.ensureBackend(node, workflow, true);
-      if (target) await open(node, target, preparation);
+      if (target) await open(node, target, preparation, retryPreset ? presetPrompt : null, retryPreset ? onPresetSaved : null);
     });
     buttons.append(back, switchEngine, reveal, original, repair, recheck, draft, apply, discard); header.append(title, buttons, status);
     const note = element('div', preparation ? `正在用 ${session.backend_url} 解析工作流控件，随后选择要在外层显示的参数。此过程不生成图片或视频。` : `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
@@ -121,6 +136,22 @@ export function createNativeWorkflowEditor(host) {
           state.ready = true;
           show(state.missing.length ? `缺少 ${state.missing.length} 种前端节点：${state.missing.join('、')}。原文已保留；请切换到安装了这些扩展的后端，补齐后重新进入。` : `已载入 ${result.nodes} 个节点。内部草稿和外层已应用参数分别保存。`);
           if (!state.missing.length) {
+            let presetSummary = '';
+            if (presetPrompt) {
+              show('正在使用 ComfyUI 已注册节点导入预设，并检查回编译结果…');
+              const converted = await request('importApi', { prompt: presetPrompt });
+              if (typeof onPresetSaved !== 'function') throw new Error('预设已转换，但尚未绑定到外层工作流；请关闭后从外层画布重新进入。');
+              const saved = await host.api(`/api/editor-workflows/${id}/draft`, {
+                document: converted.workflow, base_revision: workflow.revision,
+              });
+              workflow.revision = saved.revision;
+              await onPresetSaved();
+              state.presetBound = true;
+              refresh();
+              workflow.nodes = converted.nodes;
+              state.missing = converted.missing || [];
+              presetSummary = `预设已转换为 ${converted.nodes} 个原生节点，回编译与原 API 工作流一致`;
+            }
             const patches = [], unmapped = [], definitions = [];
             for (const field of host.fields(node)) {
               if (!Object.hasOwn(node.data.editor_baseline || {}, field.id)) continue;
@@ -147,7 +178,7 @@ export function createNativeWorkflowEditor(host) {
                 } else throw error;
               }
             }
-            show(`已载入 ${result.nodes} 个节点；已同步 ${patches.length} 项外层修改。${unmapped.length ? `以下特殊控件无法直接回写，外层覆盖值仍保留，应用时会核对：${unmapped.join('、')}` : '内部和外层使用同一组可映射参数。'}`);
+            show(`${presetSummary ? `${presetSummary}。` : `已载入 ${result.nodes} 个节点；`}${presetPrompt ? '现在可继续编辑，或点“应用参数并返回”同步外层参数。' : `已同步 ${patches.length} 项外层修改。${unmapped.length ? `以下特殊控件无法直接回写，外层覆盖值仍保留，应用时会核对：${unmapped.join('、')}` : '内部和外层使用同一组可映射参数。'}`}`);
             if (preparation) { show('正在提取可编辑参数和输出…'); await applyParameters(); }
           } else if (preparation) {
             show(`无法建立外层参数：缺少 ${state.missing.length} 种节点（${state.missing.join('、')}）。可更换引擎、进入内部修复，或返回画布“复用已保存配置”。原文已保留。`);
@@ -164,5 +195,8 @@ export function createNativeWorkflowEditor(host) {
     const startup = setTimeout(() => show('原生编辑器加载超时。请检查所选 ComfyUI 服务是否启动、前端与扩展是否兼容；原始工作流已保留，可返回后更换后端再进入。'), 60000);
     refresh(); dialog.showModal(); frame.src = session.url;
   }
-  return { open, prepare: node => open(node, false, true), applyToNode: host.applied, isOpen: () => !!active || opening };
+  async function openApiPrompt(node, prompt, onPresetSaved = null) {
+    return open(node, false, false, normalizePresetPrompt(prompt), onPresetSaved);
+  }
+  return { open, openApiPrompt, prepare: node => open(node, false, true), applyToNode: host.applied, isOpen: () => !!active || opening };
 }

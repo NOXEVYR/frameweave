@@ -1,6 +1,6 @@
 import { canConnect, parseGraph, serializeGraph, stableStringify } from './graph.mjs';
 import { parseJSONWithSafeNumbers } from './packages.mjs';
-import { createWorkflowRunner } from './workflow-runner.mjs';
+import { createWorkflowRunner, validateRunTargets } from './workflow-runner.mjs';
 
 const RUN_KEY = 'frameweave.workflow-run.v1';
 const BUNDLE = 'prismcanvas.project.v1';
@@ -35,12 +35,12 @@ export function createWorkflowCanvas(host) {
     if (!target) throw new Error('请选择一个工作流包节点作为目标');
     const pack = host.packages().find(p => p.id === target.data.package_id);
     if (!pack) throw new Error('请先导入这个节点对应的工作流包');
-    const fields = (pack.fields || []).filter(f => ['text', 'image'].includes(f.type) && (!fieldId || fieldId === f.id));
-    if (!fields.length) throw new Error('这个工作流没有可连接的文本或图片输入，请重新封装并开放所需参数');
+    const fields = (pack.fields || []).filter(f => ['text', 'image', 'video'].includes(f.type) && (!fieldId || fieldId === f.id));
+    if (!fields.length) throw new Error('这个工作流没有可连接的文本、图片或视频输入，请在工作流内开放所需参数');
     closeDialog(); dialog = element('dialog', 'workflow-connect-dialog'); dialog.id = 'workflow-connection-dialog';
     const header = element('div', 'dialog-header'); header.append(element('h2', '', `连接到 ${target.data.title}`), button('关闭', 'workflow-connect-close', closeDialog)); dialog.append(header);
     const body = element('div', 'workflow-connect-body'); dialog.append(body);
-    body.append(element('p', 'model-note', '连接会替代该字段的表单值。生成结果会在上游成功后自动上传为下游参考图。'));
+    body.append(element('p', 'model-note', '连接会替代该字段的表单值。生成结果会在上游成功后自动传入下游的对应图片或视频输入。'));
     const sources = graph.nodes.filter(n => n.id !== target.id && (!sourceId || n.id === sourceId) && ['prompt', 'reference', 'generation', 'result'].includes(n.type));
     const source = select(sources.map(n => [n.id, n.data.title])); source.id = 'workflow-connect-source';
     const targetField = select([]); targetField.id = 'workflow-connect-field';
@@ -50,26 +50,28 @@ export function createWorkflowCanvas(host) {
     const outputNode = select([]), outputNodeLabel = inputLabel('工作流输出接口', outputNode); outputNode.id = 'workflow-connect-output-node';
     const note = element('p', 'workflow-connect-note');
     const sync = () => {
-      const from = graph.nodes.find(n => n.id === source.value), type = from?.type === 'prompt' ? 'text' : 'image';
+      const from = graph.nodes.find(n => n.id === source.value), type = from?.type === 'prompt' ? 'text' : from?.type === 'reference' ? from.data.mediaType : null;
       const previous = targetField.value; targetField.replaceChildren();
-      for (const f of fields.filter(f => f.type === type)) { const option = element('option', '', f.label); option.value = f.id; targetField.append(option); }
+      for (const f of fields.filter(f => f.type === type || !type && ['image','video'].includes(f.type))) { const option = element('option', '', f.label); option.value = f.id; targetField.append(option); }
       if ([...targetField.options].some(o => o.value === previous)) targetField.value = previous;
       textLabel.hidden = type !== 'text'; outputLabel.hidden = !['generation', 'result'].includes(from?.type);
+      const mediaName = fields.find(field => field.id === targetField.value)?.type === 'video' ? '个视频' : '张图片';
+      [...output.options].forEach((option, index) => { option.textContent = `第 ${index + 1} ${mediaName}`; });
       outputNode.replaceChildren();
       const outputOwner = from?.type === 'result' ? graph.nodes.find(n => n.id === graph.edges.find(edge => edge.target === from.id)?.source) : from;
-      for (const item of (outputOwner?.data.editor_output_fields || []).filter(item => (outputOwner.data.editor_outputs || []).includes(item.id) && ['image', 'unknown'].includes(item.mediaType))) {
+      for (const item of (outputOwner?.data.editor_output_fields || []).filter(item => (outputOwner.data.editor_outputs || []).includes(item.id) && [fields.find(f=>f.id===targetField.value)?.type, 'unknown'].includes(item.mediaType))) {
         const option = element('option', '', `${item.label} · ${item.id}`); option.value = item.id; outputNode.append(option);
       }
       outputNodeLabel.hidden = !outputNode.options.length;
       note.textContent = targetField.options.length ? '每个输入连接一个来源；同一个来源可以连接多个输入。' : '来源类型与输入不匹配，请更换来源或开放对应参数。';
     };
-    source.addEventListener('change', sync); sync();
+    source.addEventListener('change', sync); targetField.addEventListener('change', sync); sync();
     body.append(inputLabel('来源节点', source), inputLabel('工作流输入', targetField), textLabel, outputNodeLabel, outputLabel, note);
     const actions = element('div', 'dialog-actions');
     actions.append(button('取消', 'workflow-connect-cancel', closeDialog), button('建立连接', 'workflow-connect-submit', () => {
       const from = graph.nodes.find(n => n.id === source.value);
       if (!from || !targetField.value) throw new Error('请选择可连接的来源与输入');
-      const options = { targetField: targetField.value, sourceField: from.type === 'prompt' ? sourceField.value : 'image', ...(['generation', 'result'].includes(from.type) ? { outputIndex: Number(output.value), ...(outputNode.value ? { sourceOutput: outputNode.value } : {}) } : {}) };
+      const options = { targetField: targetField.value, sourceField: from.type === 'prompt' ? sourceField.value : fields.find(f=>f.id===targetField.value)?.type, ...(['generation', 'result'].includes(from.type) ? { outputIndex: Number(output.value), ...(outputNode.value ? { sourceOutput: outputNode.value } : {}) } : {}) };
       const valid = canConnect(host.graph(), source.value, targetId, options); if (!valid.ok) throw new Error(valid.reason);
       host.connect(source.value, targetId, options); closeDialog(); host.toast('已连接工作流输入');
     }, 'button primary'));
@@ -80,14 +82,14 @@ export function createWorkflowCanvas(host) {
     const graph = host.graph(), edge = graph.edges.find(e => e.target === nodeId && e.targetField === field.id);
     if (!edge) return null;
     const source = graph.nodes.find(n => n.id === edge.source);
-    return { edge, text: `${source?.data.title || '来源已缺失'} · ${source?.type === 'prompt' ? edge.sourceField === 'negative' ? '负向提示词' : '正向提示词' : `图片 ${Number(edge.outputIndex || 0) + 1}`}` };
+    return { edge, text: `${source?.data.title || '来源已缺失'} · ${source?.type === 'prompt' ? edge.sourceField === 'negative' ? '负向提示词' : '正向提示词' : `${field.type === 'video' ? '视频' : '图片'} ${Number(edge.outputIndex || 0) + 1}`}` };
   }
 
   function renderState(state) {
     if (!statePanel) return;
     const busy = runner?.isRunning() || !!operation;
     runSelected.disabled = busy; runAll.disabled = busy;
-    document.querySelectorAll('[data-run-node]').forEach(b => { const node = host.graph().nodes.find(n => n.id === b.dataset.runNode); b.disabled = busy || !!node?.data.editor_id && !node?.data.package_id; });
+    document.querySelectorAll('[data-run-node]').forEach(b => { const node = host.graph().nodes.find(n => n.id === b.dataset.runNode); b.disabled = busy || node?.data.kind === 'package' && !!node?.data.editor_id && !node?.data.package_id; });
     const signature = JSON.stringify([state?.id, state?.status, state?.error, state?.steps, busy]);
     if (signature === lastRunSignature) return; lastRunSignature = signature;
     const detailsOpen = statePanel.querySelector('details')?.open || false;
@@ -118,8 +120,10 @@ export function createWorkflowCanvas(host) {
     await host.loadPackages();
     const targets = ids?.length ? ids : host.graph().nodes.filter(n => n.type === 'generation').map(n => n.id);
     if (!targets.length) throw new Error('请先向画布添加工作流或生成节点');
+    validateRunTargets(host.graph(), targets);
     if (host.prepareBackend) await host.prepareBackend(targets);
     if (!host.engine().online) throw new Error('本地推理引擎未连接，请先连接并检查模型');
+    if (host.prepareInputs) await host.prepareInputs(targets);
     return await runner.start({ graph: host.graph(), targetIds: targets, backend: host.engine().backend_url, canvasId: host.canvasIdentity() });
     } finally { operation = ''; renderState(runner.getState()); }
   }

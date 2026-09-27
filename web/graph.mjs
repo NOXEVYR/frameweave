@@ -5,7 +5,7 @@ export const NODE_TYPES = ['prompt', 'reference', 'generation', 'result'];
 export const KINDS = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'qwen21_t2i', 'qwen21_edit', 'api', 'package'];
 const copy = value => JSON.parse(JSON.stringify(value));
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
-const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image', 'audio'];
+const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image', 'audio', 'video'];
 const RESERVED_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 const fieldId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value) && !RESERVED_FIELDS.has(value);
 
@@ -54,6 +54,95 @@ function packageFields(value) {
   });
 }
 
+function normalizedInputLabels(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 256) throw new Error('生成输入端口名称无效');
+  const labels = {};
+  for (const [id, label] of Object.entries(value)) {
+    if (!fieldId(id) || typeof label !== 'string' || !label.trim() || label.length > 80) throw new Error('生成输入端口名称无效');
+    labels[id] = label.trim();
+  }
+  return labels;
+}
+
+const makePort = (id, label, type, labels) => ({ id, label: labels?.[id] || label, type });
+
+/** Public, typed inputs for built-in generators and workflow packages. */
+export function generationInputPorts(node) {
+  if (!node || node.type !== 'generation') return [];
+  const labels = node.data?.inputLabels || {};
+  if (node.data?.kind === 'package') {
+    try { return packageFields(node.data.packageFields || []).map(field => makePort(field.id, field.label, field.type, labels)); }
+    catch { return []; }
+  }
+  const kind = node.data?.kind;
+  if (!KINDS.includes(kind) || ['api', 'package'].includes(kind)) return [];
+  const inputs = [makePort('positive', '正向提示词', 'text', labels), makePort('negative', '负向提示词', 'text', labels)];
+  const addImages = (prefix, count, label) => {
+    for (let index = 1; index <= count; index++) inputs.push(makePort(prefix + index, label(index), 'image', labels));
+  };
+  if (kind === 'qwen21_edit') addImages('image_', 10, index => index === 1 ? '编辑目标' : '参考图 ' + index);
+  else if (kind === 'sdxl' || kind === 'sdxl_i2i') addImages('image_', 1, () => '输入图');
+  else if (kind === 'krea') addImages('image_', 3, index => '参考图 ' + index);
+  else if (kind === 'h3_i2v') inputs.push(makePort('start_image', '首帧', 'image', labels), makePort('end_image', '尾帧', 'image', labels));
+  else if (kind === 'h3_ref') {
+    for (let index = 0; index < 9; index++) inputs.push(makePort('ref_image_' + index, '参考图 ' + (index + 1), 'image', labels));
+  }
+  return inputs;
+}
+
+function sourceOutputType(source, edge, expected = 'image', graph) {
+  if (!['generation', 'result'].includes(source?.type)) return null;
+  const outputs = source.data?.outputs;
+  const index = edge?.outputIndex || 0;
+  if (source.type === 'result' && graph) {
+    const owner = graph.nodes.find(node => node.type === 'generation' && graph.edges.some(link => link.source === node.id && link.target === source.id));
+    if (owner) return sourceOutputType(owner, edge, expected);
+  }
+  if(source.type==='generation') {
+    if(source.data.kind?.startsWith('h3_')) return 'video';
+    if(['sdxl','sdxl_i2i','krea','qwen21_t2i','qwen21_edit'].includes(source.data.kind)) return 'image';
+    const definitions=(source.data.editor_output_fields||[]).filter(field=>!edge?.sourceOutput||field.id===edge.sourceOutput);
+    if(definitions.some(field=>field.mediaType===expected))return expected;
+    const types=[...new Set(definitions.map(field=>field.mediaType).filter(type=>['image','video','audio'].includes(type)))];
+    if(types.length===1)return types[0];
+  }
+  if (Array.isArray(outputs) && outputs.length) {
+    const matching = outputs.filter(item => item.type === expected && (!edge?.sourceOutput || item.node_id === edge.sourceOutput));
+    if (matching[index]) return expected;
+    return outputs[0].type;
+  }
+  return null;
+}
+
+/** Resolve a persisted or legacy implicit input slot for canvas rendering. */
+export function edgeInputField(graph, edge) {
+  const target = graph?.nodes?.find(node => node.id === edge?.target && node.type === 'generation');
+  if (!target) return undefined;
+  if (edge.targetField) return edge.targetField;
+  const source = graph.nodes.find(node => node.id === edge.source);
+  if (source?.type === 'prompt') return 'positive';
+  if (!['reference', 'generation', 'result'].includes(source?.type)) return undefined;
+  const ports = generationInputPorts(target).filter(item => item.type === 'image');
+  if (!ports.length) return undefined;
+  const incoming = graph.edges.filter(item => item.target === target.id && ['reference', 'generation', 'result'].includes(graph.nodes.find(node => node.id === item.source)?.type));
+  const used = new Set(incoming.filter(item => item.targetField).map(item => item.targetField));
+  const legacy = incoming.filter(item => !item.targetField);
+  const assign = new Map();
+  if (target.data.kind === 'h3_i2v') {
+    const start = legacy.find(item => graph.nodes.find(node => node.id === item.source)?.data.role === 'start');
+    const end = legacy.find(item => graph.nodes.find(node => node.id === item.source)?.data.role === 'end');
+    if (start && ports.some(item => item.id === 'start_image') && !used.has('start_image')) { assign.set(start.id, 'start_image'); used.add('start_image'); }
+    if (end && ports.some(item => item.id === 'end_image') && !used.has('end_image')) { assign.set(end.id, 'end_image'); used.add('end_image'); }
+  }
+  for (const item of legacy) {
+    if (assign.has(item.id)) continue;
+    const port = ports.find(candidate => !used.has(candidate.id));
+    if (!port) break;
+    assign.set(item.id, port.id); used.add(port.id);
+  }
+  return assign.get(edge.id);
+}
+
 function edgeOptions(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('连接参数必须为对象');
   const result = {};
@@ -62,7 +151,7 @@ function edgeOptions(options = {}) {
     result.targetField = options.targetField;
   }
   if (Object.hasOwn(options, 'sourceField')) {
-    if (!['text', 'negative', 'image'].includes(options.sourceField)) throw new Error('连接的来源字段无效');
+    if (!['text', 'negative', 'image', 'video'].includes(options.sourceField)) throw new Error('连接的来源字段无效');
     result.sourceField = options.sourceField;
   }
   if (Object.hasOwn(options, 'outputIndex')) {
@@ -129,23 +218,40 @@ export function canConnect(graph, source, target, options = {}) {
   if (!from || !to) return { ok: false, reason: '连接节点不存在' };
   let binding;
   try { binding = edgeOptions(options); } catch (error) { return { ok: false, reason: error.message }; }
-  if (binding.sourceField && !(from.type === 'prompt' ? ['text', 'negative'] : ['image']).includes(binding.sourceField)) return { ok: false, reason: '来源节点与连接字段类型不匹配' };
+  if (binding.sourceField && !(from.type === 'prompt' ? ['text', 'negative'] : ['reference', 'generation', 'result'].includes(from.type) ? ['image', 'video'] : []).includes(binding.sourceField)) return { ok: false, reason: '来源节点与连接字段类型不匹配' };
   if (binding.outputIndex && !['generation', 'result'].includes(from.type)) return { ok: false, reason: '只有生成或结果节点可选择输出图片序号' };
   const packaged = to.type === 'generation' && to.data.kind === 'package';
-  if (packaged) {
-    if (!binding.targetField) return { ok: false, reason: '请选择工作流包的目标输入参数；未连接字段仍可通过表单填写' };
-    let fields;
-    try { fields = packageFields(to.data.packageFields || []); } catch (error) { return { ok: false, reason: error.message }; }
-    const field = fields.find(item => item.id === binding.targetField);
-    if (!field) return { ok: false, reason: '工作流包目标参数不存在，请刷新工作流包定义' };
-    const sourceType = from.type === 'prompt' ? 'text' : ['reference', 'generation', 'result'].includes(from.type) ? 'image' : null;
-    if (!['text', 'image'].includes(field.type)) return { ok: false, reason: '此参数通过表单填写；只有文本与图片参数支持连线' };
-    if (field.type !== sourceType || from.type === 'reference' && from.data.mediaType !== 'image') return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片' };
-    if (graph.edges.some(edge => edge.target === target && edge.targetField === binding.targetField)) return { ok: false, reason: '工作流包此输入参数已有连接，请先断开原连接' };
+  const input = binding.targetField ? generationInputPorts(to).find(item => item.id === binding.targetField) : null;
+  if (binding.targetField && !input) return { ok: false, reason: packaged ? '工作流包目标参数不存在，请刷新工作流包定义' : '生成节点目标输入端口不存在' };
+  if (to.type === 'generation') {
+    if (!packaged && !['prompt', 'reference', 'generation', 'result'].includes(from.type)) return { ok: false, reason: '生成节点只接收提示词、参考素材或上游生成结果' };
+    if (packaged && !binding.targetField) return { ok: false, reason: '请选择工作流包的目标输入参数；未连接字段仍可通过表单填写' };
+    const knownOutputType = sourceOutputType(from, options, input?.type || binding.sourceField || 'image', graph);
+    const sourceType = from.type === 'prompt' ? 'text' : from.type === 'reference' ? from.data.mediaType : knownOutputType || binding.sourceField;
+    if (binding.sourceField && ['image', 'video'].includes(binding.sourceField) && knownOutputType && binding.sourceField !== knownOutputType) return { ok: false, reason: '所选输出媒体类型与来源节点的输出不匹配' };
+    if (binding.sourceField === 'text' || binding.sourceField === 'negative') {
+      if (from.type !== 'prompt') return { ok: false, reason: '来源节点与连接字段类型不匹配' };
+    }
+    if (binding.sourceField === 'video' && from.type === 'reference' && from.data.mediaType !== 'video') return { ok: false, reason: '来源素材不是视频' };
+    if (binding.sourceField === 'image' && from.type === 'reference' && from.data.mediaType !== 'image') return { ok: false, reason: '来源素材不是图片' };
+    if (input) {
+      if (!['text', 'image', 'video'].includes(input.type)) return { ok: false, reason: '此参数通过表单填写；只有文本、图片与视频参数支持连线' };
+      if (graph.edges.some(edge => edge.target === target && edgeInputField(graph, edge) === input.id)) return { ok: false, reason: '此输入端口已有连接，请先断开原连接' };
+      if (sourceType && sourceType !== input.type) return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片，视频接视频' };
+      if (!sourceType && !['generation', 'result'].includes(from.type)) return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片，视频接视频' };
+    } else {
+      if (binding.targetField) return { ok: false, reason: '生成节点目标输入端口不存在' };
+      const compatible = from.type === 'prompt' || from.type === 'reference' && from.data.mediaType === 'image'
+        || ['generation', 'result'].includes(from.type) && (!sourceType || sourceType === 'image');
+      if (!compatible) return { ok: false, reason: '连接顺序：提示词 / 图片参考 → 生成 → 结果；请为生成输入选择明确端口' };
+    }
+    if (!binding.targetField && graph.edges.some(edge => edge.source === source && edge.target === target && !edge.targetField)) return { ok: false, reason: '连接已存在' };
+  } else if (packaged) {
+    return { ok: false, reason: '工作流包输入节点无效' };
   } else {
-    if (binding.targetField) return { ok: false, reason: '仅工作流包支持按输入参数连线' };
-    const valid = (['prompt', 'reference'].includes(from.type) && to.type === 'generation') || (from.type === 'generation' && to.type === 'result');
-    if (!valid) return { ok: false, reason: '连接顺序：提示词 / 参考素材 → 生成 → 结果；工作流包可接文本或图片输入' };
+    if (binding.targetField) return { ok: false, reason: '只有生成节点支持目标输入端口' };
+    const valid = from.type === 'generation' && to.type === 'result';
+    if (!valid) return { ok: false, reason: '连接顺序：提示词 / 参考素材 → 生成 → 结果；工作流包可接文本、图片或视频输入' };
     if (graph.edges.some(edge => edge.source === source && edge.target === target)) return { ok: false, reason: '连接已存在' };
   }
   if (to.type === 'result' && graph.edges.some(edge => edge.target === target)) return { ok: false, reason: '一个结果节点只能接收一个生成节点' };
@@ -198,6 +304,7 @@ export function generationPayload(graph, id, context = {}) {
   const node = graph.nodes.find(item => item.id === id && item.type === 'generation');
   if (!node) throw new Error('请选择生成节点');
   if (!KINDS.includes(node.data.kind)) throw new Error('生成模式不受支持');
+  if (graph.edges.some(edge => edge.target === id && graph.nodes.some(ref => ref.id === edge.source && ref.type === 'reference' && ref.data.localAssetId && !ref.data.name))) throw new Error('参考图片已保存在本机，点击“开始生成”时会自动传入当前推理引擎');
   if (node.data.kind === 'package') {
     if (typeof node.data.package_id !== 'string' || !node.data.package_id) throw new Error('请先选择或导入对应工作流包');
     const values = packageValues(node.data.packageValues || {});
@@ -213,11 +320,17 @@ export function generationPayload(graph, id, context = {}) {
         values[edge.targetField] = text;
       } else if (source.type === 'reference') {
         if (!source.data.name) throw new Error('工作流包参考图片待准备，请先上传已连接的图片');
-        values[edge.targetField] = uploadedImageName(source.data.name);
+        const field = (node.data.packageFields || []).find(item => item.id === edge.targetField);
+        if (!field || !['image', 'video'].includes(field.type) || source.data.mediaType !== field.type) throw new Error('工作流包输入与连接素材类型不匹配');
+        values[edge.targetField] = uploadedMediaName(source.data.name, field.type === 'video' ? '工作流视频' : '参考图');
       } else {
         const images = context?.edgeImages;
         if (!images || typeof images !== 'object' || Array.isArray(images) || !Object.hasOwn(images, edge.id) || !images[edge.id]) throw new Error('等待上游生成完成，输出图片待准备；请先运行上游并将图片上传到当前后端');
-        values[edge.targetField] = uploadedImageName(images[edge.id]);
+        const field = (node.data.packageFields || []).find(item => item.id === edge.targetField);
+        if (!field || !['image', 'video'].includes(field.type)) throw new Error('工作流包连接目标不是图片或视频输入');
+        const outputType = sourceOutputType(source, edge, field.type, graph);
+        if (outputType && outputType !== field.type) throw new Error('上游生成结果与工作流包输入媒体类型不匹配');
+        values[edge.targetField] = uploadedMediaName(images[edge.id], field.type === 'video' ? '工作流视频' : '参考图');
       }
     }
     return { kind: 'package', package_id: node.data.package_id, values: packageValues(values), ...(node.data.editor_backend ? { editor_backend: node.data.editor_backend } : {}), ...(node.data.editor_outputs?.length ? { output_nodes: [...node.data.editor_outputs] } : {}) };
@@ -226,22 +339,60 @@ export function generationPayload(graph, id, context = {}) {
     if (!node.data.apiPrompt || typeof node.data.apiPrompt !== 'object' || Array.isArray(node.data.apiPrompt)) throw new Error('请先导入 ComfyUI API 格式工作流');
     return { kind: 'api', prompt: copy(node.data.apiPrompt) };
   }
-  const incoming = graph.edges.filter(edge => edge.target === id).map(edge => graph.nodes.find(item => item.id === edge.source)).filter(Boolean);
-  const prompts = incoming.filter(item => item.type === 'prompt');
-  const refs = incoming.filter(item => item.type === 'reference' && item.data.name);
-  const orderedRefs = node.data.kind.startsWith('qwen21_') ? refs : [...refs].sort((a, b) => ({ start: 0, reference: 1, end: 2 }[a.data.role] ?? 1) - ({ start: 0, reference: 1, end: 2 }[b.data.role] ?? 1));
+  const incomingEdges = graph.edges.filter(edge => edge.target === id);
+  if (node.data.kind === 'qwen21_t2i' && incomingEdges.some(edge => graph.nodes.some(item => item.id === edge.source && item.type === 'reference'))) throw new Error('Qwen 2.1 文生图不接收参考图，请选择图像编辑模式');
+  const imageSourceCount = incomingEdges.filter(edge => graph.nodes.some(item => item.id === edge.source && ['reference', 'generation', 'result'].includes(item.type))).length;
+  if (node.data.kind === 'sdxl_i2i' && imageSourceCount !== 1) throw new Error('SDXL 图生图需要连接 1 张已上传的参考图片');
+  if (node.data.kind === 'sdxl' && imageSourceCount > 1) throw new Error('SDXL 图生图只使用一张输入图');
+  const prompts = [], positive = [], negative = [], imageInputs = [];
+  for (const edge of incomingEdges) {
+    const source = graph.nodes.find(item => item.id === edge.source);
+    if (!source) continue;
+    if (source.type === 'prompt') {
+      const field = edge.sourceField || (edge.targetField === 'negative' ? 'negative' : 'text');
+      const value = source.data[field];
+      if (typeof value !== 'string' || value.length > 100000) throw new Error('连接的提示词必须是不超过 100000 字符的文本');
+      if (!edge.targetField) prompts.push(source);
+      else if (edge.targetField === 'positive') positive.push(value);
+      else if (edge.targetField === 'negative') negative.push(value);
+      continue;
+    }
+    if (!['reference', 'generation', 'result'].includes(source.type)) continue;
+    const portId = edgeInputField(graph, edge);
+    const portInfo = generationInputPorts(node).find(item => item.id === portId);
+    if (!portInfo || portInfo.type !== 'image') {
+      if (node.data.kind.startsWith('sdxl')) continue;
+      throw new Error('生成节点连接没有匹配的图片输入端口');
+    }
+    let name;
+    if (source.type === 'reference') {
+      if (!source.data.name) {
+        if (node.data.kind === 'sdxl_i2i' || node.data.kind.startsWith('qwen21_')) continue;
+        throw new Error('连接的参考素材尚未上传完成');
+      }
+      if (source.data.mediaType !== 'image') throw new Error('普通生成节点需要图片参考素材');
+      name = uploadedImageName(source.data.name);
+    } else {
+      const images = context?.edgeImages;
+      if (!images || typeof images !== 'object' || Array.isArray(images) || !Object.hasOwn(images, edge.id) || !images[edge.id]) throw new Error('等待上游生成完成，输出图片待准备；请先运行上游并将图片上传到当前后端');
+      const outputType = sourceOutputType(source, edge, 'image', graph);
+      if (outputType && outputType !== 'image') throw new Error('上游输出不是图片，不能连接到此图片输入端口');
+      name = uploadedImageName(images[edge.id]);
+    }
+    imageInputs.push({ edge, source, port: portInfo, name });
+  }
+  const orderedImages = [...imageInputs].sort((a, b) => generationInputPorts(node).findIndex(item => item.id === a.port.id) - generationInputPorts(node).findIndex(item => item.id === b.port.id));
+  const refs = orderedImages.map(item => item.name);
   if (node.data.kind === 'sdxl_i2i' && refs.length !== 1) throw new Error('SDXL 图生图需要连接 1 张已上传的参考图片');
   if (node.data.kind.startsWith('qwen21_')) {
-    if (incoming.some(item => item.type === 'reference' && !item.data.name)) throw new Error('Qwen 2.1 参考图片尚未上传完成');
+    if (incomingEdges.some(edge => graph.nodes.some(item => item.id === edge.source && item.type === 'reference' && !item.data.name))) throw new Error('Qwen 2.1 参考图片尚未上传完成');
     if (node.data.kind === 'qwen21_t2i' && refs.length) throw new Error('Qwen 2.1 文生图不接收参考图，请选择图像编辑模式');
     if (node.data.kind === 'qwen21_edit' && (refs.length < 1 || refs.length > 10)) throw new Error('Qwen 2.1 编辑需要连接 1–10 张参考图片');
     if (node.data.denoise !== 1) throw new Error('Qwen 2.1 条件编辑使用 denoise=1');
     if ((node.data.kind !== 'qwen21_edit' || node.data.custom_size) && (node.data.width % 32 || node.data.height % 32)) throw new Error('Qwen 2.1 宽高须为 32 的倍数');
   }
-  for (const ref of refs) {
-    uploadedImageName(ref.data.name);
-    if (ref.data.mediaType !== 'image') throw new Error('生成节点需要图片参考素材，请先上传图片');
-  }
+  const legacyPositive = prompts.map(item => item.data.text);
+  const legacyNegative = prompts.map(item => item.data.negative);
   const stack = Object.hasOwn(node.data, 'loras') ? loraStack(node.data.loras, node.data.kind) : undefined;
   if (!Number.isSafeInteger(node.data.seed) || node.data.seed < 0) throw new Error('随机种子必须是 0 到 9007199254740991 之间的整数');
   const data = copy(node.data);
@@ -253,10 +404,10 @@ export function generationPayload(graph, id, context = {}) {
   delete data.packageFields;
   return {
     ...data,
-    positive: [...prompts.map(item => item.data.text), data.positive].filter(Boolean).join('\n\n'),
-    negative: [...prompts.map(item => item.data.negative), data.negative].filter(Boolean).join(', '),
-    references: orderedRefs.map(item => item.data.name),
-    ...(!data.kind.startsWith('qwen21_') ? { reference_roles: orderedRefs.map(item => item.data.role || 'reference') } : {}),
+    positive: [...legacyPositive, ...positive, data.positive].filter(Boolean).join('\n\n'),
+    negative: [...legacyNegative, ...negative, data.negative].filter(Boolean).join(', '),
+    references: refs,
+    ...(!data.kind.startsWith('qwen21_') ? { reference_roles: orderedImages.map(item => item.port.id === 'start_image' ? 'start' : item.port.id === 'end_image' ? 'end' : 'reference') } : {}),
   };
 }
 
@@ -317,13 +468,14 @@ export function validateExecutionMediaBackends(graph, targets, currentBackend, t
   for (const id of needed) {
     const node = nodes.get(id);
     if (node?.type === 'reference' && node.data.name) {
+      if (node.data.localAssetId) continue; // A client-owned source can be copied to the target engine before submission.
       check(node.data.title || '参考图片', node.data.name, node.data.uploadBackend || '');
       continue;
     }
     if (node?.type !== 'generation' || node.data.kind !== 'package') continue;
     const connectedFields = new Set(graph.edges.filter(edge => edge.target === id && edge.targetField).map(edge => edge.targetField));
     for (const field of node.data.packageFields || []) {
-      if (!['image', 'audio'].includes(field.type) || connectedFields.has(field.id)) continue;
+      if (!['image', 'audio', 'video'].includes(field.type) || connectedFields.has(field.id)) continue;
       const filename = node.data.packageValues?.[field.id];
       if (filename === undefined || filename === null || filename === '') continue;
       const owner = node.data.packageMediaBackends?.[field.id];
@@ -353,7 +505,15 @@ export function recipeGraph(recipe, x = 80, y = 80) {
     (request.references || []).forEach((name, index) => {
       const metadata = (recipe.references || []).find(item => item.name === name) || {};
       const reference = createNode('reference', x - 345, y + index * 340, { title: `复用素材 ${index + 1}`, name, url: metadata.url || '', mediaType: 'image', role: request.reference_roles?.[index] || 'reference' });
-      fragment.nodes.push(reference); connect(fragment, reference.id, node.id);
+      fragment.nodes.push(reference);
+      const role = request.reference_roles?.[index] || 'reference';
+      const targetField = request.kind === 'qwen21_edit' ? 'image_' + (index + 1)
+        : ['sdxl', 'sdxl_i2i'].includes(request.kind) ? 'image_1'
+          : request.kind === 'krea' ? 'image_' + (index + 1)
+            : request.kind === 'h3_i2v' ? role === 'end' ? 'end_image' : role === 'start' || index === 0 ? 'start_image' : 'end_image'
+              : request.kind === 'h3_ref' ? 'ref_image_' + index : '';
+      if (targetField) connect(fragment, reference.id, node.id, { targetField });
+      else connect(fragment, reference.id, node.id);
     });
   }
   // Use the same boundary validation as an imported canvas before adding anything.
@@ -401,6 +561,16 @@ export function parseGraph(text) {
     if (node.type === 'reference' && node.data.uploadBackend !== undefined) {
       data.uploadBackend = node.data.uploadBackend === '' ? '' : localBackendIdentity(node.data.uploadBackend);
     }
+    if (node.type === 'reference' && node.data.localMedia !== undefined) {
+      if (typeof node.data.localMedia !== 'boolean') throw new Error('本地媒体标识无效');
+      data.localMedia = node.data.localMedia;
+    }
+    if (node.type === 'reference' && node.data.localAssetId) {
+      if (typeof node.data.localAssetId !== 'string' || !/^[a-f0-9]{64}$/.test(node.data.localAssetId)) throw new Error('本地图片标识无效');
+      data.localAssetId = node.data.localAssetId;
+      data.localFilename = String(node.data.localFilename || '本地图片').slice(0, 260);
+      data.url = (data.localMedia ? '/api/assets/media/' : '/api/assets/images/') + data.localAssetId;
+    }
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
     if (node.type === 'generation') {
@@ -431,6 +601,7 @@ export function parseGraph(text) {
         data.refine = packageValues(value);
       }
       if (Object.hasOwn(node.data, 'packageFields')) data.packageFields = packageFields(node.data.packageFields);
+      if (Object.hasOwn(node.data, 'inputLabels')) data.inputLabels = normalizedInputLabels(node.data.inputLabels);
       if (!Number.isSafeInteger(data.seed) || data.seed < 0) throw new Error('随机种子必须是 0 到 9007199254740991 之间的整数');
       if (Object.hasOwn(node.data, 'loras')) data.loras = loraStack(node.data.loras, data.kind);
       // Optional native controls survive recipes and old canvases without adding defaults.

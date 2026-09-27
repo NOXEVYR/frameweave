@@ -242,7 +242,7 @@ test('package image edges preserve independent output indices for the same upstr
 });
 
 test('package edge selectors reject invalid names, unsupported source fields and out-of-range indices', () => {
-  const source = createNode('generation', 0, 0), target = workflowNode('target');
+  const source = createNode('generation', 0, 0, { kind: 'sdxl' }), target = workflowNode('target');
   const graph = { nodes: [source, target], edges: [] };
   for (const outputIndex of [-1, 32, .5, '0', true, null, NaN, Infinity]) {
     assert.equal(canConnect(graph, source.id, target.id, { targetField: 'image', outputIndex }).ok, false);
@@ -264,7 +264,7 @@ test('package edge selectors reject invalid names, unsupported source fields and
 });
 
 test('execution order walks result intermediates and shared dependencies exactly once', () => {
-  const source = createNode('generation', 0, 0), preview = createNode('result', 0, 0);
+  const source = createNode('generation', 0, 0, { kind: 'sdxl' }), preview = createNode('result', 0, 0);
   const left = workflowNode('left'), right = workflowNode('right'), end = workflowNode('end', ['left', 'right']);
   const unused = workflowNode('unused');
   // Deliberately store consumers before producers to exercise true topological order.
@@ -298,7 +298,7 @@ test('package chains reject direct and result-mediated cycles at connect, import
 });
 
 test('duplicating workflow packages retains all public port bindings and clears result ownership', () => {
-  const source = createNode('generation', 10, 0), preview = createNode('result', 50, 0, { jobId: 'old', outputs: [{ type: 'image', url: '/api/media/old' }] });
+  const source = createNode('generation', 10, 0, { kind: 'sdxl' }), preview = createNode('result', 50, 0, { jobId: 'old', outputs: [{ type: 'image', url: '/api/media/old' }] });
   const target = workflowNode('target'); target.x = 100;
   const graph = { nodes: [source, preview, target], edges: [] };
   connect(graph, source.id, preview.id);

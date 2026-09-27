@@ -97,6 +97,29 @@ class EditorInterfaceTests(unittest.TestCase):
             {"id": "4", "label": "UnknownOutput · 4", "mediaType": "unknown"},
         ])
 
+    def test_video_loader_file_widgets_are_exposed_as_video_reference_fields(self):
+        prompt = {
+            "1": {"class_type": "LoadVideo", "inputs": {"file": "existing.mp4"}},
+            "2": {"class_type": "VHS_LoadVideo", "inputs": {"video": "existing.mov"}},
+        }
+        info = {
+            "LoadVideo": {"input": {"required": {"file": ["COMBO", {
+                "options": ["existing.mp4"], "video_upload": True,
+            }]}}, "output": ["VIDEO"]},
+            "VHS_LoadVideo": {"input": {"required": {"video": [["existing.mov"]]}},
+                              "output": ["IMAGE", "AUDIO"]},
+        }
+        result = inspect_interface(prompt, info)
+        by_binding = {(field["node_id"], field["input"]): field for field in result["fields"]}
+        for binding, value in ((('1', 'file'), 'existing.mp4'), (('2', 'video'), 'existing.mov')):
+            with self.subTest(binding=binding):
+                field = by_binding[binding]
+                self.assertEqual(field["type"], "video")
+                self.assertEqual(field["default"], value)
+                self.assertEqual(field["role"], "video_reference")
+                self.assertEqual(field["group"], "参考素材")
+        self.assertEqual(result["prompt"]["1"]["inputs"]["file"], "existing.mp4")
+
     def test_inspect_document_field_limits_keep_required_media_first(self):
         prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
                   "2": {"class_type": "Params", "inputs": {

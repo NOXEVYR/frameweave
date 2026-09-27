@@ -79,7 +79,7 @@ test('menu placement keeps the complete menu inside the visible viewport', () =>
 });
 
 test('canvas clipboard preserves package ports and edge field metadata without sharing result jobs', () => {
-  const source = createNode('generation', 20, 0), result = createNode('result', 400, 0, { jobId: 'owned', outputs: [{ type: 'image', url: '/api/media/old' }] });
+  const source = createNode('generation', 20, 0, { kind: 'sdxl' }), result = createNode('result', 400, 0, { jobId: 'owned', outputs: [{ type: 'image', url: '/api/media/old' }] });
   const target = createNode('generation', 780, 0, { kind: 'package', package_id: 'p-image', packageFields: [{ id: 'image', label: '参考图片', type: 'image' }] });
   const graph = { nodes: [source, result, target], edges: [] };
   connect(graph, source.id, result.id);

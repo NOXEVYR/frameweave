@@ -48,6 +48,7 @@ _SAFE_STATIC_PREFIXES = ("/assets/", "/scripts/", "/extensions/", "/locales/",
 _TASK_CONTROL_PATHS = {"/prompt", "/queue", "/interrupt", "/api/prompt", "/api/queue",
                       "/api/interrupt"}
 _ALWAYS_BLOCKED_PATHS = {"/interrupt", "/api/interrupt", "/upload/image", "/api/upload/image"}
+_SAFE_READ_ONLY_POST_PATHS = {"/manager/component/loads", "/api/manager/component/loads"}
 _ENCODED_SEPARATOR = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
 _WEBSOCKET_KEY = re.compile(r"^[A-Za-z0-9+/]{22}==$|^[A-Za-z0-9+/]{23}=$")
 
@@ -731,6 +732,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     content_type = "text/css; charset=utf-8"
                 self.proxy._send_response(self, 200, body, content_type, ())
                 return
+        if method == "POST" and decoded_path in _SAFE_READ_ONLY_POST_PATHS:
+            content_lengths = self.headers.get_all("Content-Length", [])
+            if (parsed.query or self.headers.get_all("Transfer-Encoding") or
+                    len(content_lengths) > 1 or
+                    (content_lengths and content_lengths[0].strip() != "0")):
+                self.proxy._send_error(self, 400, "只读组件读取仅接受无请求体 POST")
+                return
+            self.proxy._proxy_http(self, method, parsed.path)
+            return
         if method not in {"GET", "HEAD"} or not _read_only_path(decoded_path):
             self.proxy._send_error(self, 403, "EditorProxy 仅开放允许的只读 ComfyUI 路由")
             return

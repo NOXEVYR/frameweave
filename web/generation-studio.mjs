@@ -1,3 +1,5 @@
+import { liveProgressText } from './job-progress.mjs';
+import { progressPercent } from './graph.mjs';
 import { STUDIO_MODES, newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from './studio-state.mjs';
 import { audioIntegrationRequest, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields, initialAudioValues } from './audio-studio.mjs';
 
@@ -495,10 +497,18 @@ export function createGenerationStudio(host) {
     const toolbar = panel.querySelector('.studio-result-toolbar'); toolbar.replaceChildren(node('h2', '', '生成结果'), node('span', 'studio-job-state', chosen ? labels[chosen.status] || chosen.status : '等待创作'));
     const history = panel.querySelector('.studio-history'); history.replaceChildren(node('h3', '', '最近任务'));
     for (const job of matching) { const item = action(`${labels[job.status] || job.status} · ${job.summary?.width || '—'} × ${job.summary?.height || '—'} · ${job.id.slice(0, 10)}`, `studio-history-item${job.id === chosen?.id ? ' selected' : ''}`, () => { selectedJobs[mode] = job.id; save(); refresh(); }); history.append(item); }
-    const signature = JSON.stringify([chosen?.id, chosen?.status, chosen?.outputs, chosen?.error]);
+    const signature = JSON.stringify([chosen?.id, chosen?.status, chosen?.outputs, chosen?.error, chosen?.progress, chosen?.stage, chosen?.execution_node, chosen?.step, chosen?.steps, chosen?.progress_connected, chosen?.preview_url]);
     if (lastMedia.get(mode) === signature) return; lastMedia.set(mode, signature);
     const area = panel.querySelector('.studio-preview'); pause(area); area.replaceChildren();
-    if (!chosen?.outputs?.length) {
+    if (chosen && ['queued', 'running'].includes(chosen.status)) {
+      const live = node('div', 'studio-live-progress');
+      live.append(node('p', 'live-detail', liveProgressText(chosen)));
+      const bar = node('progress'); bar.max = 100; bar.setAttribute('aria-label', '当前节点采样进度');
+      const value = progressPercent(chosen.progress); if (value !== null) bar.value = value;
+      live.append(bar);
+      if (chosen.preview_url) { const image = node('img', 'live-preview'); image.src = safeURL(chosen.preview_url); image.alt = '采样中间预览，尚未完成'; live.append(image); }
+      live.append(node('small', '', '进度对应当前执行节点；中间预览尚未完成。')); area.append(live);
+    } else if (!chosen?.outputs?.length) {
       const empty = node('div', 'studio-result-empty');
       const audioMode = mode.startsWith('audio_'), category = mode === 'audio_music' ? '音乐' : '声音';
       empty.append(node('div', 'studio-prism', audioMode ? '♫' : '◈'), node('h2', '', chosen ? labels[chosen.status] || '等待结果' : audioMode ? `下一段${category}，从这里开始` : '你的下一张作品，从这里开始'), node('p', '', chosen?.error || (chosen ? '任务由本地推理引擎执行，可自由切换页面。' : audioMode ? '选择已验证 AUDIO 输出的工作流包，填写台词、音乐描述或参数，再在本机生成。' : '选择模型、写下提示词，再把画面交给棱光。'))); area.append(empty);

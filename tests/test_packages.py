@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from frameweave.packages import (MAX_BYTES, MAX_METADATA_BYTES, PackageStore, apply_values,
-                                inspect_document, normalize_document, parse_source_json, transport_document)
+                                inspect_document, normalize_document, parse_source_json, transport_document,
+                                validate_package_media_field)
 
 
 def sample():
@@ -163,6 +164,80 @@ class PackageTests(unittest.TestCase):
                 apply_values(package, {image["id"]: invalid})
         result = apply_values(package, {image["id"]: "frameweave/safe.png"})
         self.assertEqual(result["9"]["inputs"]["image"], "frameweave/safe.png")
+
+    def test_video_loader_candidates_are_typed_private_names_cleared_and_portable(self):
+        graph = {
+            "1": {"class_type": "LoadVideo", "inputs": {"file": "private/camera.mov"}},
+            "2": {"class_type": "VHS_LoadVideo", "inputs": {"video": "private/clip.mp4"}},
+        }
+        info = {
+            "LoadVideo": {"input": {"required": {"file": ["COMBO", {
+                "options": ["known.mp4"], "video_upload": True,
+            }]}}, "output": ["VIDEO"]},
+            "VHS_LoadVideo": {"input": {"required": {"video": [["known.mp4", "other.webm"]]}},
+                              "output": ["IMAGE", "AUDIO"]},
+        }
+        result = inspect_document(graph, info)
+        by_binding = {(field["node_id"], field["input"]): field for field in result["fields"]}
+        for binding in (("1", "file"), ("2", "video")):
+            with self.subTest(binding=binding):
+                field = by_binding[binding]
+                self.assertEqual(field["type"], "video")
+                self.assertTrue(field["required"])
+                self.assertEqual(field["default"], "")
+                self.assertEqual(result["prompt"][binding[0]]["inputs"][binding[1]], "")
+
+        package = self.store.save({**result, "name": "视频参考"})
+        exported = self.store.export(package["id"])
+        self.assertNotIn("private/", json.dumps(exported))
+        video_field = next(field for field in package["fields"] if field["node_id"] == "1")
+        with self.assertRaisesRegex(ValueError, "填写"):
+            apply_values(package, {})
+        video_values = {field["id"]: f"reference-{field['node_id']}.mov" for field in package["fields"]}
+        self.assertEqual(apply_values(package, video_values)["1"]["inputs"]["file"],
+                         "reference-1.mov")
+        for unsafe in ("../camera.mov", "C:/private/camera.mov", "/private/camera.mov"):
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                apply_values(package, {video_field["id"]: unsafe})
+        field, node = validate_package_media_field(package, video_field["id"], info, "video")
+        self.assertEqual((field["input"], node["class_type"]), ("file", "LoadVideo"))
+
+    def test_video_sync_requires_compatible_live_upload_widget(self):
+        package = self.store.save({
+            "name": "视频输入", "description": "",
+            "prompt": {"1": {"class_type": "LoadVideo", "inputs": {"file": ""}}},
+            "fields": [{"id": "video", "node_id": "1", "input": "file", "type": "video",
+                        "label": "参考视频", "default": ""}],
+        })
+        field_id = package["fields"][0]["id"]
+        with self.assertRaisesRegex(ValueError, "兼容媒体上传节点"):
+            validate_package_media_field(package, field_id, {
+                "LoadVideo": {"input": {"required": {"file": ["COMBO", {"options": []}]}}},
+            }, "video")
+        with self.assertRaisesRegex(ValueError, "兼容媒体上传节点"):
+            validate_package_media_field(package, field_id, {
+                "LoadVideo": {"input": {"required": {"file": ["STRING"]}}},
+            }, "video")
+        with self.assertRaisesRegex(ValueError, "类型不一致"):
+            validate_package_media_field(package, field_id, {
+                "LoadVideo": {"input": {"required": {"file": ["COMBO", {"video_upload": True}]}}},
+            }, "image")
+
+    def test_video_field_cannot_bind_to_unrelated_node_or_unexposed_loader(self):
+        with self.assertRaisesRegex(ValueError, "只能绑定"):
+            normalize_document({
+                "name": "bad", "description": "",
+                "prompt": {"1": {"class_type": "Text", "inputs": {"text": "x"}}},
+                "fields": [{"id": "video", "node_id": "1", "input": "text", "type": "video",
+                            "label": "video", "default": ""}],
+            })
+        for node_type, field_name in (("LoadVideo", "file"), ("VHS_LoadVideo", "video")):
+            with self.subTest(node_type=node_type), self.assertRaisesRegex(ValueError, "必须开放视频上传"):
+                normalize_document({
+                    "name": "missing", "description": "",
+                    "prompt": {"1": {"class_type": node_type, "inputs": {field_name: ""}}},
+                    "fields": [],
+                })
 
     def test_select_values_preserve_type_and_boolean_is_not_integer(self):
         document = sample()

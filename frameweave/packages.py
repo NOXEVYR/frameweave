@@ -289,6 +289,10 @@ def inspect_document(document, info=None, *, field_limit=64):
                 continue
             kind = "boolean" if type(value) is bool else "integer" if type(value) is int else "number" if type(value) is float else "text"
             spec, meta = _spec(specs[name]) if name in specs else (None, {})
+            # JSON serializes 1.0 as 1 in the browser; the live FLOAT contract
+            # must still allow fractional values such as a video duration.
+            if spec == "FLOAT" and type(value) in (int, float):
+                kind = "number"
             options = spec if isinstance(spec, list) else meta.get("options") if spec == "COMBO" else None
             if isinstance(options, list) and 1 <= len(options) <= 512 and all(scalar(v) for v in options):
                 kind = "select"

@@ -291,7 +291,7 @@ def generation_options(object_info: dict) -> dict:
 
 
 def _expanded_inputs(schema, values):
-    """Expand ComfyUI's public dynamic-combo and autogrow wire field names."""
+    """Expand declared dynamic-combo, autogrow and video-format inputs."""
     fields, required = {}, set()
 
     def add(groups, prefix="", depth=0):
@@ -331,6 +331,24 @@ def _expanded_inputs(schema, values):
                                      if isinstance(option, dict) and option.get("key") == selection), None)
                     if selected:
                         add(selected.get("inputs", {}), key + ".", depth + 1)
+                elif isinstance(kind, list) and isinstance(meta.get("formats"), dict):
+                    selection = values.get(key)
+                    if not isinstance(selection, str) or selection not in kind:
+                        continue
+                    widgets = meta["formats"].get(selection, [])
+                    if not isinstance(widgets, list):
+                        raise ValueError("后端视频格式输入定义不合法")
+                    for widget in widgets:
+                        if (not isinstance(widget, (list, tuple)) or len(widget) < 2 or
+                                not isinstance(widget[0], str) or not widget[0]):
+                            raise ValueError("后端视频格式输入定义不合法")
+                        # VHS sends these as flat kwargs and supplies omitted defaults.
+                        # Later entries can contain FFmpeg substitutions, not input specs.
+                        child = prefix + widget[0]
+                        if any(widget[0] in groups.get(group_name, {})
+                               for group_name in ("required", "optional")):
+                            continue
+                        fields.setdefault(child, widget[1:3])
 
     add(schema.get("input", {}))
     return fields, required

@@ -9,6 +9,38 @@ const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image', 
 const RESERVED_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 const fieldId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value) && !RESERVED_FIELDS.has(value);
 
+function localBackendIdentity(value, label = '媒体来源引擎') {
+  if (typeof value !== 'string' || !value || value.length > 200) throw new Error(`${label}无效`);
+  let url;
+  try { url = new URL(value); } catch { throw new Error(`${label}无效`); }
+  let hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (url.protocol !== 'http:' || url.username || url.password || url.search || url.hash
+      || !['', '/'].includes(url.pathname)) {
+    throw new Error(`${label}必须是本机回环地址`);
+  }
+  if (hostname === 'localhost') url.hostname = '127.0.0.1';
+  hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const ipv4 = hostname.split('.').map(Number);
+  const isLoopbackV4 = ipv4.length === 4 && ipv4.every(part => Number.isInteger(part) && part >= 0 && part <= 255) && ipv4[0] === 127;
+  if (!isLoopbackV4 && hostname !== '::1') throw new Error(`${label}必须是本机回环地址`);
+  const port = url.port ? Number(url.port) : 80;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${label}端口无效`);
+  // Match Python's existing engine/job identities, which retain IPv6 spelling.
+  const ipv6 = hostname === '::1' ? value.match(/^http:\/\/\[([^\]]+)\]/i)?.[1].toLowerCase() : null;
+  return `http://${ipv6 ? `[${ipv6}]` : hostname}:${port}`;
+}
+
+function packageMediaOwners(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 64) throw new Error('工作流包媒体来源记录无效');
+  const owners = {};
+  for (const [id, owner] of Object.entries(value)) {
+    if (!fieldId(id) || !owner || typeof owner !== 'object' || Array.isArray(owner)
+        || typeof owner.name !== 'string' || !owner.name) throw new Error('工作流包媒体来源字段无效');
+    owners[id] = { name: uploadedMediaName(owner.name, '工作流包媒体'), backend: localBackendIdentity(owner.backend, '工作流包媒体来源引擎') };
+  }
+  return owners;
+}
+
 /** Cached public ports only. The actual package is refreshed and validated before running. */
 function packageFields(value) {
   if (!Array.isArray(value) || value.length > 64) throw new Error('工作流包最多开放 64 个输入参数');
@@ -45,9 +77,13 @@ function edgeOptions(options = {}) {
 }
 
 function uploadedImageName(value) {
-  if (typeof value !== 'string' || !value || value.length > 1024) throw new Error('参考图必须使用后端上传返回的相对名称');
+  return uploadedMediaName(value, '参考图');
+}
+
+function uploadedMediaName(value, label = '媒体输入') {
+  if (typeof value !== 'string' || !value || value.length > 1024) throw new Error(`${label}必须使用后端上传返回的相对名称`);
   const name = value.replaceAll('\\', '/');
-  if (name.startsWith('/') || name.includes(':') || name.split('/').some(part => ['.', '..'].includes(part)) || name.includes('\0')) throw new Error('参考图必须使用后端上传返回的相对名称');
+  if (name.startsWith('/') || name.includes(':') || name.split('/').some(part => ['.', '..'].includes(part)) || name.includes('\0')) throw new Error(`${label}必须使用后端上传返回的相对名称`);
   return value;
 }
 
@@ -253,6 +289,52 @@ export function executionOrder(graph, ids = graph.nodes.filter(node => node.type
   return order.filter(id => needed.has(id) && nodes.get(id).type === 'generation');
 }
 
+/** Fail closed when file names would cross the local engine boundary. */
+export function validateExecutionMediaBackends(graph, targets, currentBackend, targetBackend) {
+  const order = executionOrder(graph, targets);
+  if (!order.length) return true;
+  const nodes = new Map(graph.nodes.map(node => [node.id, node]));
+  const incoming = new Map(graph.nodes.map(node => [node.id, []]));
+  for (const edge of graph.edges) incoming.get(edge.target)?.push(edge);
+  const needed = new Set();
+  const include = id => {
+    if (needed.has(id)) return;
+    needed.add(id);
+    for (const edge of incoming.get(id) || []) include(edge.source);
+  };
+  for (const id of targets) include(id);
+
+  const switching = currentBackend !== targetBackend;
+  const issues = [];
+  const check = (label, filename, owner) => {
+    if (owner && owner !== targetBackend) {
+      issues.push(`${label}（${filename}）上传自 ${owner}，目标引擎为 ${targetBackend}`);
+    } else if (!owner && switching) {
+      issues.push(`${label}（${filename}）没有上传引擎记录，切换到 ${targetBackend} 后无法确认素材是否存在`);
+    }
+  };
+
+  for (const id of needed) {
+    const node = nodes.get(id);
+    if (node?.type === 'reference' && node.data.name) {
+      check(node.data.title || '参考图片', node.data.name, node.data.uploadBackend || '');
+      continue;
+    }
+    if (node?.type !== 'generation' || node.data.kind !== 'package') continue;
+    const connectedFields = new Set(graph.edges.filter(edge => edge.target === id && edge.targetField).map(edge => edge.targetField));
+    for (const field of node.data.packageFields || []) {
+      if (!['image', 'audio'].includes(field.type) || connectedFields.has(field.id)) continue;
+      const filename = node.data.packageValues?.[field.id];
+      if (filename === undefined || filename === null || filename === '') continue;
+      const owner = node.data.packageMediaBackends?.[field.id];
+      check(field.label || '工作流包图片输入', filename,
+        owner?.name === filename ? owner.backend : '');
+    }
+  }
+  if (issues.length) throw new Error(`媒体输入不会在推理引擎之间自动转移。${issues.slice(0, 4).join('；')}。请在目标引擎中重新上传对应媒体，再运行工作流。`);
+  return true;
+}
+
 /** Restore a recorded request as an independent, editable canvas fragment. */
 export function recipeGraph(recipe, x = 80, y = 80) {
   const request = recipe?.request;
@@ -316,16 +398,20 @@ export function parseGraph(text) {
       else if (typeof data[key] === 'number') data[key] = finite(node.data[key], data[key]);
       else data[key] = String(node.data[key] ?? '').slice(0, 100000);
     }
+    if (node.type === 'reference' && node.data.uploadBackend !== undefined) {
+      data.uploadBackend = node.data.uploadBackend === '' ? '' : localBackendIdentity(node.data.uploadBackend);
+    }
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
     if (node.type === 'generation') {
+      if (node.data.packageMediaBackends !== undefined) data.packageMediaBackends = packageMediaOwners(node.data.packageMediaBackends);
       if (node.data.editor_id !== undefined) {
         if (typeof node.data.editor_id !== 'string' || !/^e-[a-f0-9]{24}$/.test(node.data.editor_id)) throw new Error('原生工作流 ID 无效');
         data.editor_id = node.data.editor_id;
       }
       if (node.data.editor_backend !== undefined) {
         if (typeof node.data.editor_backend !== 'string' || node.data.editor_backend.length > 200) throw new Error('原生工作流后端地址无效');
-        data.editor_backend = node.data.editor_backend;
+        data.editor_backend = node.data.editor_backend ? localBackendIdentity(node.data.editor_backend, '原生工作流后端地址') : '';
       }
       for (const key of ['editor_baseline', 'editor_outputs', 'editor_output_fields']) {
         if (node.data[key] !== undefined) data[key] = packageValues({ value: node.data[key] }).value;

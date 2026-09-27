@@ -9,6 +9,39 @@ export function editorOutputEdges(graph, nodeId) {
 
 export const editorOutputKey = edge => edge.sourceOutput || `legacy-${edge.id}`;
 
+function remappedMediaOwners(node, fields, values, backend, rebindings) {
+  const oldFields = new Map((node.data.packageFields || []).map(field => [field.id, field]));
+  const nextFields = new Map(fields.map(field => [field.id, field]));
+  const oldValues = node.data.packageValues || {};
+  const oldOwners = node.data.packageMediaBackends || {};
+  const owners = {};
+  const mediaTypes = new Set(['image', 'audio']);
+  const engineChanged = Boolean(node.data.editor_backend && backend && node.data.editor_backend !== backend);
+
+  for (const [oldId, oldField] of oldFields) {
+    if (!mediaTypes.has(oldField.type)) continue;
+    const nextId = Object.hasOwn(rebindings, oldId) ? rebindings[oldId] : oldId;
+    if (!nextId) continue;
+    const nextField = nextFields.get(nextId);
+    if (!nextField || nextField.type !== oldField.type) continue;
+
+    const oldName = oldValues[oldId];
+    const nextName = values?.[nextId];
+    if (typeof oldName !== 'string' || !oldName || oldName !== nextName) continue;
+
+    const prior = oldOwners[oldId];
+    if (prior?.name === oldName && prior.backend) {
+      owners[nextId] = { name: nextName, backend: prior.backend };
+    } else if (engineChanged) {
+      // Older canvases did not record media ownership. Keep the old editor's
+      // engine as the conservative source so applying the interface on a new
+      // engine cannot turn the inherited filename into an unowned input.
+      owners[nextId] = { name: nextName, backend: node.data.editor_backend };
+    }
+  }
+  return owners;
+}
+
 export function editorConnectionSummary(graph, nodeId, outputs) {
   const inputs = graph.edges.filter(edge => edge.target === nodeId).map(edge => ({
     direction: 'input', fieldId: edge.targetField,
@@ -29,10 +62,11 @@ export function applyEditorInterfaceGraph(graph, nodeId, result) {
   const fields = result.package.fields;
   const valid = new Set(fields.map(field => field.id));
   const outputs = new Set(editorOutputEdges(copy, nodeId).map(edge => edge.id));
+  const packageMediaBackends = remappedMediaOwners(node, fields, result.values, result.backend_url, result.rebindings || {});
   Object.assign(node.data, { package_id: result.package.id, packageValues: result.values,
     packageFields: fields.map(({ id, label, type }) => ({ id, label, type })),
     editor_backend: result.backend_url, editor_baseline: result.baseline,
-    editor_outputs: result.output_nodes, editor_output_fields: result.outputs });
+    editor_outputs: result.output_nodes, editor_output_fields: result.outputs, packageMediaBackends });
   if (result.controls) node.data.editor_controls = result.controls;
   copy.edges = copy.edges.filter(edge => {
     if (edge.target === nodeId && edge.targetField) {

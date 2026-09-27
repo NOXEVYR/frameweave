@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNode, createDemo, connect, canConnect, removeNodes, duplicateNodes, generationPayload, executionOrder, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from '../web/graph.mjs';
+import { createNode, createDemo, connect, canConnect, removeNodes, duplicateNodes, generationPayload, executionOrder, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent, validateExecutionMediaBackends } from '../web/graph.mjs';
 
 test('Qwen 2.1 canvas preserves model identity and reference order rather than video frame roles', () => {
   const target = createNode('generation', 0, 0, { kind: 'qwen21_edit', models: { dit: 'qwen_image_2.1_variant.safetensors' }, width: 1024, height: 1024 });
@@ -322,4 +322,84 @@ test('canvas preserves explicit refinement and audio package fields/results thro
   const restored = parseGraph(serializeGraph(graph));
   assert.deepEqual(restored.nodes[0].data.refine, graph.nodes[0].data.refine);
   assert.equal(restored.nodes[1].data.outputs[0].type, 'audio');
+});
+
+test('reference upload engine identity survives canvas save and rejects cross-engine handoff', () => {
+  const target = createNode('generation', 300, 0, { editor_backend: 'http://127.0.0.1:8188' });
+  const reference = createNode('reference', 0, 0, { name: 'input/portrait.png', uploadBackend: 'http://127.0.0.1:8189' });
+  const unrelated = createNode('reference', 0, 400, { name: 'input/unused.png', uploadBackend: 'http://127.0.0.1:8189' });
+  const graph = { nodes: [target, reference, unrelated], edges: [] };
+  connect(graph, reference.id, target.id);
+  const restored = parseGraph(serializeGraph(graph));
+  const restoredReference = restored.nodes.find(node => node.id === reference.id);
+  assert.equal(restoredReference.data.uploadBackend, 'http://127.0.0.1:8189');
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'), /目标引擎.*重新上传/);
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8188', 'http://127.0.0.1:8188'), /目标引擎.*重新上传/);
+  restoredReference.data.uploadBackend = 'http://127.0.0.1:8188';
+  assert.doesNotThrow(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'));
+});
+
+test('backend identities normalize localhost and preserve explicit loopback ports including 80', () => {
+  const references = [
+    createNode('reference', 0, 0, { name: 'a.png', uploadBackend: 'http://127.0.0.2' }),
+    createNode('reference', 0, 0, { name: 'b.png', uploadBackend: 'http://[::1]' }),
+    createNode('reference', 0, 0, { name: 'c.png', uploadBackend: 'http://localhost:8188' }),
+  ];
+  const restored = parseGraph(serializeGraph({ nodes: references, edges: [] }));
+  assert.deepEqual(restored.nodes.map(node => node.data.uploadBackend), [
+    'http://127.0.0.2:80', 'http://[::1]:80', 'http://127.0.0.1:8188',
+  ]);
+  const target = createNode('generation', 300, 0, { editor_backend: 'http://127.0.0.2:80' });
+  const sameEngine = createNode('reference', 0, 0, { name: 'same.png', uploadBackend: 'http://127.0.0.2' });
+  const sameGraph = { nodes: [target, sameEngine], edges: [] };
+  connect(sameGraph, sameEngine.id, target.id);
+  const sameRestored = parseGraph(serializeGraph(sameGraph));
+  assert.doesNotThrow(() => validateExecutionMediaBackends(sameRestored, [target.id], 'http://127.0.0.2:80', 'http://127.0.0.2:80'));
+  references[0].data.uploadBackend = 'http://128.0.0.1:8188';
+  assert.throws(() => parseGraph(serializeGraph({ nodes: references, edges: [] })), /本机回环地址/);
+});
+
+test('old reference nodes without an owner are blocked on engine switch but remain usable without a switch', () => {
+  const target = createNode('generation', 300, 0, { editor_backend: 'http://127.0.0.1:8188' });
+  const reference = createNode('reference', 0, 0, { name: 'legacy.png' });
+  const graph = { nodes: [target, reference], edges: [] };
+  connect(graph, reference.id, target.id);
+  const restored = parseGraph(serializeGraph(graph));
+  assert.equal(restored.nodes.find(node => node.id === reference.id).data.uploadBackend, undefined);
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'), /没有上传引擎记录/);
+  assert.doesNotThrow(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8188', 'http://127.0.0.1:8188'));
+});
+
+test('package image values preserve owner and are checked only when an image field supplies the value', () => {
+  const target = createNode('generation', 300, 0, {
+    kind: 'package', package_id: 'p-test', editor_backend: 'http://127.0.0.1:8188',
+    packageFields: [{ id: 'image', label: '参考图', type: 'image' }],
+    packageValues: { image: 'input/package.png' },
+    packageMediaBackends: { image: { name: 'input/package.png', backend: 'http://localhost:8188' } },
+  });
+  const graph = { nodes: [target], edges: [] };
+  const restored = parseGraph(serializeGraph(graph));
+  assert.deepEqual(restored.nodes[0].data.packageMediaBackends, {
+    image: { name: 'input/package.png', backend: 'http://127.0.0.1:8188' },
+  });
+  assert.doesNotThrow(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'));
+  restored.nodes[0].data.packageMediaBackends.image.backend = 'http://127.0.0.1:8189';
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8188', 'http://127.0.0.1:8188'), /目标引擎.*重新上传/);
+  restored.nodes[0].data.packageMediaBackends.image.backend = 'http://127.0.0.1:8188';
+  restored.nodes[0].data.packageMediaBackends.image.name = 'old-filename.png';
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'), /没有上传引擎记录/);
+});
+
+test('package audio values stop on a different engine and pass after upload to the target engine', () => {
+  const target = createNode('generation', 300, 0, {
+    kind: 'package', package_id: 'p-audio', editor_backend: 'http://127.0.0.1:8188',
+    packageFields: [{ id: 'voice', label: '参考音频', type: 'audio' }],
+    packageValues: { voice: 'input/voice.wav' },
+    packageMediaBackends: { voice: { name: 'input/voice.wav', backend: 'http://127.0.0.1:8189' } },
+  });
+  const graph = { nodes: [target], edges: [] };
+  const restored = parseGraph(serializeGraph(graph));
+  assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'), /目标引擎.*重新上传/);
+  restored.nodes[0].data.packageMediaBackends.voice.backend = 'http://127.0.0.1:8188';
+  assert.doesNotThrow(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'));
 });

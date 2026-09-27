@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__
@@ -33,6 +34,7 @@ from .canvas_store import CanvasStore
 from .editor_workflows import EditorWorkflowStore, _parse_document as parse_editor_document
 from .editor_proxy import EditorProxy
 from .editor_interfaces import inspect_interface, reconcile_interface, select_outputs
+from .editor_backends import inspect_backend_fit
 from .workspace_services import PROFILES, performance_plan, result_location
 from .packages import (PackageStore, apply_values, inspect_document,
                        normalize_document, transport_document)
@@ -147,6 +149,25 @@ class App:
             result = proxy.start()
             self.editor_sessions[session_id] = {'proxy': proxy, 'backend': backend, 'workflow_id': workflow_id}
         return {**result, 'session_id': session_id, 'backend_url': backend}
+
+    def editor_backends(self, workflow_id):
+        document = self.editor_workflows.get(workflow_id)['document']
+        current = self.backend.url
+        profiles = self.engines.registered_endpoints()
+        choices = {current: {'base_url': current, 'name': '当前引擎'}}
+        for profile in profiles:
+            choices[profile['base_url']] = {'base_url': profile['base_url'], 'name': profile['name']}
+        def inspect(item):
+            try:
+                backend = Backend(item['base_url'])
+                info = backend.request('/object_info', timeout=3)
+                extensions = backend.request('/extensions', timeout=3)
+                return {**item, 'online': True, **inspect_backend_fit(document, info, extensions)}
+            except (BackendError, ValueError) as exc:
+                return {**item, 'online': False, 'error': str(exc), 'score': -1}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            candidates = list(pool.map(inspect, choices.values()))
+        return {'current': current, 'candidates': candidates}
 
     def editor_interface(self, workflow_id, data):
         self.editor_workflows.get(workflow_id)
@@ -503,7 +524,7 @@ class App:
         backend_name = f"{subfolder}/{returned_name}" if subfolder else returned_name
         self.uploaded.add(backend_name)
         self.info_at = 0
-        return {"name": backend_name, "url": url}
+        return {"name": backend_name, "url": url, "backend": self.backend.url}
 
     def image_input(self, job_id, data):
         """Copy an owned completed result into the current backend's image inputs."""
@@ -1151,9 +1172,11 @@ def make_server(app, port=0):
                     if document is None and isinstance(data.get('source_json'), str):
                         document = json.loads(data['source_json'].lstrip('\ufeff'))
                     result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'))
-                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure)', path):
+                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure|backends)', path):
                     workflow_id, action = path.split('/')[3:5]
-                    if action == 'session':
+                    if action == 'backends':
+                        result = app.editor_backends(workflow_id)
+                    elif action == 'session':
                         result = app.editor_session(workflow_id, 'http://' + self.headers['Host'])
                     elif action == 'draft':
                         with app.lock:

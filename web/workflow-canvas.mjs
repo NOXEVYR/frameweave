@@ -107,9 +107,10 @@ export function createWorkflowCanvas(host) {
     operation = 'run'; renderState(runner.getState());
     try {
     await host.loadPackages();
-    if (!host.engine().online) throw new Error('本地推理引擎未连接，请先连接并检查模型');
     const targets = ids?.length ? ids : host.graph().nodes.filter(n => n.type === 'generation').map(n => n.id);
     if (!targets.length) throw new Error('请先向画布添加工作流或生成节点');
+    if (host.prepareBackend) await host.prepareBackend(targets);
+    if (!host.engine().online) throw new Error('本地推理引擎未连接，请先连接并检查模型');
     return await runner.start({ graph: host.graph(), targetIds: targets, backend: host.engine().backend_url, canvasId: host.canvasIdentity() });
     } finally { operation = ''; renderState(runner.getState()); }
   }

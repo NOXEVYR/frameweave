@@ -4,6 +4,10 @@
 
 **AI 图片、视频与音频工作台，兼顾专业画布和本地环境检查。** 在画布上组织提示词、参考图、生成任务与结果，连接已有本地 ComfyUI 完成生成；发现并检查推理环境、模型依赖和后端状态。
 
+功能完整、稳定和易用优先，资源占用适度控制。必要组件按实际成本引入，优先复用已有模型和引擎，避免重复权重与无意义的后台工作。
+
+> **0.11.1**：进入工作流前按实时节点与前端扩展匹配引擎；画布记住绑定，运行时检查媒体所属引擎。支持视频输出格式的动态编码参数和小数时长；内部更换引擎、接口重绑后继续校验来源，避免把其他引擎的同名素材当作当前输入。
+
 以钴蓝、杏桃与暖灰构建的本地 AI 影像工作台。独立编写，无广告、账号、遥测或云端依赖；支持 MiniMax H3 视频、Krea 2 / SDXL 图片控制、Qwen Image 2.1 原生文生图与条件编辑、缺失项检查和可复现工作流。
 
 > **0.10.0**：长弹窗固定关闭按钮；本地命名画布版本库、生成产物与文件位置；GPU 显存建议和快捷键帮助；SDXL 外置双编码器 / VAE 与高清二次重绘；声音 / 音乐工作流页。环境检查区分备用端口与实际故障，并提供脱敏的实时版本和节点接口证据。音频通过已有 AUDIO 工作流运行，不内置语音或音乐模型。
@@ -24,11 +28,11 @@
 
 ## 开始使用
 
-**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.0-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.0-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
+**[下载 Windows 便携版](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip)** · [下载源码 ZIP](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-source.zip) · [SHA-256 校验值](https://github.com/NOXEVYR/frameweave/blob/main/releases/SHA256SUMS.txt)
 
 新版本源码、文档和下载包在本独立仓库维护。[v0.2.0 历史发行文件](https://github.com/NOXEVYR/portfolio/tree/main/frameweave/releases) 和原下载地址继续保留，详情见 [迁移说明](MIGRATION.md)。
 
-Windows 用户完整解压 0.11.0 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
+Windows 用户完整解压 0.11.1 便携 ZIP 后，打开 `PrismCanvas.exe`。程序使用系统 Edge 的独立应用窗口；无需另装 Python，不另外捆绑 Chromium。没有 Edge 时使用默认浏览器。
 
 1. 启动你的本地 ComfyUI 推理服务。
 2. 棱光启动后自动发现本机后端，点击使用发现的服务；也可在右上角设置填写地址，例如 `http://127.0.0.1:8188`。

@@ -460,6 +460,12 @@ class EngineManager:
             self._save()
             return self._public_status(profile)
 
+    def registered_endpoints(self):
+        """List validated public identities without network or lifecycle probes."""
+        with self._lock:
+            return [{key: profile[key] for key in ('id', 'name', 'base_url')}
+                    for profile in self._profiles]
+
     def status(self):
         """Read health without changing state or managing any process."""
         with self._lock:

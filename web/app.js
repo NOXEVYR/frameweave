@@ -12,6 +12,7 @@ import { createWorkflowCanvas } from './workflow-canvas.mjs';
 import { createNativeWorkflowEditor, editorDocument, EDITOR_LIMIT } from './native-workflow-editor.mjs';
 import { chooseEditorInterface, resolveEditorConflicts } from './editor-interface-panel.mjs';
 import { editorConnectionSummary, applyEditorInterfaceGraph } from './editor-canvas-interface.mjs';
+import { chooseWorkflowBackend, workflowBackendTarget } from './editor-backend-picker.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
@@ -34,6 +35,7 @@ let history = [];
 let future = [];
 let csrf = '';
 const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copyText,
+  ensureBackend: ensureWorkflowBackend,
   async ensureInstance(node) {
     if (graph.nodes.filter(other => other.data.editor_id === node.data.editor_id).length < 2) return;
     const original = await api(`/api/editor-workflows/${node.data.editor_id}`);
@@ -76,8 +78,29 @@ async function configureNativeInterface(node, compiled = null, session = null) {
   return { ...result, outputs: info.outputs, controls: compiled?.controls || node.data.editor_controls || [], rebindings: selection.rebindings, output_rebindings: selection.output_rebindings };
 }
 async function configureNativePanel(node) {
+  if (!await ensureWorkflowBackend(node)) return;
   const result = await configureNativeInterface(node);
   if (result) { await nativeEditor.applyToNode(node, result); toast('外层参数面板已更新；无需进入内部即可调节'); }
+}
+async function ensureWorkflowBackend(node, _workflow = null, force = false) {
+  const report = await api(`/api/editor-workflows/${node.data.editor_id}/backends`, {});
+  const target = await chooseWorkflowBackend(report, node.data.editor_backend, force);
+  if (!target) return false;
+  if (target !== report.current || target !== settings.backend_url) await useBackend(target);
+  if (!node.data.package_id && node.data.editor_backend !== target) mutate(() => { node.data.editor_backend = target; });
+  return target;
+}
+async function prepareWorkflowBackend(targets) {
+  const currentBackend = settings.backend_url;
+  const snapshot = parseGraph(serializeGraph(graph));
+  const target = workflowBackendTarget(snapshot, targets, currentBackend);
+  if (target === currentBackend) return;
+  const profiles = (await api('/api/engines')).profiles || [];
+  if (settings.backend_url !== currentBackend) throw new Error('准备工作流期间推理引擎已变化，请重新运行以检查参考图片归属。');
+  if (!profiles.some(item => item.base_url === target && item.online)) throw new Error('工作流绑定的引擎尚未登记或未启动，请在设置中连接后再运行。');
+  await useBackend(target);
+  if (serializeGraph(graph) !== serializeGraph(snapshot)) throw new Error('切换推理引擎期间画布发生了变化。请确认参考图片后重新运行，避免使用未检查的素材。');
+  toast('已连接这套工作流记住的推理引擎');
 }
 let settings = { backend_url: 'http://127.0.0.1:8188', model_roots: [], comfy_roots: [] };
 let engine = { online: false, capabilities: {}, models: {} };
@@ -628,10 +651,17 @@ function renderPackageInputs(wrap, node) {
   for (const definition of pack.fields) {
     const type = fieldType(definition), value = values[definition.id];
     const label = `${definition.label || definition.input}${definition.required ? ' *' : ''}`;
-    const change = raw => {
+    const change = (raw, mediaBackend = '') => {
       try {
         const next = coerceFieldValue(definition, raw);
-        mutate(() => { node.data.packageValues = { ...(node.data.packageValues || {}), [definition.id]: next }; }, { inspector: false });
+        mutate(() => {
+          node.data.packageValues = { ...(node.data.packageValues || {}), [definition.id]: next };
+          if (type === 'image' || type === 'audio') {
+            node.data.packageMediaBackends = { ...(node.data.packageMediaBackends || {}) };
+            if (mediaBackend) node.data.packageMediaBackends[definition.id] = { name: next, backend: mediaBackend };
+            else delete node.data.packageMediaBackends[definition.id];
+          }
+        }, { inspector: false });
       } catch (error) { if (!draftEditing) { reportError(error); renderInspector(); } return false; }
     };
     let control;
@@ -648,10 +678,19 @@ function renderPackageInputs(wrap, node) {
       input.addEventListener('change', () => {
         const file = input.files?.[0]; input.value = ''; if (!file) return;
         upload.disabled = true;
-        const operation = type === 'audio' ? (async () => { if (file.size > 20 * 1024 * 1024) throw new Error('参考音频最大 20 MiB'); const bytes = new Uint8Array(await file.arrayBuffer()); let raw = ''; for (let i = 0; i < bytes.length; i += 8192) raw += String.fromCharCode(...bytes.subarray(i, i + 8192)); return api('/api/upload-audio', { data: btoa(raw) }); })() : uploadImage(file);
+        const operation = type === 'audio' ? (async () => {
+          if (file.size > 20 * 1024 * 1024) throw new Error('参考音频最大 20 MiB');
+          const bytes = new Uint8Array(await file.arrayBuffer()); let raw = '';
+          for (let i = 0; i < bytes.length; i += 8192) raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
+          const uploadBackend = settings.backend_url;
+          const uploaded = await api('/api/upload-audio', { data: btoa(raw) });
+          if (!uploaded?.name || !uploaded.backend || uploaded.backend !== uploadBackend || settings.backend_url !== uploadBackend) throw new Error('上传期间推理引擎发生了切换，或服务未确认音频来源。本次音频不会写入工作流，请在目标引擎下重新上传。');
+          return uploaded;
+        })() : uploadImage(file);
         operation.then(uploaded => {
           if (!getNode(node.id)) return;
-          change(uploaded.name); renderInspector(); toast('参考图已保存到本地推理服务');
+          if (settings.backend_url !== uploaded.backend) throw new Error('上传期间推理引擎发生了切换，本次媒体来源无法确认。请在目标引擎下重新上传。');
+          change(uploaded.name, uploaded.backend); renderInspector(); toast('参考素材已保存到本地推理服务');
         }).catch(reportError).finally(() => { upload.disabled = false; });
       });
       control.append(upload, input);
@@ -1435,14 +1474,17 @@ async function uploadImage(file) {
   if (file.size > 20 * 1024 * 1024) throw new Error('初版单张参考图上限为 20 MiB，请先缩小图片。');
   toast(`正在导入 ${file.name}…`);
   const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = () => reject(new Error('无法读取素材')); reader.readAsDataURL(file); });
+  const uploadBackend = settings.backend_url;
   const uploaded = await api('/api/upload', { name: file.name, data });
-  if (!uploaded.name || !uploaded.url) throw new Error('上传服务没有返回有效素材引用');
+  if (!uploaded?.name || !uploaded.url) throw new Error('上传服务没有返回有效素材引用');
+  if (!uploaded.backend || uploaded.backend !== uploadBackend || settings.backend_url !== uploadBackend) throw new Error('上传期间推理引擎发生了切换，或服务未确认图片来源。本次图片不会写入画布，请在目标引擎下重新上传。');
   return uploaded;
 }
 async function uploadFile(file, target) {
   const uploaded = await uploadImage(file);
-  if (target && getNode(target)) mutate(() => { const node = getNode(target); node.data = { ...node.data, name: uploaded.name, url: uploaded.url, mediaType: file.type.startsWith('video/') ? 'video' : 'image' }; });
-  else addNode('reference', { title: file.name.replace(/\.[^.]+$/, '').slice(0, 50), name: uploaded.name, url: uploaded.url, mediaType: file.type.startsWith('video/') ? 'video' : 'image' });
+  if (settings.backend_url !== uploaded.backend) throw new Error('上传期间推理引擎发生了切换，本次图片来源无法确认。请在目标引擎下重新上传。');
+  if (target && getNode(target)) mutate(() => { const node = getNode(target); node.data = { ...node.data, name: uploaded.name, url: uploaded.url, uploadBackend: uploaded.backend, mediaType: file.type.startsWith('video/') ? 'video' : 'image' }; });
+  else addNode('reference', { title: file.name.replace(/\.[^.]+$/, '').slice(0, 50), name: uploaded.name, url: uploaded.url, uploadBackend: uploaded.backend, mediaType: file.type.startsWith('video/') ? 'video' : 'image' });
   toast('素材已保存到本地');
 }
 
@@ -1684,7 +1726,7 @@ const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { 
 const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
 initializeCanvasActions();
 studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
-workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError,
+workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend,
   connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });

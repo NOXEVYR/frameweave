@@ -2,7 +2,7 @@
 
 - Display brand since 0.5.0: 棱光 PrismCanvas. Preserve the FrameWeave Python package, data directory, browser storage keys, schemas, MCP server name and API identity for compatibility. New Windows builds use PrismCanvas.exe. The selected E04 geometry lives in assets/frameweave.svg and web/brand.svg.
 
-- Reply in Chinese for this project. This is an independently written lightweight AI canvas client.
+- Reply in Chinese for this project. This is an independently written AI canvas client. Functional completeness, stability and usability take priority over minimizing package size. Keep resource use proportionate: reuse model files, make cache/storage visible and manageable, and avoid unnecessary background work. Necessary dependencies may be added with measured cost and existing download consent rules.
 - Never copy YUH Studio implementation, branding, advertisements, user history, configuration, or weights into this repository.
 - Use Python 3.11+ standard library for the local HTTP service, plain ES modules/CSS for the canvas. No runtime npm dependencies.
 - Keep all runtime user data outside the source tree; tests use temporary directories.

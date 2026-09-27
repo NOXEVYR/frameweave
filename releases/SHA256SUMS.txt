@@ -6,3 +6,5 @@ e663184c030ffaaa78f12b81b4ae241495dab7ce47bd9b3eeea900f108325eba  PrismCanvas-v0
 e2127e6e580059d5b75c906e178e46d9b52393d0b9b34a2257eee91e14f663ed  PrismCanvas-v0.10.0-source.zip
 d83630dd9769773f744f7fec8731559ebed17367c75c9cdc4fddf7ee02bae481  PrismCanvas-v0.11.0-Windows-x64.zip
 4692be07e5715b5325b35b43b0c7687ae78e807ac9ad1ebd2715b894e3fc2c45  PrismCanvas-v0.11.0-source.zip
+0873307053b2e15fc541cc31ddb5407dbd1728f6ef41ef552cb711f4fb8aa265  PrismCanvas-v0.11.1-Windows-x64.zip
+261009483d677bbd18dc6ce6b927ae33708a0ccaa49205d9a88acedba12f170a  PrismCanvas-v0.11.1-source.zip

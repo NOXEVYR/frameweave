@@ -1,8 +1,46 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNode, parseGraph, serializeGraph, generationPayload, connect } from '../web/graph.mjs';
-import { editorDocument } from '../web/native-workflow-editor.mjs';
+import { workflowBackendTarget } from '../web/editor-backend-picker.mjs';
+import { editorDocument, createNativeWorkflowEditor } from '../web/native-workflow-editor.mjs';
 import { editorConnectionSummary, applyEditorInterfaceGraph } from '../web/editor-canvas-interface.mjs';
+
+test('cancelling engine choice leaves shared workflow identity untouched', async () => {
+  let forks = 0;
+  const node = {data:{editor_id:'shared'}};
+  const editor = createNativeWorkflowEditor({api:async()=>({id:'shared'}),
+    ensureBackend:async()=>false, ensureInstance:async()=>{forks++;node.data.editor_id='copy';}});
+  await editor.open(node);
+  assert.equal(forks,0); assert.equal(node.data.editor_id,'shared'); assert.equal(editor.isOpen(),false);
+});
+
+test('imported editor backend aliases use the same identity as uploaded media', () => {
+  const node = createNode('generation', 0, 0, {kind:'package', package_id:'p-'+'a'.repeat(24),
+    editor_backend:'http://localhost:8188', packageFields:[{id:'ref',label:'Reference',type:'image'}],
+    packageValues:{ref:'same.png'},packageMediaBackends:{ref:{name:'same.png',backend:'http://127.0.0.1:8188'}}});
+  const restored = parseGraph(serializeGraph({nodes:[node],edges:[]}));
+  assert.equal(restored.nodes[0].data.editor_backend,'http://127.0.0.1:8188');
+  assert.equal(workflowBackendTarget(restored,[node.id],'http://127.0.0.1:8188'),'http://127.0.0.1:8188');
+  const ipv6='http://[0:0:0:0:0:0:0:1]:8188';
+  node.data.editor_backend=ipv6;node.data.packageMediaBackends.ref.backend=ipv6;
+  const v6= parseGraph(serializeGraph({nodes:[node],edges:[]}));
+  assert.equal(v6.nodes[0].data.editor_backend,ipv6);
+  assert.equal(workflowBackendTarget(v6,[node.id],ipv6),ipv6);
+});
+
+test('editor refuses a session switched by another window and closes it', async () => {
+  const closed = [];
+  const node = {data:{editor_id:'flow'}};
+  const editor = createNativeWorkflowEditor({
+    ensureBackend:async()=>'http://127.0.0.1:8188', ensureInstance:async()=>{},
+    api:async(path,body)=>{
+      if(path.endsWith('/session'))return{session_id:'new',backend_url:'http://127.0.0.1:8189'};
+      if(path.endsWith('/close')){closed.push(body.session_id);return{};}
+      return{id:'flow'};
+    }});
+  await assert.rejects(editor.open(node), /其他窗口/);
+  assert.deepEqual(closed,['new']);assert.equal(editor.isOpen(),false);
+});
 
 test('legacy output wires through preview require explicit stable branch migration', () => {
   const source = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '1'.repeat(24) });
@@ -53,4 +91,74 @@ test('canvas keeps native controls, internal baseline and stable output identity
   assert.equal(restored.edges[0].sourceOutput, '7');
   assert.deepEqual(generationPayload(restored, source.id).output_nodes, ['7']);
   assert.equal(generationPayload(restored, source.id).editor_backend, 'http://127.0.0.1:8188');
+});
+
+test('rebindings migrate image ownership only with the same filename and media type', () => {
+  const backend = 'http://127.0.0.1:8188', nextBackend = 'http://127.0.0.1:8189';
+  const node = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '4'.repeat(24),
+    editor_backend: backend,
+    packageFields: [
+      { id: 'oldImage', label: '旧图片', type: 'image' },
+      { id: 'changedType', label: '旧图像类型', type: 'image' },
+      { id: 'removed', label: '已移除', type: 'image' },
+    ],
+    packageValues: { oldImage: 'same.png', changedType: 'type.png', removed: 'removed.png' },
+    packageMediaBackends: {
+      oldImage: { name: 'same.png', backend },
+      changedType: { name: 'type.png', backend },
+      removed: { name: 'removed.png', backend },
+    } });
+  const updated = applyEditorInterfaceGraph({ nodes: [node], edges: [] }, node.id, {
+    package: { id: node.data.package_id, fields: [
+      { id: 'newImage', label: '新图片', type: 'image' },
+      { id: 'newAudio', label: '新音频', type: 'audio' },
+    ] },
+    values: { newImage: 'same.png', newAudio: 'type.png' }, baseline: {}, backend_url: nextBackend,
+    output_nodes: [], outputs: [], rebindings: { oldImage: 'newImage', changedType: 'newAudio', removed: null },
+  });
+  assert.deepEqual(updated.nodes[0].data.packageMediaBackends, { newImage: { name: 'same.png', backend } });
+  assert.throws(() => workflowBackendTarget(updated, [node.id], nextBackend), /请在目标引擎中重新上传/);
+});
+
+test('legacy unowned media keeps its old engine and the execution guard rejects it after interface reapply', () => {
+  const oldBackend = 'http://127.0.0.1:8188', newBackend = 'http://127.0.0.1:8189';
+  const node = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '5'.repeat(24),
+    editor_backend: oldBackend, packageFields: [{ id: 'oldRef', label: '旧参考图', type: 'image' }],
+    packageValues: { oldRef: 'legacy.png' } });
+  const updated = applyEditorInterfaceGraph({ nodes: [node], edges: [] }, node.id, {
+    package: { id: node.data.package_id, fields: [{ id: 'newRef', label: '新参考图', type: 'image' }] },
+    values: { newRef: 'legacy.png' }, baseline: {}, backend_url: newBackend,
+    output_nodes: [], outputs: [], rebindings: { oldRef: 'newRef' },
+  });
+  assert.deepEqual(updated.nodes[0].data.packageMediaBackends, {
+    newRef: { name: 'legacy.png', backend: oldBackend },
+  });
+  assert.throws(() => workflowBackendTarget(updated, [node.id], newBackend), /请在目标引擎中重新上传/);
+});
+
+test('audio ownership follows an unchanged audio field and obsolete or renamed media owners are discarded', () => {
+  const backend = 'http://127.0.0.1:8188';
+  const node = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '6'.repeat(24),
+    editor_backend: backend,
+    packageFields: [
+      { id: 'oldAudio', label: '旧音频', type: 'audio' },
+      { id: 'oldImage', label: '旧图片', type: 'image' },
+      { id: 'unused', label: '未使用', type: 'audio' },
+    ],
+    packageValues: { oldAudio: 'voice.wav', oldImage: 'before.png', unused: 'unused.wav' },
+    packageMediaBackends: {
+      oldAudio: { name: 'voice.wav', backend },
+      oldImage: { name: 'before.png', backend },
+      unused: { name: 'unused.wav', backend },
+    } });
+  const updated = applyEditorInterfaceGraph({ nodes: [node], edges: [] }, node.id, {
+    package: { id: node.data.package_id, fields: [
+      { id: 'newAudio', label: '新音频', type: 'audio' },
+      { id: 'newImage', label: '新图片', type: 'image' },
+    ] },
+    values: { newAudio: 'voice.wav', newImage: 'after.png' }, baseline: {}, backend_url: backend,
+    output_nodes: [], outputs: [], rebindings: { oldAudio: 'newAudio', oldImage: 'newImage', unused: null },
+  });
+  assert.deepEqual(updated.nodes[0].data.packageMediaBackends, { newAudio: { name: 'voice.wav', backend } });
+  assert.equal(workflowBackendTarget(updated, [node.id], backend), backend);
 });

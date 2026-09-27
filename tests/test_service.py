@@ -353,7 +353,7 @@ class ServiceHTTPTests(unittest.TestCase):
 
     def test_upload_cannot_change_backend_midway(self):
         entered, release, switched = threading.Event(), threading.Event(), threading.Event()
-        errors = []
+        errors, results = [], []
         original = self.app.backend.upload
         def blocked_upload(*args):
             entered.set()
@@ -361,7 +361,7 @@ class ServiceHTTPTests(unittest.TestCase):
             return original(*args)
         def upload():
             try:
-                self.app.upload({"data": base64.b64encode(PNG).decode()})
+                results.append(self.app.upload({"data": base64.b64encode(PNG).decode()}))
             except Exception as exc:
                 errors.append(exc)
         def switch():
@@ -379,6 +379,7 @@ class ServiceHTTPTests(unittest.TestCase):
             switcher.join(2)
         self.assertFalse(errors)
         self.assertTrue(switched.is_set())
+        self.assertEqual(results[0]['backend'], self.backend.url)
         self.assertTrue(self.app.media)
         self.assertTrue(all(backend == self.backend.url for backend, _ in self.app.media.values()))
 

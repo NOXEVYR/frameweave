@@ -2,6 +2,8 @@ import { elapsedText, updateLiveProgress } from './job-progress.mjs';
 import { isJobActive, jobStatusLabel, jobStateDetail, canCancelJob, canRefreshJob, cancelActionLabel } from './job-state.mjs';
 import { STUDIO_MODES, newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from './studio-state.mjs';
 import { audioIntegrationRequest, audioMediaIssue, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields, initialAudioValues, restoreAudioMediaPreviews } from './audio-studio.mjs';
+import { renderAudioDiagnostics } from './audio-diagnostics.mjs';
+import { restoreStudioEditorMetadata, studioEditorRecovery } from './studio-editor-state.mjs';
 import { createMediaTransfers } from './media-transfers.mjs';
 import { resultReferenceOutputs, resultReferenceOutputKey, transferOwnedOutput } from './result-reference.mjs';
 
@@ -17,6 +19,7 @@ const safeURL = value => { try { const url = new URL(value, location.origin); re
 
 export function studioOutputSize(summary = {}) {
   const refined = summary.refine?.enabled === true, size = refined ? summary.refine : summary;
+  if (!size.width && !size.height && summary.package_id) return typeof summary.package_name === 'string' && summary.package_name ? summary.package_name : '工作流';
   return `${size.width || '—'} × ${size.height || '—'}${refined ? ' · 二次重绘' : ''}`;
 }
 
@@ -42,6 +45,7 @@ export function createGenerationStudio(host) {
   const resultTransfers = new Set(), recipeTransfers = new Set();
   let recipeBackups = {};
   let navigationEpoch = 0;
+  let audioEditEpoch = 0, audioEditing = false;
   let mediaBackendEpoch = 0;
   function mediaOwner(draft, mode) { return `${mode}:${draft.kind}`; }
   function mediaIssue(draft, mode) {
@@ -61,7 +65,7 @@ export function createGenerationStudio(host) {
     audioObservedBackend = current;
     return current;
   }
-  function newAudioDraft() { return { package_id: '', values: {}, valuesByPackage: {}, mediaBackends: {}, mediaBackendsByPackage: {}, mediaPreviewsByPackage: {} }; }
+  function newAudioDraft() { return { package_id: '', values: {}, valuesByPackage: {}, mediaBackends: {}, mediaBackendsByPackage: {}, mediaPreviewsByPackage: {}, editorBindings: {}, editorHistory: [] }; }
   function open(mode) {
     syncAudioBackendContext();
     if (mode !== 'canvas' && !STUDIO_MODES[mode] && mode !== 'audio') return;
@@ -267,6 +271,33 @@ export function createGenerationStudio(host) {
   }
   function audioKey() { return `audio_${audioCategory}`; }
   function currentAudioPackage(category = audioCategory) { return audioChoices.packages.find(pack => pack.id === audioDrafts[category]?.package_id) || null; }
+  async function editAudioWorkflow(category, packageId) {
+    if (audioEditing) throw new Error('请先关闭当前内部工作流');
+    if (!host.editWorkflow) throw new Error('当前客户端尚未加载工作台编辑接口，请重新启动更新后的客户端');
+    if (category !== audioCategory || audioDrafts[category].package_id !== packageId) throw new Error('工作流选择已变化，请重新进入');
+    if (audioLoading || audioChoices.stale || audioCapabilitiesBackend !== backend()) throw new Error('请先刷新当前引擎与包信息，再进入工作流');
+    const issue = audioMediaIssue(audioDrafts[category]); if (issue) throw new Error(issue);
+    audioEditing = true; refreshAudio();
+    let finished = false;
+    const finish = async () => {
+      if (finished) return; finished = true; audioEditing = false;
+      await refreshAudioCapabilities(true);
+    };
+    try {
+      await host.editWorkflow({
+        read() {
+          syncAudioBackendContext();
+          return { active, category: audioCategory, epoch: audioContextEpoch, editEpoch: audioEditEpoch, navigationEpoch,
+            backend: backend(), draft: audioDrafts[category], mediaIssue: audioMediaIssue(audioDrafts[category]) };
+        },
+        commit(next) {
+          const prior = audioDrafts[category]; audioDrafts[category] = next;
+          try { saveAudioDrafts(true); } catch (error) { audioDrafts[category] = prior; throw error; }
+        },
+        finished: finish,
+      });
+    } catch (error) { await finish(); throw error; }
+  }
   async function refreshAudioCapabilities(force = false) {
     const selectedBackend = syncAudioBackendContext();
     if (force) audioContextEpoch++;
@@ -329,6 +360,16 @@ export function createGenerationStudio(host) {
       const supported = chosen.eligible === true && chosen.available !== false && !audioChoices.stale && audioCapabilitiesBackend === backend();
       block.append(node('p', supported ? 'studio-help audio-package-ready' : 'studio-help disabled-capability', supported ? `当前后端已确认 ${chosen.audio_outputs?.length || chosen.capability?.audio_outputs?.length || 1} 个 AUDIO 输出。此页面选择用途为“${audioCategory === 'voice' ? '声音' : '音乐'}”，工作流包本身不做自动用途猜测。` : chosen.reason || '此包尚未通过当前后端实时 schema 检查；不会尝试提交。'));
       if (chosen.requirements?.nodes?.length) block.append(node('small', 'studio-help', `所需节点：${chosen.requirements.nodes.join('、')}`));
+      renderAudioDiagnostics(block, chosen);
+      const repair = action('复制当前工作流修复说明', 'button quiet audio-repair-copy', async () => {
+        if (audioChoices.stale || audioCapabilitiesBackend !== backend() || currentAudioPackage()?.id !== chosen.id) throw new Error('所选工作流或引擎已变化，请刷新后重新复制');
+        await host.copyText(audioIntegrationRequest(host.engine(), audioCapability, chosen.id), '已复制当前工作流的脱敏诊断；不含素材名称、路径或输入值');
+      });
+      repair.disabled = audioLoading || audioChoices.stale || audioCapabilitiesBackend !== backend(); block.append(repair);
+      const edit = action('进入工作流 · 调整节点与外部接口', 'button quiet audio-edit-workflow', () => editAudioWorkflow(category, chosen.id));
+      edit.disabled = audioEditing || audioLoading || audioChoices.stale; block.append(edit);
+      block.append(node('p', 'studio-help', '外部参数会同步到内部。“应用参数并返回”更新本页表单与输入接口；只保存内部草稿时，外部仍使用上次应用的配置。'));
+      if (studioEditorRecovery(draft, chosen.id)) block.append(node('p', 'field-error', '上次内部保存或外部绑定需要核对。进入工作流选择已保存来源；原参数和生成请求仍保留。'));
       const dynamic = node('div', 'audio-package-fields');
       const expectedUploadContext = { epoch: renderEpoch, category, draft, packageId: chosen.id, backend: backend() };
       renderAudioFields(dynamic, { pack: chosen, draft, api: host.api, storeMedia: host.storeLocalMedia, backend: backend(), currentBackend: backend, isCurrent: ({ field }) => {
@@ -338,7 +379,7 @@ export function createGenerationStudio(host) {
           epoch: audioContextEpoch, category: audioCategory, draft: currentDraft, packageId: currentDraft.package_id,
           backend: backend(), capabilitiesBackend: audioCapabilitiesBackend, stale: audioChoices.stale, fields: currentPack?.fields,
         }, field);
-      }, onChange: () => { draft.valuesByPackage[chosen.id] = structuredClone(draft.values); draft.mediaBackendsByPackage[chosen.id] = { ...draft.mediaBackends }; saveAudioDrafts(); refreshAudio(); }, reportError: host.reportError });
+      }, onChange: () => { audioEditEpoch++; draft.valuesByPackage[chosen.id] = structuredClone(draft.values); draft.mediaBackendsByPackage[chosen.id] = { ...draft.mediaBackends }; saveAudioDrafts(); refreshAudio(); }, reportError: host.reportError });
       block.append(dynamic);
     }
     if (!audioLoading && !listed.some(item => item.eligible === true && item.available !== false)) {
@@ -373,7 +414,9 @@ export function createGenerationStudio(host) {
     const hasForeignMedia = Object.entries(draft.mediaBackends || {}).some(([field, owner]) => draft.values?.[field] && owner && owner !== backend());
     const uploadIssue = audioMediaIssue(draft);
     const generate = panel.querySelector('.studio-generate'), status = panel.querySelector('.studio-operation'), query = panel.querySelector('.studio-query'), resume = panel.querySelector('.studio-resume');
-    generate.disabled = submitting || !!entry || !host.engine().online || !supported || hasForeignMedia || !!uploadIssue;
+    generate.disabled = audioEditing || submitting || !!entry || !host.engine().online || !supported || hasForeignMedia || !!uploadIssue;
+    const edit = panel.querySelector('.audio-edit-workflow');
+    if (edit) edit.disabled = audioEditing || audioLoading || audioChoices.stale || !!uploadIssue;
     generate.textContent = submitting ? '正在处理…' : entry ? '上次提交待确认' : '开始生成';
     const topRun = panel.querySelector('.studio-run-top'); topRun.disabled = generate.disabled; topRun.textContent = generate.textContent;
     status.textContent = entry ? `原请求 ${entry.request_id.slice(0, 8)} · 请先查询，避免重复生成` : uploadIssue || (hasForeignMedia ? '音频/图片输入属于另一个推理引擎，请重新上传' : supported ? '本地 AUDIO 工作流 · 任务可在后台继续执行' : audioLoadError || (host.engine().online ? pack ? (pack.reason || '所选工作流包尚未通过当前引擎检查') : hasEligiblePackage ? `请选择一个${audioCategory === 'voice' ? '声音' : '音乐'}工作流包` : '当前引擎尚未配置可用的声音 / 音乐生成工作流' : '引擎未连接：先连接本地 ComfyUI，再检查工作流能力'));
@@ -577,9 +620,9 @@ export function createGenerationStudio(host) {
       const live = node('div', 'studio-live-progress');
       live.dataset.jobId = chosen.id;
       live.append(node('p', 'live-detail'));
-      const bar = node('progress'); bar.max = 100; bar.setAttribute('aria-label', '当前节点采样进度');
+      const bar = node('progress'); bar.max = 100; bar.setAttribute('aria-label', '当前节点执行进度');
       live.append(bar);
-      const image = node('img', 'live-preview'); image.alt = '采样中间预览，尚未完成'; live.append(image);
+      const image = node('img', 'live-preview'); image.alt = '节点中间预览，尚未完成'; live.append(image);
       live.append(node('small', 'live-preview-status')); updateLive(live); area.append(live);
     } else if (!chosen?.outputs?.length) {
       const empty = node('div', 'studio-result-empty');
@@ -657,6 +700,7 @@ export function createGenerationStudio(host) {
           for (const category of ['voice', 'music']) {
             const source = saved.audioDrafts[category]; if (!source || typeof source !== 'object') continue;
             audioDrafts[category] = { ...newAudioDraft(), package_id: typeof source.package_id === 'string' ? source.package_id.slice(0, 200) : '', values: source.values && typeof source.values === 'object' && !Array.isArray(source.values) ? source.values : {}, valuesByPackage: source.valuesByPackage && typeof source.valuesByPackage === 'object' ? source.valuesByPackage : {}, mediaBackends: source.mediaBackends && typeof source.mediaBackends === 'object' ? source.mediaBackends : {}, mediaBackendsByPackage: source.mediaBackendsByPackage && typeof source.mediaBackendsByPackage === 'object' ? source.mediaBackendsByPackage : {}, mediaPreviewsByPackage: restoreAudioMediaPreviews(source.mediaPreviewsByPackage) };
+            Object.assign(audioDrafts[category], restoreStudioEditorMetadata(source));
           }
           audioCategory = saved.audioCategory === 'music' ? 'music' : 'voice';
         }
@@ -664,7 +708,7 @@ export function createGenerationStudio(host) {
       initialized = true; document.querySelectorAll('.workspace-nav[data-workspace]').forEach(button => button.addEventListener('click', () => open(button.dataset.workspace)));
       document.querySelector('#toggle-inspector')?.addEventListener('click', event => { const open = document.body.classList.toggle('inspector-open'); event.currentTarget.setAttribute('aria-pressed', String(open)); window.dispatchEvent(new Event('resize')); });
       open('canvas');
-    }, open, refresh, hasPending: () => busy.size > 0 || resultTransfers.size > 0 || recipeTransfers.size > 0 || Object.keys(pending).length > 0,
+    }, open, refresh, hasPending: () => audioEditing || busy.size > 0 || resultTransfers.size > 0 || recipeTransfers.size > 0 || Object.keys(pending).length > 0,
     diagnosticsRequest() {
       if (active === 'audio') { try { return buildRequest(audioKey()); } catch { return null; } }
       const mode = STUDIO_MODES[active] ? active : 'txt2img', draft = drafts[mode];

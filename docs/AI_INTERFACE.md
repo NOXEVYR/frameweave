@@ -51,6 +51,14 @@ AI 提交的任务与界面使用相同记录。打开 **生成队列 → 放入
 
 画布组合调度在客户端完成；当前 MCP 共 16 个工具，包含音频能力查询与音频上传，以 `tools/list` 为准。供本机程序调用的 `POST /api/jobs/{job_id}/image-input` 接收 `{ "output_index": 0 }`（仅图片输出的零起始索引），使用当前启动的 `X-FW-Token`。它只接受本客户端在同一后端完成并登记的图片，验证媒体后上传到后端输入目录；返回 `name` 可填入下游包的图片字段。此接口不提交生成，不接受任意文件路径或 URL，单张最大 20 MiB。
 
+## 工作流来源（Phase8C1 源码候选）
+
+`GET /api/packages/{package_id}/editor-sources` 查询已经应用的原生来源，返回 `sources`、`unreadable` 和 `ambiguous`。每个来源包括 `workflow_id`、已应用的 `revision`、`backend_url`、`document_sha256`、`prompt_sha256`、`source_kind` 和 `draft_newer`。名称只用于展示；多个来源时调用方须明确选择，不使用相似文件名猜测。查询核对包内容身份、已提交记录以及原图和执行图摘要，不提交任务。
+
+`POST /api/packages/{package_id}/fork-editor-source` 需要当前 `X-FW-Token`，请求体恰好为选中来源的 `workflow_id`、`revision`、`backend_url`、`document_sha256`、`prompt_sha256`。服务再次核对回执并创建独立编辑副本，返回 `workflow` 和 `source`。副本来自已应用修订；原记录中的新草稿保留。无有效来源或回执改变则拒绝，不退回最新草稿。此接口不切换后端、不运行工作流。
+
+`POST /api/editor-workflows` 可传 `source_kind: "native" | "api" | "unknown"`；默认 `native` 仅适用于实际原生图导入。从 API 转换的可编辑图必须标为 `api`，旧数据缺少该字段按 `unknown` 读取。来源类型说明保存的图是怎样取得的，不证明模型可运行、作者可信或还原了丢失的原始分组。当前新增的是来源基础协议，独立声音工作台的直接编辑入口尚未交付。
+
 ## 去重与故障
 
 0.6.0 新增原生 `kind=sdxl_i2i`（恰好一张参考图），支持 `loras:[{name,strength_model,strength_clip}]` 最多 4 层。SDXL 可分别设置 MODEL/CLIP 强度；H3/Krea 只支持 MODEL（CLIP 省略或 0）。旧 `lora/models.lora` 与 `lora_strength` 保留兼容；显式 `loras:[]` 关闭旧选择。

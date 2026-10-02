@@ -2,6 +2,7 @@ import { normalizePresetPrompt } from './preset-editor.mjs';
 import { redactLocalText, parseJSONWithSafeNumbers } from './packages.mjs';
 import { createEditorSessionProjection, importEditorBaseline } from './editor-session-projection.mjs';
 import { prepareOwnMediaSynchronization } from './editor-media-synchronization.mjs';
+import { editorTargetHost, editorLifecycle } from './editor-target-host.mjs';
 
 /** Original ComfyUI documents live locally; native controls run on an isolated origin. */
 export const EDITOR_LIMIT = 16 * 1024 * 1024;
@@ -82,12 +83,20 @@ export function createNativeWorkflowEditor(host) {
   let active = null, opening = false;
   const element = (tag, text = '') => { const item = document.createElement(tag); item.textContent = text; return item; };
   async function open(node, backendReady = false, preparation = false, presetPrompt = null, onPresetSaved = null) {
-    if (active || opening) throw new Error('请先返回外层画布');
+    if (active || opening) throw new Error('请先关闭当前内部工作流');
+    const targetHost = editorTargetHost(host, node), lifecycle = editorLifecycle(targetHost, node);
     opening = true;
-    try { await openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved); }
-    finally { if (!active) host.endSession?.(node); opening = false; }
+    try {
+      await openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved, targetHost, lifecycle);
+      if (!active) await lifecycle.finish('cancelled');
+    } catch (error) {
+      if (active?.lifecycle === lifecycle) await active.close('failed');
+      await lifecycle.finish('failed');
+      throw error;
+    } finally { opening = false; }
   }
-  async function openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved) {
+  async function openEditor(node, backendReady, preparation, presetPrompt, onPresetSaved, host, lifecycle) {
+    const targetLabel = host.targetLabel?.(node) || '画布';
     let workflow = await host.api(`/api/editor-workflows/${node.data.editor_id}`);
     const selectedBackend = backendReady || (host.ensureBackend ? await host.ensureBackend(node, workflow) : null);
     if (host.ensureBackend && !selectedBackend) return;
@@ -95,7 +104,11 @@ export function createNativeWorkflowEditor(host) {
     const id = node.data.editor_id;
     if (id !== workflow.id) workflow = await host.api(`/api/editor-workflows/${id}`);
     const preparationContext = await host.prepareSession?.(node, workflow);
-    const assertCurrent = () => preparationContext?.assertCurrent?.();
+    let state = null;
+    const assertCurrent = () => {
+      if (state?.closed) throw new Error('内部编辑会话已关闭，请重新进入核对');
+      return preparationContext?.assertCurrent?.();
+    };
     await assertCurrent();
     const session = await host.api(`/api/editor-workflows/${id}/session`, {});
     try { await assertCurrent(); } catch (error) {
@@ -112,18 +125,21 @@ export function createNativeWorkflowEditor(host) {
     const frame = element('iframe'); frame.title = `${workflow.name} · 内部工作流`;
     frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-downloads allow-modals');
     frame.referrerPolicy = 'no-referrer';
-    const state = { ready: false, busy: false, missing: [], pending: new Map(), session, frame, dialog,
+    let startup;
+    state = { ready: false, busy: false, missing: [], pending: new Map(), session, frame, dialog,
       presetBound: !presetPrompt, hiddenSyncBlocked: [], nestedSyncBlocked: [], additionReview: null,
       projection: null, persistenceUnknown: false, bindingFailed: false, mediaCapture: false, mediaNestedCapture: false,
-      mappingCapture: false, fitView: false, mediaSyncBlocked: [], mediaPending: [] };
+      mappingCapture: false, fitView: false, mediaSyncBlocked: [], mediaPending: [], lifecycle, close,
+      closed: false, draftSaved: false, persisting: false, initializationBlocked: Boolean(host.needsInitialization?.(node)) };
     // Own values synchronized on entry become the merge base for this session
     // only. Draft saves, cancellation and connected display overlays must never
     // advance the persisted canvas baseline.
     state.syncBaseline = [];
     active = state;
-    const releaseOnLeave = () => host.releaseSession(session.session_id);
+    const releaseOnLeave = () => { void close('cancelled', true); };
     window.addEventListener('pagehide', releaseOnLeave, { once: true });
     function request(action, extra = {}) {
+      if (state.closed) return Promise.reject(new Error('内部编辑会话已关闭，请重新进入核对'));
       if (action === 'captureMedia' && !state.mediaCapture) return Promise.reject(new Error('当前编辑会话未提供受控素材同步，请检查客户端版本与模块加载后重新进入'));
       if (action === 'captureMappings' && !state.mappingCapture) return Promise.reject(new Error('当前编辑会话未提供实例控件映射证明，请重新进入更新后的编辑器'));
       return new Promise((resolve, reject) => {
@@ -133,13 +149,14 @@ export function createNativeWorkflowEditor(host) {
         frame.contentWindow.postMessage({ source: 'prism-parent', nonce: session.bridgeNonce, requestId, action, ...extra }, session.origin);
       });
     }
-    function show(message) { status.textContent = message; }
+    function show(message) { if (!state.closed) status.textContent = message; }
     function refresh() {
+      if (state.closed) return;
       const presetUnbound = Boolean(presetPrompt) && !state.presetBound;
       const projectionState = state.projection?.getState();
       const storageBlocked = Boolean(state.persistenceUnknown || state.bindingFailed || projectionState && (!projectionState.initialized || projectionState.locked));
       draft.disabled = apply.disabled = !state.ready || state.busy || !!state.missing.length || presetUnbound || storageBlocked;
-      if (state.hiddenSyncBlocked.length || state.nestedSyncBlocked.length || state.mediaSyncBlocked.length) apply.disabled = true;
+      if (state.initializationBlocked || state.hiddenSyncBlocked.length || state.nestedSyncBlocked.length || state.mediaSyncBlocked.length) apply.disabled = true;
       original.disabled = state.busy || presetUnbound || storageBlocked;
       back.disabled = state.busy;
       reviewAdditions.disabled = state.busy || state.persistenceUnknown || state.bindingFailed || !state.additionReview || state.presetBound;
@@ -147,7 +164,7 @@ export function createNativeWorkflowEditor(host) {
       fitView.disabled = !state.ready || state.busy || !state.fitView;
     }
     async function action(callback) {
-      if (state.busy) return;
+      if (state.busy || state.closed) return;
       state.busy = true; refresh();
       try { await callback(); } catch (error) {
         if (error.persisted === 'unknown') state.persistenceUnknown = true;
@@ -158,21 +175,27 @@ export function createNativeWorkflowEditor(host) {
     }
     async function persistClean(store, snapshotOnly = false) {
       if (state.persistenceUnknown) throw new Error('上次保存结果尚未确认，请重新进入核对草稿版本。');
-      if (state.bindingFailed) throw new Error('内容已保存，但外层绑定未完成；请重新进入核对工作流与画布。');
+      if (state.bindingFailed) throw new Error(`内容已保存，但外层绑定未完成；请重新进入核对工作流与${targetLabel}。`);
       await assertCurrent();
+      const guardedStore = async result => {
+        await assertCurrent();
+        state.persisting = true;
+        try { return await store(result); }
+        finally { state.persisting = false; }
+      };
       if (!state.projection) {
         const result = await request(snapshotOnly ? 'snapshot' : 'compile');
         await assertCurrent();
         let value;
-        try { value = await store(result); }
+        try { value = await guardedStore(result); }
         catch (error) { if (![true, false, 'unknown'].includes(error.persisted)) error.persisted = 'unknown'; throw error; }
         return { persisted: value !== null && value !== false && value?.persisted !== false, value };
       }
-      let result = await state.projection.prepare(store);
+      let result = await state.projection.prepare(guardedStore);
       if (result.status === 'resolution_required') {
         const choices = await (host.resolveConnectedConflicts || resolveConnectedEditorValues)(result.conflicts);
         if (!choices) return { persisted: false, status: 'cancelled' };
-        result = await state.projection.prepare(store, { resolutions: choices, expectedConflicts: result.conflicts });
+        result = await state.projection.prepare(guardedStore, { resolutions: choices, expectedConflicts: result.conflicts });
         if (result.status === 'resolution_required') throw new Error('内部输入在选择期间发生变化，请重新确认保存方式。');
       }
       return result;
@@ -181,28 +204,48 @@ export function createNativeWorkflowEditor(host) {
       if (presetPrompt && !state.presetBound) throw new Error('预设尚未绑定到外层工作流，不能保存内部草稿。');
       const outcome = await persistClean(async result => {
         const saved = await host.api(`/api/editor-workflows/${id}/draft`, { document: result.workflow, base_revision: workflow.revision });
-        workflow.revision = saved.revision; return saved;
+        workflow.revision = saved.revision; state.draftSaved = true; return saved;
       }, true);
       if (!outcome.persisted) { show('已取消保存；内部修改仍保留在当前编辑器。'); return false; }
       show('内部草稿已保存；外层继续使用上一次明确应用的参数。');
       return true;
     }
-    async function close() {
+    async function close(reason = 'cancelled', leavingPage = false) {
+      if (state.closed) return;
+      state.closed = true;
+      if (state.persisting) state.persistenceUnknown = true;
       clearTimeout(startup);
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', releaseOnLeave);
       for (const item of state.pending.values()) { clearTimeout(item.timeout); item.reject(new Error('编辑器已关闭')); }
-      state.pending.clear(); dialog.close(); dialog.remove(); active = null;
-      host.endSession?.(node);
-      await host.api('/api/editor-sessions/close', { session_id: session.session_id });
+      state.pending.clear(); dialog.close(); dialog.remove();
+      let sessionCleanup = 'confirmed';
+      try {
+        if (leavingPage) { host.releaseSession(session.session_id); sessionCleanup = 'requested'; }
+        else await host.api('/api/editor-sessions/close', { session_id: session.session_id });
+      } catch {
+        sessionCleanup = 'unconfirmed';
+        host.toast?.('编辑界面已关闭，后端会话清理尚未确认；已保存内容仍保留。', true);
+      }
+      try {
+        await lifecycle.finish(state.persistenceUnknown || state.bindingFailed ? 'failed' : reason,
+          { workflow: { id, revision: workflow.revision }, draftSaved: state.draftSaved,
+            persistenceUnknown: state.persistenceUnknown, bindingFailed: state.bindingFailed, sessionCleanup });
+      } finally {
+        // Keep ownership until old cleanup completes. Otherwise its endSession
+        // callback could remove the next session's guard for the same target.
+        if (active === state) active = null;
+      }
     }
-    const back = element('button', '← 返回画布'); back.className = 'button quiet';
+    const back = element('button', `← 返回${targetLabel}`); back.className = 'button quiet';
     back.onclick = () => action(async () => {
-      if (state.ready && !state.missing.length && (!presetPrompt || state.presetBound) && !await saveDraft()) return;
-      await close();
+      const saving = state.ready && !state.missing.length && (!presetPrompt || state.presetBound);
+      if (saving && !await saveDraft()) return;
+      await close(saving ? 'draft' : 'cancelled');
     });
     const draft = element('button', '保存内部草稿'); draft.className = 'button quiet'; draft.onclick = () => action(saveDraft);
     async function applyParameters() {
+      if (state.initializationBlocked) throw new Error('首次控件映射尚未确认，请修复来源后重新进入；外层参数仍保留。');
       if (presetPrompt && !state.presetBound) throw new Error('预设尚未绑定到外层工作流，不能应用参数。');
       if (state.hiddenSyncBlocked.length) throw new Error('隐藏参数尚未安全同步，不能应用；请返回外层重新暴露该字段或修复控件映射。');
       if (state.nestedSyncBlocked.length) throw new Error('子图外层修改尚未安全同步，不能应用；请修复实例控件映射后重新进入。外层值仍保留。');
@@ -212,16 +255,19 @@ export function createNativeWorkflowEditor(host) {
           { automatic: preparation, ...(state.syncBaseline.length ? { syncBaseline: structuredClone(state.syncBaseline) } : {}) });
         if (!applied) return null;
         if (Number.isSafeInteger(applied.workflow?.revision)) workflow.revision = applied.workflow.revision;
+        // The application callback may have legitimately advanced its own
+        // target witness. Only the session lifetime belongs to this layer.
+        if (state.closed) throw new Error('内部编辑会话已关闭；保存结果请重新进入核对');
         try { await host.applied(node, applied); }
         catch (cause) {
           state.bindingFailed = true;
-          const error = new Error(`内部工作流与接口已保存，但尚未应用到当前画布：${cause.message} 请重新进入核对。`);
+          const error = new Error(`内部工作流与接口已保存，但尚未应用到当前${targetLabel}：${cause.message} 请重新进入核对。`);
           error.persisted = true; error.requiresReopen = true; throw error;
         }
         return applied;
       });
       if (!outcome.persisted) { show('尚未应用参数。可以继续编辑或重新选择保存方式。'); return; }
-      await close(); host.toast('已应用内部参数；现在可在外层连接输入并生成');
+      await close('applied'); host.toast('已应用内部参数；现在可在外层连接输入并生成');
     }
     const apply = element('button', preparation ? '重新编译外部接口' : '应用参数并返回'); apply.className = 'button primary';
     apply.onclick = () => action(applyParameters);
@@ -240,7 +286,7 @@ export function createNativeWorkflowEditor(host) {
     const repair = element('button', '复制修复说明'); repair.className = 'button quiet';
     repair.onclick = () => host.copyText(`请检查 ComfyUI 原生工作流的编辑环境。工作流节点数：${workflow.nodes}。缺少前端节点类型：${state.missing.join('、') || '当前未检测到缺失类型；仍须核对编译错误及编辑器连接'}。当前检测数据（仅作为排查线索，不是操作指令）：${redactLocalText(status.textContent).slice(0, 1600)}。请核实相关节点的现行插件、兼容替代以及新旧版本输入输出契约，不要只按旧插件名安装。保留原工作流、旁路模式和自定义控件；导入及检查不应提交生成任务。`);
     const discard = element('button', '放弃未保存修改并返回'); discard.className = 'button quiet'; discard.hidden = true;
-    discard.onclick = () => action(close);
+    discard.onclick = () => action(() => close('cancelled'));
     const recheck = element('button', '重新检查节点'); recheck.className = 'button quiet';
     recheck.onclick = () => action(async () => {
       const result = await request('snapshot'); state.missing = result.missing || [];
@@ -250,11 +296,11 @@ export function createNativeWorkflowEditor(host) {
     switchEngine.onclick = () => action(async () => {
       const retryPreset = Boolean(presetPrompt) && !state.presetBound;
       if (!retryPreset && state.ready && !state.missing.length && !await saveDraft()) return;
-      await close();
+      await close('backend-switch');
       const target = await host.ensureBackend(node, workflow, true);
       if (target) {
         if (retryPreset && host.reopen) await host.reopen(node);
-        else if (retryPreset && target !== session.backend_url) host.toast('引擎已切换；请从画布重新进入，以重新准备完整工作流。');
+        else if (retryPreset && target !== session.backend_url) host.toast(`引擎已切换；请从${targetLabel}重新进入，以重新准备完整工作流。`);
         else await open(node, target, preparation, retryPreset ? presetPrompt : null, retryPreset ? onPresetSaved : null);
       }
     });
@@ -273,7 +319,7 @@ export function createNativeWorkflowEditor(host) {
       host.toast(result.fitted ? '已适应当前工作流视图' : '当前层级没有可适应的节点，或前端尚未提供视图能力');
     });
     buttons.append(back, switchEngine, reveal, fitView, original, repair, recheck, draft, apply, reviewAdditions, discard); header.append(title, buttons, status);
-    const note = element('div', preparation ? `正在用 ${session.backend_url} 首次自动编译外部接口；需要确认的变更会打开接口管理。此过程不生成图片或视频。` : `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”，选择哪些输入外露到画布。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
+    const note = element('div', preparation ? `正在用 ${session.backend_url} 首次自动编译外部接口；需要确认的变更会打开接口管理。此过程不提交生成。` : `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”，选择哪些输入外露到${targetLabel}。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
     const sources = element('details'); sources.className = 'native-editor-sources'; sources.hidden = true;
     const sourceReasons = { upstream_not_run: '上游尚未生成；进入编辑不会自动运行它', source_missing: '直接输入节点已不存在',
       source_unavailable: '没有可核对的完整执行源；保留内部原图，请在接口管理检查映射',
@@ -345,14 +391,16 @@ export function createNativeWorkflowEditor(host) {
               if (typeof onPresetSaved !== 'function') throw new Error('预设已转换，但尚未绑定到外层工作流；请关闭后从外层画布重新进入。');
               let saved;
               try {
+                state.persisting = true;
                 saved = await host.api(`/api/editor-workflows/${id}/draft`, {
                   document: converted.workflow, base_revision: workflow.revision,
                 });
               } catch (error) {
                 if (![true, false, 'unknown'].includes(error.persisted)) error.persisted = 'unknown';
                 throw error;
-              }
-              workflow.revision = saved.revision;
+              } finally { state.persisting = false; }
+              workflow.revision = saved.revision; state.draftSaved = true;
+              await assertCurrent();
               try { await onPresetSaved(converted); }
               catch (cause) {
                 const error = new Error(`内部草稿已保存，外层绑定未完成：${cause.message} 请重新进入核对。`);
@@ -363,6 +411,12 @@ export function createNativeWorkflowEditor(host) {
               workflow.nodes = converted.nodes;
               state.missing = converted.missing || [];
               presetSummary = converted.accepted_added_inputs?.length ? `已按确认补充 ${converted.accepted_added_inputs.length} 项参数，转换为 ${converted.nodes} 个原生节点；原有内容已核对` : `预设已转换为 ${converted.nodes} 个原生节点，回编译与原 API 工作流一致`;
+            }
+            if (host.needsInitialization?.(node)) {
+              const compiled = await request('compile'); await assertCurrent();
+              if (typeof host.initializeTarget !== 'function') throw new Error('工作台尚未提供首次控件映射');
+              await host.initializeTarget(node, compiled, { workflow: { id, revision: workflow.revision } });
+              await assertCurrent(); state.initializationBlocked = false;
             }
             let patches = [], definitions = [];
             state.syncBaseline = [];
@@ -532,7 +586,7 @@ export function createNativeWorkflowEditor(host) {
         state.busy = false; refresh();
     }
     async function receive(event) {
-      if (active !== state || event.source !== frame.contentWindow || event.origin !== session.origin || event.data?.source !== 'prism-editor' || event.data.nonce !== session.bridgeNonce) return;
+      if (active !== state || state.closed || event.source !== frame.contentWindow || event.origin !== session.origin || event.data?.source !== 'prism-editor' || event.data.nonce !== session.bridgeNonce) return;
       const message = event.data;
       if (message.action === 'notice') { note.textContent = `内部编辑器 · ${session.backend_url} · ${String(message.result?.message || message.message || '更换整个工作流请返回外层导入。')}`; return; }
       if (message.action === 'ready' && !state.loading) {
@@ -548,7 +602,7 @@ export function createNativeWorkflowEditor(host) {
       if (message.error) { const error = new Error(message.error); error.result = message.result; pending.reject(error); } else pending.resolve(message.result);
     }
     window.addEventListener('message', receive);
-    const startup = setTimeout(() => show('原生编辑器加载超时。请检查所选 ComfyUI 服务是否启动、前端与扩展是否兼容；原始工作流已保留，可返回后更换后端再进入。'), 60000);
+    startup = setTimeout(() => show('原生编辑器加载超时。请检查所选 ComfyUI 服务是否启动、前端与扩展是否兼容；原始工作流已保留，可返回后更换后端再进入。'), 60000);
     refresh(); dialog.showModal(); frame.src = session.url;
   }
   async function openApiPrompt(node, prompt, onPresetSaved = null) {

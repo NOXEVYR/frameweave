@@ -1,0 +1,52 @@
+{
+  "application": "PrismCanvas",
+  "version": "0.11.5",
+  "candidate": "Phase8C3",
+  "stable_release": false,
+  "source_archive_sha256": "8ba038877f05d327073a8f041273a554c0e27ca6f9660738b045a5ba23d067bc",
+  "exe_sha256": "134f6ab18e19ebaf90e024e446391e086c843e98d32f419fb1a05a160b8a00cd",
+  "packages": [
+    {
+      "filename": "PrismCanvas-Phase8C3-Source.zip",
+      "bytes": 1594589,
+      "sha256": "8ba038877f05d327073a8f041273a554c0e27ca6f9660738b045a5ba23d067bc"
+    },
+    {
+      "filename": "PrismCanvas-0.11.5-Phase8C3-Windows-x64-candidate.zip",
+      "bytes": 11136587,
+      "sha256": "ef8059bd6177c40786a324fb14ba07c0757828dd74db29836b20a858ed5704ed"
+    }
+  ],
+  "validation": {
+    "node_tests_passed": 1671,
+    "python_tests": {
+      "status": "not_rerun_for_C3",
+      "basis": "40 Python runtime modules unchanged from Phase8C1; C1 suite results are not counted as C3"
+    },
+    "exe_preview_assertions": 33,
+    "exe_cpu_assertions": 10,
+    "exe_jobs": 1,
+    "queue_empty": true,
+    "silent_audio": {
+      "sample_rate": 24000,
+      "channels": 1,
+      "bits": 16,
+      "samples": 78000
+    },
+    "neural_tts_or_music_generation": false,
+    "human_audio_acceptance": false,
+    "phase8c1_gpu_validation_reused_as_C3": false,
+    "existing_data_copy_two_starts": true,
+    "old_data_unchanged": true
+  },
+  "unpacked_exe_two_starts": true,
+  "stable_update_feed_changed": false,
+  "contains_model_weights": false,
+  "contains_user_data": false,
+  "source_archive_is_pre_build_checkpoint": true,
+  "postseal_source_differences": {
+    "docs/DEVELOPMENT_LOG.md": "post-build delivery record",
+    "docs/VALIDATION.md": "post-build delivery record",
+    "tests/studio-editor-state.test.mjs": "remove final blank line only; runtime unchanged"
+  }
+}

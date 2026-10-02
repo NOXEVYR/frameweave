@@ -333,24 +333,45 @@ class App:
             if not configure:
                 # Reject malformed editor state before creating a reusable package.
                 validate_editor_document(data.get('document'))
-            result = self.apply_interface(prompt, data, current['name'], persist=configure)
+            result = self.apply_interface(prompt, data, current['name'], persist=False)
             if result.get('requires_resolution'):
                 return result
             compiled_prompt = result.pop('_compiled_prompt')
-            if configure:
-                revision = current
-            else:
-                package_document = result.pop('_package_document')
-                # Keep readers blocked until both stores commit. No package is
-                # published if revision storage fails, and existing packages are
-                # never removed or rewritten during rollback.
-                with self.packages.lock, self.editor_workflows.lock:
-                    with self._stage_interface_package(package_document) as (package, publish):
-                        result['package'] = package
+            package_document = result.pop('_package_document')
+            # Sources join the same metadata rollback as editor revisions. No
+            # provenance is inferred from names or an uncommitted revision file.
+            with self.packages.lock, self.editor_workflows.lock:
+                with self._stage_interface_package(package_document) as (package, publish):
+                    result['package'] = package
+                    if configure:
+                        revision = current
+                        report = self.editor_workflows.package_sources(data['package_id'], compiled_prompt,
+                                                                       workflow_id=workflow_id)
+                        matches = [item for item in report['sources'] if item['backend_url'] == self.backend.url]
+                        current_matches = [item for item in matches if item['revision'] == current['revision']]
+                        source = current_matches[0] if len(current_matches) == 1 else matches[0] if len(matches) == 1 else None
+                        if source:
+                            with self.editor_workflows.package_source_transaction(
+                                    workflow_id, package['id'], source['revision'], self.backend.url):
+                                publish()
+                        else:
+                            publish()
+                    else:
                         with self.editor_workflows.revision_transaction(
-                                workflow_id, data.get('document'), compiled_prompt) as revision:
+                                workflow_id, data.get('document'), compiled_prompt,
+                                package_id=package['id'], backend_url=self.backend.url) as revision:
                             publish()
         return {'workflow': revision, **result}
+
+    def package_editor_sources(self, package_id):
+        with self.lock, self.packages.lock, self.editor_workflows.lock:
+            self.packages.get(package_id)
+            return self.editor_workflows.package_sources(package_id)
+
+    def fork_package_editor_source(self, package_id, selection):
+        with self.lock, self.packages.lock, self.editor_workflows.lock:
+            self.packages.get(package_id)
+            return self.editor_workflows.fork_package_source(package_id, selection)
 
     @contextmanager
     def _stage_interface_package(self, document):
@@ -1845,6 +1866,8 @@ def make_server(app, port=0):
                         self.respond({"packages": app.packages.list()})
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}", path):
                     self.respond({"package": app.packages.get(path.rsplit("/", 1)[-1])})
+                elif re.fullmatch(r'/api/packages/p-[0-9a-f]{24}/editor-sources', path):
+                    self.respond(app.package_editor_sources(path.split('/')[3]))
                 elif path.startswith("/api/assets/images/"):
                     match = re.fullmatch(r"/api/assets/images/([0-9a-f]{64})", path)
                     if not match:
@@ -2148,7 +2171,8 @@ def make_server(app, port=0):
                     document = data.get('document')
                     if document is None and isinstance(data.get('source_json'), str):
                         document = json.loads(data['source_json'].lstrip('\ufeff'))
-                    result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'))
+                    result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'),
+                                                         origin=data.get('source_kind', 'native'))
                 elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure|backends)', path):
                     workflow_id, action = path.split('/')[3:5]
                     if action == 'backends':
@@ -2201,6 +2225,8 @@ def make_server(app, port=0):
                     result = app.prepare_h3_reference(data)
                 elif path == "/api/packages":
                     result = {"package": app.packages.save(transport_document(data, allow_bare=True))}
+                elif re.fullmatch(r'/api/packages/p-[0-9a-f]{24}/fork-editor-source', path):
+                    result = app.fork_package_editor_source(path.split('/')[3], data)
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/export", path):
                     result = app.packages.export_transport(path.split("/")[3])
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/apply", path):

@@ -72,7 +72,7 @@ class ProgressStream:
         record['execution_node'] = node
 
     def _sample(self, record, value, maximum):
-        record.update(stage='采样中', progress=value / maximum * 100,
+        record.update(stage='节点执行中', progress=value / maximum * 100,
                       progress_scope='node', step=value, steps=maximum)
 
     def event(self, message):

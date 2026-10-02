@@ -323,7 +323,7 @@ export function createWorkflowCanvas(host) {
     for (const id of new Set(canvas.nodes.map(n => n.data.editor_id).filter(Boolean))) {
       const result = await host.api(`/api/editor-workflows/${id}`);
       assertCurrent();
-      editors.push({ id, name: result.name, source_json: result.source_json });
+      editors.push({ id, name: result.name, source_json: result.source_json, source_kind: result.source_kind || 'unknown' });
     }
     const document = { schema: BUNDLE, version: 1, name: title, canvas, packages, ...(editors.length ? { editors } : {}) };
     validateCanvasStructure(document);
@@ -361,6 +361,7 @@ export function createWorkflowCanvas(host) {
     for (const entry of document.editors || []) {
       if (!entry || !editorIds.has(entry.id) || editorDefinitions.has(entry.id) || typeof entry.source_json !== 'string' || !Array.isArray(parseJSONWithSafeNumbers(entry.source_json.replace(/^\uFEFF/, '')).nodes)) throw new Error('集合中的原生工作流缺失或重复');
       if (typeof entry.name !== 'string' || !entry.name.trim() || entry.name.length > 120) throw new Error('原生工作流名称无效');
+      if (entry.source_kind !== undefined && !['native', 'api', 'unknown'].includes(entry.source_kind)) throw new Error('工作流来源类型无效');
       await host.api('/api/editor-workflows/inspect', { source_json: entry.source_json });
       assertCurrent();
       editorDefinitions.set(entry.id, entry);
@@ -390,7 +391,7 @@ export function createWorkflowCanvas(host) {
       remap.set(id, result.package);
     }
     const editorRemap = new Map();
-    for (const [id, entry] of editorDefinitions) { const result = await host.api('/api/editor-workflows', { name: entry.name, source_json: entry.source_json }); assertCurrent(); editorRemap.set(id, result.id); }
+    for (const [id, entry] of editorDefinitions) { const result = await host.api('/api/editor-workflows', { name: entry.name, source_json: entry.source_json, source_kind: entry.source_kind || 'unknown' }); assertCurrent(); editorRemap.set(id, result.id); }
     for (const node of incoming.nodes) {
       if (node.data.editor_id) node.data.editor_id = editorRemap.get(node.data.editor_id);
     }

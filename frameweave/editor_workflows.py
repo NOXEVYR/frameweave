@@ -7,6 +7,7 @@ ComfyUI editor remains responsible for compiling its graph to an API prompt.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -17,13 +18,15 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .packages import normalize_prompt
+from .packages import encoded, normalize_prompt
+from .editor_sources import source_kind, source_receipt, source_receipts, source_reference, validate_package_id
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_NODES = 10_000
 MAX_LINKS = 50_000
 MAX_DEPTH = 80
 MAX_ITEMS = 500_000
+MAX_META_BYTES = 256 * 1024
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 ID_PATTERN = re.compile(r"e-[0-9a-f]{24}\Z")
 REVISION_PATTERN = re.compile(r"revision-([0-9]{8})\.json\Z")
@@ -257,6 +260,7 @@ class EditorWorkflowStore:
         return {
             "id": meta["id"],
             "name": meta["name"],
+            "source_kind": meta.get("source_kind", "unknown"),
             "revision": revision,
             "nodes": len(nodes),
             "links": len(links),
@@ -273,11 +277,11 @@ class EditorWorkflowStore:
     def _read_meta(self, record_dir, workflow_id):
         path = self._safe_file(record_dir, "meta.json")
         try:
-            if path.stat().st_size > 64 * 1024:
+            if path.stat().st_size > MAX_META_BYTES:
                 raise ValueError("记录元数据超过大小上限")
             with path.open("rb") as stream:
-                raw = stream.read(64 * 1024 + 1)
-            if len(raw) > 64 * 1024:
+                raw = stream.read(MAX_META_BYTES + 1)
+            if len(raw) > MAX_META_BYTES:
                 raise ValueError("记录元数据超过大小上限")
             meta = json.loads(raw,
                                   object_pairs_hook=_pairs_no_duplicates,
@@ -306,6 +310,10 @@ class EditorWorkflowStore:
                     or not math.isfinite(meta["compiled_updated_at"])
                     or meta["compiled_updated_at"] <= 0):
                 raise ValueError("compiled 时间元数据无效")
+            source_kind(meta.get('source_kind', 'unknown'))
+            receipts = source_receipts(meta.get('package_sources', []))
+            if any(item['revision'] > meta['current_revision'] for item in receipts):
+                raise ValueError('工作流来源修订超过当前已提交修订')
             return meta
         except (OSError, json.JSONDecodeError, TypeError, ValueError,
                 OverflowError, UnicodeError, RecursionError) as exc:
@@ -414,8 +422,9 @@ class EditorWorkflowStore:
                 "compiled_revision": compiled_revision,
                 "compiled_updated_at": compiled_updated_at}
 
-    def create(self, name, document, source_json=None):
+    def create(self, name, document, source_json=None, *, origin='native'):
         name = _name(name)
+        origin = source_kind(origin)
         if source_json is None:
             _validate_document(document)
             raw = _encode_document(document)
@@ -445,6 +454,7 @@ class EditorWorkflowStore:
                     temporary_dir / "revisions" / "revision-00000001.json", raw)
                 now = time.time()
                 meta = self._make_meta(workflow_id, name, 1, now)
+                meta['source_kind'] = origin
                 self._write_atomic(temporary_dir / "meta.json", _json_bytes(meta))
                 os.replace(temporary_dir, target)
             except BaseException:
@@ -495,7 +505,7 @@ class EditorWorkflowStore:
                         record = self._get(path.name)
                         workflows.append({key: record[key] for key in
                                           ("id", "name", "revision", "nodes", "links",
-                                           "updated_at", "summary")})
+                                           "updated_at", "summary", "source_kind")})
                     except (OSError, ValueError) as exc:
                         unreadable.append({"id": path.name, "reason": str(exc)})
             workflows.sort(key=lambda item: item["updated_at"], reverse=True)
@@ -558,17 +568,36 @@ class EditorWorkflowStore:
                 workflow_id, meta["name"], revision, now,
                 compiled_revision=compiled_revision,
                 compiled_updated_at=compiled_updated_at)
+            new_meta['created_at'] = meta['created_at']
+            new_meta['source_kind'] = meta.get('source_kind', 'unknown')
+            if 'package_sources' in meta:
+                new_meta['package_sources'] = meta['package_sources']
             self._write_atomic(record_dir / "meta.json", _json_bytes(new_meta))
             return self._summary(new_meta, document)
 
     @contextmanager
-    def revision_transaction(self, workflow_id, document, prompt=None):
+    def revision_transaction(self, workflow_id, document, prompt=None, *, package_id=None, backend_url=None):
         """Restore exact visible metadata if a coordinated package publish fails.
 
         Revision/compiled files remain immutable, including unreferenced failed
         attempts. This is an exception transaction for one locked service, not a
         crash-atomic transaction across both stores.
         """
+        with self._meta_transaction(workflow_id):
+            revision = self.save_revision(workflow_id, document, prompt)
+            if package_id is not None:
+                self._record_package_source(workflow_id, package_id, revision['revision'], backend_url)
+            yield revision
+
+    @contextmanager
+    def package_source_transaction(self, workflow_id, package_id, revision, backend_url):
+        """Associate a reconfigured package with a proven existing revision."""
+        with self._meta_transaction(workflow_id):
+            self._record_package_source(workflow_id, package_id, revision, backend_url)
+            yield
+
+    @contextmanager
+    def _meta_transaction(self, workflow_id):
         with self.lock:
             record_dir = self._record_dir(workflow_id)
             self._read_meta(record_dir, workflow_id)
@@ -584,8 +613,7 @@ class EditorWorkflowStore:
                     stream.flush()
                     os.fsync(stream.fileno())
                 try:
-                    revision = self.save_revision(workflow_id, document, prompt)
-                    yield revision
+                    yield
                 except BaseException as apply_error:
                     try:
                         if meta_path.read_bytes() != original:
@@ -602,6 +630,93 @@ class EditorWorkflowStore:
                         backup.unlink(missing_ok=True)
                     except OSError:
                         pass
+
+    def _record_package_source(self, workflow_id, package_id, revision, backend_url):
+        source_reference(package_id, revision, backend_url)
+        record_dir = self._record_dir(workflow_id)
+        meta = self._read_meta(record_dir, workflow_id)
+        if revision > meta['current_revision']:
+            raise ValueError('不能关联尚未提交的工作流修订')
+        _, raw_source = self._read_revision(record_dir, revision)
+        compiled = self._read_compiled(record_dir, revision)
+        receipt = source_receipt(package_id, revision, backend_url,
+            hashlib.sha256(raw_source.encode('utf-8')).hexdigest(),
+            hashlib.sha256(encoded(compiled['prompt'])).hexdigest())
+        history = meta.get('package_sources', [])
+        if receipt in history:
+            return
+        meta['package_sources'] = source_receipts([*history, receipt])
+        raw = _json_bytes(meta)
+        if len(raw) > MAX_META_BYTES:
+            raise ValueError('工作流来源历史已满；请另存工作流后继续，原记录已保留')
+        self._write_atomic(record_dir / 'meta.json', raw)
+
+    def package_sources(self, package_id, prompt=None, *, workflow_id=None):
+        """Find committed receipts for a package already verified by PackageStore.
+
+        Names are display-only. Failed/unreferenced immutable revisions are never
+        discovered by scanning revision files. This method never rewrites data.
+        Optional prompt limits reconfiguration to an exact compiled baseline;
+        exported package prompts may deliberately clear private media defaults.
+        """
+        validate_package_id(package_id)
+        expected = encoded(normalize_prompt(prompt, check_dependencies=False)) if prompt is not None else None
+        with self.lock:
+            self._ensure_root()
+            paths = ([self._record_dir(workflow_id)] if workflow_id else
+                     sorted(self.directory.iterdir(), key=lambda path: path.name) if self.directory.is_dir() else [])
+            candidates, unreadable = [], []
+            for path in paths:
+                if not ID_PATTERN.fullmatch(path.name):
+                    continue
+                try:
+                    record_dir = self._record_dir(path.name)
+                    meta = self._read_meta(record_dir, path.name)
+                    matches = [item for item in meta.get('package_sources', []) if item['package_id'] == package_id]
+                except (OSError, ValueError):
+                    unreadable.append({'workflow_id': path.name, 'reason': 'source_record_unavailable'})
+                    continue
+                for receipt in matches:
+                    try:
+                        _, raw_source = self._read_revision(record_dir, receipt['revision'])
+                        compiled = self._read_compiled(record_dir, receipt['revision'])
+                        document_hash = hashlib.sha256(raw_source.encode('utf-8')).hexdigest()
+                        compiled_bytes = encoded(compiled['prompt'])
+                        prompt_hash = hashlib.sha256(compiled_bytes).hexdigest()
+                        if (document_hash != receipt['document_sha256'] or prompt_hash != receipt['prompt_sha256']
+                                or expected is not None and compiled_bytes != expected):
+                            raise ValueError('执行图与包内容不一致')
+                        candidates.append({**receipt, 'workflow_id': path.name, 'name': meta['name'],
+                            'source_kind': meta.get('source_kind', 'unknown'),
+                            'current_revision': meta['current_revision'],
+                            'draft_newer': meta['current_revision'] != receipt['revision']})
+                    except (OSError, ValueError):
+                        unreadable.append({'workflow_id': path.name, 'revision': receipt['revision'],
+                                           'reason': 'source_revision_unavailable'})
+            candidates.sort(key=lambda item: (item['workflow_id'], -item['revision'], item['backend_url']))
+            return {'package_id': package_id, 'sources': candidates, 'unreadable': unreadable,
+                    'ambiguous': len(candidates) > 1}
+
+    def fork_package_source(self, package_id, selection):
+        expected_keys = {'workflow_id', 'revision', 'backend_url', 'document_sha256', 'prompt_sha256'}
+        if not isinstance(selection, dict) or set(selection) != expected_keys:
+            raise ValueError('请选择完整的工作流来源回执后再创建编辑副本')
+        if any(not isinstance(selection[key], str) or not re.fullmatch(r'[0-9a-f]{64}', selection[key])
+               for key in ('document_sha256', 'prompt_sha256')):
+            raise ValueError('工作流来源摘要无效')
+        source_reference(package_id, selection['revision'], selection['backend_url'])
+        with self.lock:
+            report = self.package_sources(package_id, workflow_id=selection['workflow_id'])
+            matches = [item for item in report['sources'] if all(item[key] == selection[key] for key in expected_keys)]
+            if len(matches) != 1:
+                raise ValueError('工作流来源已变化或无法核实；未创建编辑副本，请刷新来源')
+            matched = matches[0]
+            record_dir = self._record_dir(matched['workflow_id'])
+            document, source = self._read_revision(record_dir, matched['revision'])
+            if hashlib.sha256(source.encode('utf-8')).hexdigest() != matched['document_sha256']:
+                raise ValueError('工作流来源读取期间发生变化，未创建副本')
+            forked = self.create(matched['name'], document, source, origin=matched['source_kind'])
+            return {'workflow': forked, 'source': matched}
 
     def get_compiled(self, workflow_id):
         with self.lock:

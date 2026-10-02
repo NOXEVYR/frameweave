@@ -12,14 +12,14 @@ export function editorOutputEdges(graph, nodeId) {
 
 export const editorOutputKey = edge => edge.sourceOutput || `legacy-${edge.id}`;
 
-function remappedMediaOwners(node, fields, values, backend, rebindings, invalidated = []) {
-  const oldFields = new Map((node.data.packageFields || []).map(field => [field.id, field]));
+function remappedMediaOwners(data, fields, values, backend, rebindings, invalidated = []) {
+  const oldFields = new Map((data.packageFields || []).map(field => [field.id, field]));
   const nextFields = new Map(fields.map(field => [field.id, field]));
-  const oldValues = node.data.packageValues || {};
-  const oldOwners = node.data.packageMediaBackends || {};
+  const oldValues = data.packageValues || {};
+  const oldOwners = data.packageMediaBackends || {};
   const owners = {};
   const mediaTypes = new Set(['image', 'audio', 'video']);
-  const engineChanged = Boolean(node.data.editor_backend && backend && node.data.editor_backend !== backend);
+  const engineChanged = Boolean(data.editor_backend && backend && data.editor_backend !== backend);
   if (!Array.isArray(invalidated) || invalidated.some(id => typeof id !== 'string')) throw new Error('媒体归属失效记录无效');
   const invalidatedIds = new Set(invalidated);
 
@@ -44,7 +44,7 @@ function remappedMediaOwners(node, fields, values, backend, rebindings, invalida
       // Older canvases did not record media ownership. Keep the old editor's
       // engine as the conservative source so applying the interface on a new
       // engine cannot turn the inherited filename into an unowned input.
-      owners[nextId] = { name: nextName, backend: node.data.editor_backend };
+      owners[nextId] = { name: nextName, backend: data.editor_backend };
     }
   }
   return owners;
@@ -64,22 +64,29 @@ export function editorConnectionSummary(graph, nodeId, outputs) {
   })];
 }
 
+/** Immutable instance transformation; the owning workspace validates its boundary. */
+export function applyEditorInterfaceData(data, result) {
+  const next = structuredClone(data);
+  const fields = result.package.fields;
+  const packageMediaBackends = remappedMediaOwners(data, fields, result.values, result.backend_url, result.rebindings || {}, result.invalidated_media_fields || []);
+  const packageTextCompositions = remapTextCompositions(data.packageTextCompositions, data.packageFields, fields, result.rebindings || {});
+  const hiddenUpdates = mergeHiddenUpdates(data.editor_hidden_updates || [], result.hidden_updates || [], result.hidden_updates_reset === true, fields);
+  Object.assign(next, { package_id: result.package.id, packageValues: result.values,
+    packageFields: fields.map(cachedPackageField),
+    editor_backend: result.backend_url, editor_baseline: result.baseline,
+    editor_outputs: result.output_nodes, editor_output_fields: result.outputs, packageMediaBackends, packageTextCompositions, editor_hidden_updates: hiddenUpdates });
+  if (result.controls) next.editor_controls = result.controls;
+  return structuredClone(next);
+}
+
 /** Validate the entire proposed graph before changing the live canvas. */
 export function applyEditorInterfaceGraph(graph, nodeId, result, { preserveOutputIndices = false } = {}) {
   const copy = structuredClone(graph);
   const node = copy.nodes.find(item => item.id === nodeId);
   if (!node) throw new Error('工作流节点已不存在');
-  const fields = result.package.fields;
-  const valid = new Set(fields.map(field => field.id));
+  const valid = new Set(result.package.fields.map(field => field.id));
   const outputs = new Set(editorOutputEdges(copy, nodeId).map(edge => edge.id));
-  const packageMediaBackends = remappedMediaOwners(node, fields, result.values, result.backend_url, result.rebindings || {}, result.invalidated_media_fields || []);
-  const packageTextCompositions = remapTextCompositions(node.data.packageTextCompositions, node.data.packageFields, fields, result.rebindings || {});
-  const hiddenUpdates = mergeHiddenUpdates(node.data.editor_hidden_updates || [], result.hidden_updates || [], result.hidden_updates_reset === true, fields);
-  Object.assign(node.data, { package_id: result.package.id, packageValues: result.values,
-    packageFields: fields.map(cachedPackageField),
-    editor_backend: result.backend_url, editor_baseline: result.baseline,
-    editor_outputs: result.output_nodes, editor_output_fields: result.outputs, packageMediaBackends, packageTextCompositions, editor_hidden_updates: hiddenUpdates });
-  if (result.controls) node.data.editor_controls = result.controls;
+  node.data = applyEditorInterfaceData(node.data, result);
   copy.edges = copy.edges.filter(edge => {
     if (edge.target === nodeId && edge.targetField) {
       if (Object.hasOwn(result.rebindings || {}, edge.targetField)) {

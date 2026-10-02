@@ -134,19 +134,20 @@ function mediaValue(value, owner, type, backend, transaction, localAssetId = '')
   } catch { return { reason: 'invalid_media' }; }
 }
 
-/**
- * Host supplies full fields (not cached ports), current backend and transactions.
- * Overrides are session-only. stored_fallback and baseline must survive application.
- */
-export function projectEditorInputs(graph, targetId, options) {
-  const target = targetNode(graph, targetId), backend = backendIdentity(options.backend), data = jsonCopy(target.data);
-  const fields = jsonCopy(options.fields || []);
+function ownProjection(data, fields, backend, mediaState) {
   if (!Array.isArray(fields) || fields.length > 4096) throw new Error('完整编辑字段映射无效');
-  const incoming = inputEdges(graph, targetId), pending = [], overrides = new Map(), mediaOwners = {};
+  const pending = [], overrides = new Map(), mediaOwners = {};
   const byId = new Map(), seenBindings = new Map(), ambiguous = new Set();
   for (const field of fields) {
     if (byId.has(field.id)) ambiguous.add(field.id);
     byId.set(field.id, field);
+  }
+  const effectiveFields = [...fields];
+  for (const item of data.editor_hidden_updates || []) {
+    if (!byId.has(item.field.id)) { byId.set(item.field.id, item.field); effectiveFields.push(item.field); }
+  }
+  if (effectiveFields.length > 4096) throw new Error('完整编辑字段映射无效');
+  for (const field of effectiveFields) {
     if (mappingOK(field)) {
       const binding = JSON.stringify([field.node_id, field.input]);
       if (seenBindings.has(binding)) { ambiguous.add(field.id); ambiguous.add(seenBindings.get(binding)); }
@@ -169,10 +170,6 @@ export function projectEditorInputs(graph, targetId, options) {
     ...(Object.hasOwn(data.packageValues || {}, field.id) ? { stored_fallback: data.packageValues[field.id] } : {}),
     ...(Object.hasOwn(data.editor_baseline || {}, field.id) ? { baseline: data.editor_baseline[field.id] } : {}), ...extra });
   };
-  const effectiveFields = [...fields];
-  for (const item of data.editor_hidden_updates || []) {
-    if (!byId.has(item.field.id)) { byId.set(item.field.id, item.field); effectiveFields.push(item.field); }
-  }
   for (const field of effectiveFields) {
     const hiddenMatches = (data.editor_hidden_updates || []).filter(item => item.field.id === field.id);
     const hidden = hiddenMatches[0];
@@ -186,7 +183,7 @@ export function projectEditorInputs(graph, targetId, options) {
     if (!mappingOK(field) || ambiguous.has(field.id)) { addPending(field, 'mapping_unavailable', provenance); continue; }
     const value = hidden ? hidden.value : data.packageValues[field.id];
     if (MEDIA.has(field.type)) {
-      const state = options.mediaTransfers?.state(`${options.canvasId}:${targetId}`, field.id);
+      const state = mediaState?.(field.id);
       const result = mediaValue(value, data.packageMediaBackends?.[field.id], field.type, backend, state);
       if (result.reason) addPending(field, result.reason, provenance);
       else { put(field, value, 'own', { media_owner: result.owner }); mediaOwners[field.id] = result.owner; }
@@ -201,6 +198,25 @@ export function projectEditorInputs(graph, targetId, options) {
     }
   }
   for (const id of Object.keys(data.packageValues || {})) if (!byId.has(id)) addPending({ id }, 'mapping_unavailable');
+  return { pending, overrides, mediaOwners, byId, ambiguous, addPending, put };
+}
+
+/** Independent workspace input preparation, with no artificial canvas target. */
+export function projectOwnEditorInputs(data, fields, { backend, mediaState } = {}) {
+  backend = backendIdentity(backend);
+  const { pending, overrides, mediaOwners } = ownProjection(jsonCopy(data), jsonCopy(fields), backend, mediaState);
+  return jsonCopy({ backend, overrides: [...overrides.values()], pending, mediaOwners }, EDITOR_PREPARATION_RESULT_LIMIT);
+}
+
+/**
+ * Host supplies full fields (not cached ports), current backend and transactions.
+ * Overrides are session-only. stored_fallback and baseline must survive application.
+ */
+export function projectEditorInputs(graph, targetId, options) {
+  const target = targetNode(graph, targetId), backend = backendIdentity(options.backend), data = jsonCopy(target.data);
+  const fields = jsonCopy(options.fields || []), incoming = inputEdges(graph, targetId);
+  const { pending, overrides, mediaOwners, byId, ambiguous, addPending, put } = ownProjection(data, fields, backend,
+    fieldId => options.mediaTransfers?.state(`${options.canvasId}:${targetId}`, fieldId));
   const presetInputs = { positive: '', negative: '', references: {} }, legacyPositive = [], legacyNegative = [], positive = [], negative = [];
   const builtin = !['package', 'api'].includes(data.kind);
   const compositions = normalizeTextCompositions(data.packageTextCompositions, fields);

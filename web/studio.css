@@ -68,3 +68,9 @@ body.canvas-focus .canvas-shell { position:fixed; inset:0; z-index:60; }.canvas-
 .h3-soundtrack-option { display: flex; gap: 10px; align-items: center; margin: 10px 0; font-size: 14px; }
 .h3-soundtrack-option input[type=checkbox] { width: 18px; height: 18px; margin: 0; flex: 0 0 auto; }
 .h3-reference-builder > button { width: 100%; white-space: normal; }
+.audio-diagnostics { margin: 12px 0; padding: 12px 14px; border: 1px solid #eddac8; border-radius: 10px; background: #fff8f2; color: #644f40; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+.audio-diagnostics summary { cursor: pointer; font-weight: 650; }
+.audio-diagnostics ul { margin: 10px 0 0; padding-left: 20px; }
+.audio-diagnostics li + li { margin-top: 6px; }
+.audio-diagnostics p { margin: 10px 0 0; }
+.audio-repair-copy { margin: 0 0 14px; white-space: normal; }

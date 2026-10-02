@@ -1,3 +1,4 @@
+import { configureWorkflowInterface } from '../web/workflow-interface-controller.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -13,7 +14,7 @@ function harness() {
   const selection = { fields: [], output_nodes: ['out'], rebindings: {}, output_rebindings: {} };
   const result = { package: { id: 'new-package', fields: [] }, values: {}, baseline: {}, output_nodes: ['out'] };
   const state = { identity: 'canvas-1', node, result, selection };
-  const sandbox = {
+  const sandbox = { configureWorkflowInterface,
     graph: { nodes: [node], edges: [] }, packages: [], calls: [], nativeSessionContexts: new WeakMap(),
     stableStringify: JSON.stringify, clone: structuredClone, currentCanvasIdentity: () => state.identity,
     getNode: id => sandbox.graph.nodes.find(item => item.id === id),
@@ -73,7 +74,7 @@ test('native host includes hidden controls and keeps hidden conflict choices out
   const field = { id: 'hidden-width', label: 'Width', node_id: '1', input: 'width', type: 'integer' };
   const node = { data: { package_id: 'pack', packageValues: { visible: 'keep' },
     editor_hidden_updates: [{ field, value: 77, baseline: 10 }] } };
-  const sandbox = { packages: [{ id: 'pack', fields: [{ id: 'visible' }] }], mutate: callback => callback(),
+  const sandbox = { configureWorkflowInterface, packages: [{ id: 'pack', fields: [{ id: 'visible' }] }], mutate: callback => callback(),
     nativeSessionContexts: new WeakMap(), nativeSyncTargets: new WeakMap(), captureNativeInterfaceTarget: node => ({ node }), assertNativeInterfaceTarget() {} };
   sandbox.packageCatalog = { peek: id => sandbox.packages.find(pack => pack.id === id) };
   const hostGlue = appSource.slice(appSource.indexOf('  fields: node =>'), appSource.indexOf('  resolveConflicts:'));
@@ -141,7 +142,7 @@ test('card button keeps its target stable through pointerdown and runs its first
   const listeners = new Map(), calls = [];
   const node = {id:'clicked'},card = { dataset: { nodeId: 'clicked' }, _node: node };
   const element = { closest: selector => selector === '.node' ? card : null, addEventListener: (name, fn) => listeners.set(name, fn) };
-  const sandbox = { el: () => element, spaceDown: false, tool: 'select', selected: new Set(),
+  const sandbox = { configureWorkflowInterface, el: () => element, spaceDown: false, tool: 'select', selected: new Set(),
     reportError: error => { throw error; }, revealInspector: () => calls.push('reveal'),
     renderSelection: () => calls.push('select'), renderInspector: () => calls.push('render'), switchTab() {},renderNodes() {},
     nodeActionPress:createNodeActionPress({isCurrent:actual=>actual===node}) };

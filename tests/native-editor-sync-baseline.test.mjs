@@ -1,3 +1,4 @@
+import { configureWorkflowInterface } from '../web/workflow-interface-controller.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -31,7 +32,7 @@ function setup({ native = 15, baseline = 15, outer = 14, executionId = '1', inpu
     else Object.assign(node.data.packageValues, updates);
   };
   const requests = [], options = [], selections = [];
-  const sandbox = {
+  const sandbox = { configureWorkflowInterface,
     graph: { nodes: [h.node], edges: [] }, nativeSessionContexts: new WeakMap(),
     currentCanvasIdentity: () => 'canvas', stableStringify: JSON.stringify, clone: copy,
     getNode: id => sandbox.graph.nodes.find(node => node.id === id), generationInputPorts: () => [],

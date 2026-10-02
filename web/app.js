@@ -1,3 +1,5 @@
+import { configureWorkflowInterface } from './workflow-interface-controller.mjs';
+import { createStudioWorkflowEditor, chooseStudioEditorSource } from './studio-workflow-editor.mjs';
 import { liveProgressText, elapsedText, previewStatusText, updateLiveProgress } from './job-progress.mjs';
 import { isJobActive, isJobTerminal, jobStatusLabel, jobStateDetail, canCancelJob, canRefreshJob, canSwitchJobBackend, cancelActionLabel } from './job-state.mjs';
 import { createUpdateCenter } from './update-center.mjs';
@@ -61,10 +63,12 @@ let history = [];
 let future = [];
 let csrf = '';
 const nativeSyncTargets = new WeakMap();
+const workspaceEditorTargets = new WeakMap();
 const nativeSessionContexts = new WeakMap();
 const editorMediaSyncs = new WeakMap();
 const nodeActionPress = createNodeActionPress({ isCurrent: node => !!node && getNode(node.id) === node });
 const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copyText,
+  forTarget: target => workspaceEditorTargets.get(target),
   ensureBackend: ensureWorkflowBackend,
   prepareSession: prepareNativeEditorSession,
   endSession: endNativeEditorSession,
@@ -75,7 +79,7 @@ const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copy
     if (graph.nodes.filter(other => other.data.editor_id === node.data.editor_id).length < 2) return;
     const original = await api(`/api/editor-workflows/${node.data.editor_id}`);
     context?.assertCurrent();
-    const copied = await api('/api/editor-workflows', { name: original.name, source_json: original.source_json });
+    const copied = await api('/api/editor-workflows', { name: original.name, source_json: original.source_json, source_kind: original.source_kind || 'unknown' });
     context?.assertCurrent();
     mutate(() => { node.data.editor_id = copied.id; });
     context?.rebaseTarget();
@@ -313,76 +317,16 @@ async function completeInterfaceInputs(info, selection, { path, payload, options
 async function configureNativeInterface(node, compiled = null, session = null, { automatic = false, syncBaseline = [] } = {}) {
   const context = nativeSessionContexts.get(node); context?.assertCurrent();
   const guard = captureNativeInterfaceTarget(node);
-  if (compiled?.ignored_ui_inputs?.length) toast(`已识别并排除 ${compiled.ignored_ui_inputs.length} 个仅用于界面操作的控件；原工作流保留`);
   const previousFields = context?.fields || packageCatalog.peek(node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
-  const previousBaseline = clone(node.data.editor_baseline || {});
-  // This option is local editor state, never an arbitrary addition to the
-  // session HTTP payload. Recheck both the previous field and clean native
-  // compile before replacing a single field's three-way merge base.
-  if (compiled && session?.session_id && Array.isArray(syncBaseline)) {
-    const fields = [...previousFields, ...(node.data.editor_hidden_updates || []).map(item => item.field)];
-    const fieldsById = new Map(), controlsByBinding = new Map(), ownerCounts = new Map(), baselineCounts = new Map();
-    for (const field of fields) { const matches = fieldsById.get(field.id) || []; matches.push(field); fieldsById.set(field.id, matches); }
-    for (const control of compiled.controls || []) {
-      const binding = JSON.stringify([control.node_id, control.input]), target = JSON.stringify([control.widget_node_id, control.widget_name]);
-      const matches = controlsByBinding.get(binding) || []; matches.push(control); controlsByBinding.set(binding, matches);
-      ownerCounts.set(target, (ownerCounts.get(target) || 0) + 1);
-    }
-    for (const item of syncBaseline) if (item) baselineCounts.set(item.field_id, (baselineCounts.get(item.field_id) || 0) + 1);
-    const hiddenById = new Map((node.data.editor_hidden_updates || []).map(item => [item.field.id, item]));
-    const seen = new Set();
-    for (const item of syncBaseline) {
-      if (!item || seen.has(item.field_id)) continue;
-      seen.add(item.field_id);
-      const matches = fieldsById.get(item.field_id) || [];
-      const field = matches[0], definition = compiled.output?.[item.node_id];
-      const controls = controlsByBinding.get(JSON.stringify([item.node_id, item.input])) || [];
-      const hidden = hiddenById.get(item.field_id);
-      const ownValue = hidden ? hidden.value : node.data.packageValues?.[item.field_id];
-      if (baselineCounts.get(item.field_id) !== 1 || matches.length !== 1 || field.node_id !== item.node_id || field.input !== item.input || field.type !== item.type ||
-          definition?.class_type !== item.class_type || !Object.hasOwn(definition.inputs || {}, item.input) ||
-          controls.length !== 1 || ownerCounts.get(JSON.stringify([item.widget_node_id, item.widget_name])) !== 1 || controls[0].widget_node_id !== item.widget_node_id || controls[0].widget_name !== item.widget_name ||
-          !Object.is(ownValue, item.value) || item.value !== null && !['string', 'number', 'boolean'].includes(typeof item.value)) continue;
-      previousBaseline[item.field_id] = item.value;
-    }
-  }
-  const prefix = `/api/editor-workflows/${node.data.editor_id}`;
-  const inspectionPayload = { previous_package_id: node.data.package_id || null,
-    ...(compiled ? { prompt: compiled.output } : { package_id: node.data.package_id, values: node.data.packageValues, previous_baseline: node.data.editor_baseline }) };
-  let info = await api(`${prefix}/interface`, inspectionPayload);
-  assertNativeInterfaceTarget(guard);
-  if (info.migrations?.length) toast(`已按当前节点定义对齐 ${info.migrations.length} 个参数名；未改动原文件或参数值`);
   const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
-  const connectionGraph=clone(graph);
-  if(node.data.kind!=='package') for(const edge of connectionGraph.edges.filter(e=>e.target===node.id)) edge.targetField=edgeInputField(graph,edge);
-  const connections = editorConnectionSummary(connectionGraph, node.id, oldOutputs);
-  if (!compiled) info.outputs = info.outputs.map(item => ({ ...item, label: oldOutputs.find(old => old.id === item.id)?.label || item.label }));
-  const options = { ...info, previousFields, previousValues: node.data.packageValues, previousBaseline, selectedOutputs: oldOutputs.length ? oldOutputs : node.data.editor_outputs || [], connections };
-  let selection = (automatic ? autoEditorInterfaceSelection(options) : null) || await chooseEditorInterface(options);
-  if (!selection) return null;
-  const repaired = await completeInterfaceInputs(info, selection, { path: `${prefix}/interface`, payload: inspectionPayload, options, ensureCurrent: () => assertNativeInterfaceTarget(guard) });
-  if (!repaired) return null;
-  ({ info, selection } = repaired);
-  assertNativeInterfaceTarget(guard);
-  const payload = { ...(session ? { session_id: session.session_id, base_revision: session.base_revision } : {}), missing_values: repaired.missing_values, fields: selection.fields, output_nodes: selection.output_nodes, rebindings: selection.rebindings,
-    ...(compiled?.connected_resolutions ? { connected_resolutions: compiled.connected_resolutions } : {}),
-    previous_package_id: node.data.package_id || null, previous_values: node.data.packageValues || {}, previous_baseline: previousBaseline,
-    ...(compiled ? { document: compiled.workflow, prompt: compiled.output } : { package_id: node.data.package_id, values: node.data.packageValues, backend_url: node.data.editor_backend }) };
-  let result = await api(`${prefix}/${compiled ? 'apply' : 'configure'}`, payload);
-  if (result.requires_resolution) {
-    const resolutions = await resolveEditorConflicts(result.changes.conflicts);
-    if (!resolutions) return null;
-    assertNativeInterfaceTarget(guard);
-    result = await api(`${prefix}/${compiled ? 'apply' : 'configure'}`, { ...payload, resolutions });
-    if (result.requires_resolution) throw new Error('仍有参数冲突未选择，请重新配置');
-  }
-  assertNativeInterfaceTarget(guard);
-  if (result.readiness?.issues?.length) toast(`外部接口已建立；生成前还需修复：${result.readiness.issues[0].message || result.readiness.issues[0]}`, true);
-  const controls = (compiled?.controls || node.data.editor_controls || []).map(control => {
-    const copy = { ...control }; delete copy.media_receipt; delete copy.mapping_receipt; return copy;
-  });
-  const invalidated_media_fields = (Array.isArray(compiled?.connected_resolutions) ? compiled.connected_resolutions : []).filter(item => item.choice === 'inner' && item.media_owner_invalidated === true).map(item => item.field_id);
-  return { ...result, outputs: info.outputs, controls, invalidated_media_fields, rebindings: selection.rebindings, output_rebindings: selection.output_rebindings, _canvas_guard: guard };
+  const connectionGraph = clone(graph);
+  if (node.data.kind !== 'package') for (const edge of connectionGraph.edges.filter(e => e.target === node.id)) edge.targetField = edgeInputField(graph, edge);
+  const result = await configureWorkflowInterface({ api, toast, chooseEditorInterface,
+    autoEditorInterfaceSelection, resolveEditorConflicts, completeInterfaceInputs }, node.data,
+    { compiled, session, automatic, syncBaseline, previousFields,
+      connections: editorConnectionSummary(connectionGraph, node.id, oldOutputs),
+      assertCurrent: () => assertNativeInterfaceTarget(guard) });
+  return result ? { ...result, _canvas_guard: guard } : null;
 }
 async function configureNativePanel(node) {
   const existing = nativeSessionContexts.get(node), context = existing || beginNativeEditorContext(node);
@@ -1106,7 +1050,7 @@ function renderNodes() {
       }
       const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || workflowCanvas?.isRunning() || node.data.kind==='package' && !node.data.package_id; run.dataset.runNode = node.id;
       const live = el('div','node-live-progress'); live.dataset.liveNode = node.id; live.hidden = true;
-      const detail = el('p','live-detail'); const bar = el('progress'); bar.max = 100; bar.setAttribute('aria-label','当前节点采样进度'); const img = el('img','live-preview'); img.alt = '采样中间预览，尚未完成'; img.hidden = true;
+      const detail = el('p','live-detail'); const bar = el('progress'); bar.max = 100; bar.setAttribute('aria-label','当前节点执行进度'); const img = el('img','live-preview'); img.alt = '节点中间预览，尚未完成'; img.hidden = true;
       live.append(detail,bar,img,el('small','live-preview-status')); body.append(run,live); card.append(body);
       const footer = el('div', 'node-footer');
       const status = el('span', 'node-status', '○ 等待提交'); status.dataset.nodeStatus = node.id;
@@ -1699,7 +1643,7 @@ async function openNodeWorkflow(node) {
       if (baseline.backend_url !== settings.backend_url || context.package && baseline.source_revision !== context.package.id) throw new Error('完整来源的后端或版本已变化，请重新进入');
       context.baselineBackend = settings.backend_url;
       context.baselineDocument = baseline.source_document;
-      const saved = await api('/api/editor-workflows', { name: node.data.title, document: { version: 0.4, nodes: [], links: [], last_node_id: 0, last_link_id: 0 } });
+      const saved = await api('/api/editor-workflows', { name: node.data.title, source_kind: 'api', document: { version: 0.4, nodes: [], links: [], last_node_id: 0, last_link_id: 0 } });
       context.assertCurrent();
       const draft = clone(node); draft.data.editor_id = saved.id; draft.data.editor_backend = settings.backend_url;
       aliasNativeEditorContext(context, draft);
@@ -1726,7 +1670,7 @@ async function openNodeWorkflow(node) {
     const shadow = preparePresetEditGraph(graph, node.id, prepared, collected);
     context.fields = shadow.fields; context.sessionGraph = shadow.graph;
     context.baselineBackend = settings.backend_url; context.baselineDocument = prepared.source_document;
-    const saved = await api('/api/editor-workflows', { name: node.data.title,
+    const saved = await api('/api/editor-workflows', { name: node.data.title, source_kind: 'api',
       document: { version: 0.4, nodes: [], links: [], last_node_id: 0, last_link_id: 0 } });
     context.assertCurrent();
     const draft = clone(shadow.target); draft.data.editor_id = saved.id; draft.data.editor_backend = settings.backend_url;
@@ -2408,9 +2352,9 @@ function newJobView(id) {
   const card = el('article', 'job-card'); card.dataset.jobId = id;
   const heading = el('div', 'job-heading'), title = el('span', 'job-title'), status = el('span', 'job-tag'); heading.append(title, status);
   const time = el('div', 'job-time'), elapsed = el('span'); time.append(elapsed, el('span', '', id.slice(0, 8)));
-  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '当前节点采样进度');
+  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '当前节点执行进度');
   const state = el('div', 'progress-state'), error = el('p', 'job-error'), warning = el('p', 'job-warning'), provenance = el('p', 'job-provenance'), thumbs = el('div', 'job-thumbs');
-  const livePreview = el('img', 'live-preview'); livePreview.alt = '采样中间预览，尚未完成'; livePreview.hidden = true;
+  const livePreview = el('img', 'live-preview'); livePreview.alt = '节点中间预览，尚未完成'; livePreview.hidden = true;
   const previewStatus = el('small', 'live-preview-status');
   const actions = el('div', 'job-actions');
   const reuse = button('复用参数', 'job-action', () => reuseJob(id), '把原任务参数添加为独立节点，不会自动开始生成');
@@ -2920,7 +2864,13 @@ const hubCenter = createHubCenter({ api, reportError, downloadJSON, toast,
     backend: () => settings.backend_url, canvasIdentity: currentCanvasIdentity, ensurePackageDefinition }) });
 $('#hub-connection-open').addEventListener('click', () => hubCenter.open().catch(reportError));
 initializeCanvasActions();
-studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, controlJob, isJobControlling: id => controllingJobs.has(id), refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, canvasIdentity: currentCanvasIdentity, canvasSnapshot: snapshot, prepareH3Package: (document, guard) => inspectPackageDocument(document, document.name, '', guard), catalog, openSettings, copyText, storeLocalMedia, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
+const studioEditor = createStudioWorkflowEditor({ api, toast, openSettings, editor: nativeEditor, loadPackage: ensurePackageDefinition,
+  chooseSource: chooseStudioEditorSource,
+  registerTarget(target, adapter) { workspaceEditorTargets.set(target, adapter); return () => workspaceEditorTargets.delete(target); },
+  configure: (data, options) => configureWorkflowInterface({ api, toast, chooseEditorInterface, autoEditorInterfaceSelection,
+    resolveEditorConflicts, completeInterfaceInputs }, data, options),
+});
+studio = createGenerationStudio({ api, editWorkflow: context => studioEditor.open(context), engine: () => engine, jobs: () => jobs, controlJob, isJobControlling: id => controllingJobs.has(id), refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, canvasIdentity: currentCanvasIdentity, canvasSnapshot: snapshot, prepareH3Package: (document, guard) => inspectPackageDocument(document, document.name, '', guard), catalog, openSettings, copyText, storeLocalMedia, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
 workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, ensurePackageDefinition, rememberPackageDefinition, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend, prepareInputs: prepareCanvasImages,
   connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
@@ -2940,7 +2890,7 @@ const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle:
     let editorId = '';
     if (incoming.data.editor_id) {
       const editor = bundle.editors.find(item => item.id === incoming.data.editor_id);
-      editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json})).id;
+      editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json, source_kind:editor.source_kind || 'unknown'})).id;
     }
     await loadPackages();
     if (identity !== currentCanvasIdentity()) throw new Error('画布已切换，配置未放入新画布；已登记的工作流仍在包库');

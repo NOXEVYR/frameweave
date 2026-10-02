@@ -39,34 +39,85 @@ export function nativeMediaContract(node, input, type, registry) {
 export function createNativeEditorMedia({ app, window, document, graph, findWidget, sameMappingProof, config, createPreview }) {
   const receipts = new Map(), byBinding = new Map(), isolated = new WeakMap(), wrapped = new WeakSet(), liveIsolations = new Map();
   const viewHooks = new Map(), scopeHooks = new Map();
-  let panel, preview, previewOwner = null, previewWidget = null, previewValue, refreshing = false, serial = 0, observerChecked = false, observerProbe, probeHandler, unavailable = false;
+  let panel, preview, previewOwner = null, previewWidget = null, previewValue, previewEntry = null, refreshing = false, serial = 0, observerChecked = false, observerProbe, probeHandler, unavailable = false;
+  let activeTrail = null, pendingTrail = null;
   const registry = () => window.LiteGraph?.registered_node_types;
   const canvas = () => app.canvasOrUndefined || app.canvas;
-  function clearPreview() { previewOwner = null; previewWidget = null; previewValue = undefined; preview?.clear(); }
+  function clearPreview(message) { previewOwner = null; previewWidget = null; previewValue = undefined; previewEntry = null; preview?.clear(message); }
+  function validTrail(trail, scope = canvas()?.graph) {
+    if (!trail || trail.root !== graph() || trail.canvas !== canvas() || trail.scope !== scope) return false;
+    let parent = graph();
+    for (const host of trail.hosts) {
+      if (host.graph !== parent || !(parent?._nodes || parent?.nodes || []).includes(host) ||
+          host.isSubgraphNode?.() !== true || !host.subgraph) return false;
+      parent = host.subgraph;
+    }
+    return parent === scope;
+  }
+  function viewPath(scope) {
+    if (scope === graph()) return [];
+    return validTrail(activeTrail, scope) ? activeTrail.hosts.map(host => String(host.id)) : null;
+  }
+  function navigationAvailable() {
+    return typeof document?.addEventListener === 'function' && typeof document?.removeEventListener === 'function' &&
+      typeof canvas()?.openSubgraph === 'function' && typeof canvas()?.canvas?.dispatchEvent === 'function';
+  }
+  function subgraphOpening(event) {
+    pendingTrail = null;
+    const active = canvas(), detail = event?.detail, path = viewPath(active?.graph);
+    if (event?.target !== active?.canvas || !detail || !path || detail.closingGraph !== active.graph ||
+        detail.fromNode?.graph !== active.graph || !(active.graph?._nodes || active.graph?.nodes || []).includes(detail.fromNode) ||
+        detail.fromNode.isSubgraphNode?.() !== true || detail.fromNode.subgraph !== detail.subgraph) return;
+    pendingTrail = { root: graph(), canvas: active, scope: detail.subgraph, closing: detail.closingGraph,
+      hosts: [...(active.graph === graph() ? [] : activeTrail.hosts), detail.fromNode] };
+  }
+  function subgraphOpened(event) {
+    const next = pendingTrail; pendingTrail = null;
+    if (event?.target !== canvas()?.canvas) return;
+    activeTrail = next && next.closing === event.detail?.closingGraph && next.scope === event.detail?.subgraph &&
+      next.hosts.at(-1) === event.detail?.fromNode && validTrail(next) ? next : null;
+    clearPreview(); refreshPreview();
+  }
   function restoreHooks(owner, hooks) {
     for (const { name, wrapper, descriptor } of hooks || []) if (owner[name] === wrapper) {
       if (descriptor) Object.defineProperty(owner, name, descriptor); else delete owner[name];
     }
   }
-  function installHooks(owner, names, store) {
+  function installHooks(owner, names, store, replaceNotifications = false) {
     if (!owner || !Object.isExtensible(owner)) return false;
     const known = store.get(owner);
-    if (known) return known.every(({ name, wrapper }) => owner[name] === wrapper);
-    const descriptors = names.map(name => ({ name, descriptor: Object.getOwnPropertyDescriptor(owner, name), original: owner[name] }));
+    if (known?.every(({ name, wrapper }) => owner[name] === wrapper)) return true;
+    const changed = known ? names.filter(name => owner[name] !== known.find(item => item.name === name)?.wrapper) : names;
+    if (known && (!replaceNotifications || changed.some(name => !['onNodeAdded', 'onNodeRemoved'].includes(name)))) return false;
+    const descriptors = changed.map(name => ({ name, descriptor: Object.getOwnPropertyDescriptor(owner, name), original: owner[name] }));
     if (descriptors.some(({ descriptor, original }) => descriptor && (!own(descriptor, 'value') || !descriptor.configurable) ||
         original !== undefined && typeof original !== 'function')) return false;
     const hooks = [];
     try {
-      for (const item of descriptors) {
+      for (const descriptor of descriptors) {
+        const item = { ...descriptor, active: true };
         const wrapper = function (...args) {
-          if (!unavailable && item.name === 'setGraph') clearPreview();
+          let trail = null;
+          if (!unavailable && item.active && item.name === 'setGraph') {
+            // Breadcrumb navigation can return to an already proven ancestor.
+            // A definition ID alone never identifies a shared instance.
+            if (validTrail(activeTrail)) {
+              const index = activeTrail.hosts.findIndex(host => host.subgraph === args[0]);
+              if (index >= 0) trail = { ...activeTrail, scope: args[0], hosts: activeTrail.hosts.slice(0, index + 1) };
+            }
+            activeTrail = null; clearPreview();
+          }
           try { return item.original?.apply(this, args); }
-          finally { if (!unavailable) refreshPreview(); }
+          finally {
+            if (!unavailable && item.active && item.name === 'setGraph' && validTrail(trail)) activeTrail = trail;
+            if (!unavailable && item.active) refreshPreview();
+          }
         };
         Object.defineProperty(owner, item.name, { configurable: true, enumerable: false, writable: true, value: wrapper });
-        hooks.push({ ...item, wrapper });
+        item.wrapper = wrapper; hooks.push(item);
       }
-      store.set(owner, hooks); return true;
+      for (const item of known || []) if (changed.includes(item.name)) item.active = false;
+      store.set(owner, [...(known || []).filter(item => !changed.includes(item.name)), ...hooks]); return true;
     } catch { restoreHooks(owner, hooks); return false; }
   }
   function nestedAvailable() {
@@ -78,11 +129,15 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   function nestedReason(nodeId, target) {
     if (!nestedAvailable()) return 'nested_media_not_supported';
     if (target?.reason) return target.reason === 'shared_definition_widget' ? 'shared_definition_widget' : 'media_mapping_unproven';
-    if (target.owner !== target.node || target.widget_path !== nodeId) return 'promoted_preview_not_isolated';
+    const promoted = target.owner !== target.node;
+    if (promoted && !navigationAvailable()) return 'promoted_preview_not_isolated';
     const proof = target.mappingProof;
-    if (!proof || proof.root !== graph() || proof.node !== target.node || proof.owner !== target.node ||
-        proof.widget !== target.widget || proof.scope !== target.node.graph || proof.widgetPath !== nodeId ||
+    if (!proof || proof.root !== graph() || proof.node !== target.node || proof.owner !== target.owner ||
+        proof.widget !== target.widget || proof.scope !== target.owner.graph || proof.widgetPath !== target.widget_path ||
         !Array.isArray(proof.nodes) || proof.nodes.length < 2 || proof.nodes.some(item => !item.lifecycle)) return 'media_mapping_unproven';
+    const ownerIndex = proof.nodes.findIndex(item => item.node === target.owner);
+    if (ownerIndex < 0 || nodeId.split(':').slice(0, ownerIndex + 1).join(':') !== target.widget_path ||
+        !promoted && target.widget_path !== nodeId) return 'media_mapping_unproven';
     // Live PreviewExposureStore is authoritative. SubgraphNode.serialize reads
     // it into this explicit property; node.properties may be an older snapshot.
     for (const { node: host } of proof.nodes.slice(0, -1)) {
@@ -98,7 +153,10 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     const target = findWidget(marker.node_id, marker.input);
     if (nestedReason(marker.node_id, target) || !sameMappingProof(marker.mappingProof, target.mappingProof)) return null;
     if (!viewHooks.get(canvas())?.every(({ name, wrapper }) => canvas()[name] === wrapper)) return null;
-    for (const scope of marker.scopes) if (!scopeHooks.get(scope)?.every(({ name, wrapper }) => scope[name] === wrapper)) return null;
+    // The official view detaches/reattaches node-list notification callbacks
+    // when navigating. Re-arm only those notifications after the complete
+    // binding proof above; keep the current callback and its restore descriptor.
+    for (const scope of marker.scopes) if (!installHooks(scope, ['onNodeAdded', 'onNodeRemoved', 'onAfterChange'], scopeHooks, true)) return null;
     return target;
   }
   function hideElement(element) {
@@ -169,8 +227,9 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       graph: graph(), saved, addDescriptor, values: new Map([...saved].map(([name, descriptor]) => [name, descriptor?.value])),
       written: new Set(), styles: new Map(), autoplay: new Map(), scope: node.graph,
       ...(nested ? { node_id: nested.node_id, input: nested.input, nested: true,
-        nativeValue: nested.target.widget.value, scopes: [...new Set(nested.target.mappingProof.nodes.map(item => item.graph))] } : {}) };
-    if (nested && marker.scopes.some(scope => !installHooks(scope, ['onNodeAdded', 'onNodeRemoved', 'onAfterChange'], scopeHooks))) return false;
+        promoted: nested.target.owner !== node, nativeValue: nested.target.widget.value,
+        scopes: [...new Set(nested.target.mappingProof.nodes.map(item => item.graph))] } : {}) };
+    if (nested && marker.scopes.some(scope => !installHooks(scope, ['onNodeAdded', 'onNodeRemoved', 'onAfterChange'], scopeHooks, true))) return false;
     let container = saved.get('videoContainer')?.value;
     for (const widget of node.widgets || []) if (['audioUI', 'video-preview'].includes(widget.name) && widget.element) marker.elements.add(widget.element);
     if (container) marker.elements.add(container);
@@ -312,7 +371,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   function resolve(entry) {
     if (graph() !== entry.graph) return null;
     const target = findWidget(entry.node_id, entry.input);
-    if (target.reason || target.node !== entry.node || target.owner !== entry.node || target.widget !== entry.widget ||
+    if (target.reason || target.node !== entry.node || target.owner !== entry.owner || target.widget !== entry.widget ||
         (target.node.comfyClass || target.node.type) !== entry.class_type || !verifyIsolation(entry.node) ||
         entry.mappingProof && !sameMappingProof(entry.mappingProof, target.mappingProof)) return null;
     const contract = nativeMediaContract(entry.node, entry.input, entry.type, registry());
@@ -331,9 +390,17 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
         const active = canvas(), scope = active?.graph || graph();
         const selected = active?.selected_nodes || {};
         if (previewOwner.graph !== scope || selected[String(previewOwner.id)] !== previewOwner ||
-            Object.keys(selected).length !== 1 || previewWidget?.value !== previewValue || !verifyIsolation(previewOwner)) clearPreview();
+            Object.keys(selected).length !== 1 || previewWidget?.value !== previewValue ||
+            (previewEntry ? !promotedSelected(previewEntry, previewOwner, scope) : !verifyIsolation(previewOwner))) clearPreview();
       }
     } });
+  }
+  function promotedSelected(entry, selected, scope) {
+    const target = resolve(entry), path = viewPath(scope);
+    if (!target || target.owner === target.node || !path) return false;
+    const selectedPath = [...path, String(selected.id)].join(':');
+    return selected === entry.node && selectedPath === entry.node_id ||
+      selected === entry.owner && selectedPath === target.widget_path;
   }
   function refreshPreview() {
     if (unavailable || refreshing) return;
@@ -346,8 +413,23 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     const selectedNodes = nodes.filter(node => own(selected, String(node.id)) && selected[String(node.id)] === node);
     if (selectedNodes.length !== 1 || Object.keys(selected).length !== 1) { clearPreview(); return; }
     const node = selectedNodes[0];
+    const promoted = [...byBinding.values()].filter(entry => entry.owner !== entry.node && promotedSelected(entry, node, scope));
+    if (promoted.length) {
+      // Multiple media slots on a selected host are ambiguous; selecting the
+      // actual leaf inside its instance identifies the slot without guessing.
+      if (promoted.length !== 1) { clearPreview('此实例有多个参考素材槽；请进入此实例，选中具体素材节点以预览。'); return; }
+      if (!safeEditorMediaFilename(promoted[0].widget.value)) { clearPreview('当前实例的素材名称为空或无效；请检查对应的外层输入。'); return; }
+      const entry = promoted[0], identity = `${entry.node_id}:${entry.receipt}:${entry.widget.value}`;
+      previewOwner = node; previewWidget = entry.widget; previewValue = entry.widget.value; previewEntry = entry;
+      if (preview.getState()?.identity !== identity) preview.show({ identity, type: entry.type, filename: entry.widget.value,
+        label: entry.label || `${entry.owner.title || entry.owner.id} / ${entry.node.title || entry.input}` });
+      return;
+    }
     if (!verifyIsolation(node)) { clearPreview(); return; }
     const marker = isolated.get(node), nodeId = marker.nested ? marker.node_id : String(node.id);
+    if (marker.promoted) {
+      clearPreview('无法确定当前子图属于哪个实例；请返回上层，从具体实例进入，再选择素材节点。未修改任何参考素材。'); return;
+    }
     const bindings = [];
     for (const widget of node.widgets || []) for (const type of TYPES) {
       const contract = nativeMediaContract(node, widget.name, type, registry());
@@ -387,7 +469,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
         const reason = nestedReason(binding.node_id, target);
         if (reason) { fail(reason); continue; }
       }
-      if (target.reason || target.owner !== target.node || (target.node.comfyClass || target.node.type) !== binding.class_type ||
+      if (target.reason || !nested && target.owner !== target.node || (target.node.comfyClass || target.node.type) !== binding.class_type ||
           actual?.class_type !== binding.class_type || !own(actual.inputs || {}, binding.input) || actual.inputs[binding.input] !== target.widget.value) { fail('media_mapping_unproven'); continue; }
       const contract = nativeMediaContract(target.node, binding.input, binding.type, registry());
       if (!contract) { fail('media_contract_unsupported'); continue; }
@@ -413,7 +495,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       if (!old && receipts.size >= MAX_FIELDS) { fail('media_capture_limit'); continue; }
       const bytes = new Uint8Array(24); window.crypto.getRandomValues(bytes);
       const receipt = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('') + `-${++serial}`;
-      const entry = { ...binding, ...contract, receipt, graph: graph(), node: target.node, widget: target.widget,
+      const entry = { ...binding, ...contract, receipt, graph: graph(), node: target.node, owner: target.owner, widget: target.widget,
         native_value: target.widget.value, observed_value: target.widget.value,
         ...(nested ? { mappingProof: target.mappingProof } : {}) };
       receipts.set(receipt, entry); byBinding.set(key, entry);
@@ -446,7 +528,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
         ![entry.native_value, entry.value, entry.observed_value].some(value => Object.is(value, patch.value))) return false;
     const allowed = safeEditorMediaFilename(patch.value, patch.value === entry.native_value && patch.value === '');
     const marker = isolated.get(entry.node);
-    if (allowed && marker?.nested && (patch.value !== marker.nativeValue || target.widget.value !== marker.nativeValue)) marker.contaminated = true;
+    if (allowed && marker?.nested && !marker.promoted && (patch.value !== marker.nativeValue || target.widget.value !== marker.nativeValue)) marker.contaminated = true;
     return allowed;
   }
   function prune() {
@@ -464,14 +546,14 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
           // Keep presentation isolated until a real re-add/reload boundary;
           // recovery must not rewrite graph values merely to repair a preview.
           const widget = (node.widgets || []).find(item => item.name === marker.input);
-          if (marker.contaminated || widget?.value !== marker.nativeValue) {
+          if (marker.contaminated || !marker.promoted && widget?.value !== marker.nativeValue) {
             marker.quarantined = true; revokeNode(node); if (previewOwner === node) clearPreview();
           } else releaseIsolation(node, marker);
         }
       } else if (!current.has(node)) retireIsolation(node, marker);
     }
   }
-  function reset() { receipts.clear(); byBinding.clear(); clearPreview(); }
+  function reset() { receipts.clear(); byBinding.clear(); activeTrail = pendingTrail = null; clearPreview(); }
   let refreshQueued = false;
   function schedulePreview(event) {
     // Closing/folding/playing the independent panel must not immediately reopen it.
@@ -482,14 +564,19 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   }
   const events = ['pointerup', 'input', 'change', 'keyup'];
   for (const event of events) document?.addEventListener?.(event, schedulePreview);
+  document?.addEventListener?.('subgraph-opening', subgraphOpening);
+  document?.addEventListener?.('subgraph-opened', subgraphOpened);
   function destroy() {
     reset(); preview?.destroy(); panel?.remove(); observerProbe?.disconnect?.();
     for (const marker of liveIsolations.values()) { marker.observer?.disconnect?.(); marker.retired = true; }
     liveIsolations.clear();
+    for (const hooks of [...viewHooks.values(), ...scopeHooks.values()]) for (const item of hooks) item.active = false;
     for (const [owner, hooks] of viewHooks) restoreHooks(owner, hooks);
     for (const [owner, hooks] of scopeHooks) restoreHooks(owner, hooks);
     viewHooks.clear(); scopeHooks.clear();
     for (const event of events) document?.removeEventListener?.(event, schedulePreview);
+    document?.removeEventListener?.('subgraph-opening', subgraphOpening);
+    document?.removeEventListener?.('subgraph-opened', subgraphOpened);
     window.removeEventListener?.('pagehide', destroy);
     unavailable = true;
   }

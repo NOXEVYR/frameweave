@@ -2440,8 +2440,9 @@ kbd {
 .package-node-name { color:#34486f; font-size:14px; font-weight:600; line-height:1.5; overflow-wrap:anywhere; }
 .package-node-counts { display:flex; flex-wrap:wrap; gap:5px 8px; color:#65758f; font-size:12px; }
 .package-node-counts span { padding:3px 7px; border:1px solid #e2e7f1; border-radius:5px; background:#f7f9fd; }
-.package-node-actions { display:flex; gap:7px; }
+.package-node-actions { display:flex; flex-wrap:wrap; gap:7px; }
 .package-node-actions .button { flex:1; width:auto; min-height:35px; margin:0; padding:7px 8px; font-size:12px; }
+.package-node-actions .sync-editor-media { flex-basis:100%; white-space:normal; }
 .package-node-actions .enter-workflow { color:#384fc1; border-color:#aab9e8; background:#f1f4ff; }
 .package-node-actions .manage-package-interface { color:#526785; border:1px solid #d6deed; background:#fafbfe; }
 .package-node-actions .button:hover { border-color:#839bdb; background:#eaf0ff; }

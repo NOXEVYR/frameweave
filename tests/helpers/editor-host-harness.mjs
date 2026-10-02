@@ -8,6 +8,7 @@ import { editorPreparationBackend, captureEditorPreparationTarget, assertEditorP
 import { collectPresetEditRequest } from '../../web/preset-edit-request.mjs';
 import { preparePresetEditGraph } from '../../web/preset-edit-graph.mjs';
 import { applyEditorInterfaceGraph } from '../../web/editor-canvas-interface.mjs';
+import { stageEditorMediaSync } from '../../web/editor-media-sync.mjs';
 
 const source = await readFile(new URL('../../web/app.js', import.meta.url), 'utf8');
 const hostCode = source.slice(source.indexOf('const nativeSyncTargets ='), source.indexOf('async function completeInterfaceInputs('));
@@ -34,6 +35,8 @@ export function hostHarness({fields = [field('prompt')], values = {prompt:'fallb
   const sandbox = {graph:{nodes:[node],edges:[]},settings:{backend_url:BACKEND},packages:[],referenceImports:new Map(),
     packageMediaTransfers:createMediaTransfers(),currentCanvasIdentity:()=>state.identity,stableStringify,clone:structuredClone,
     editorPreparationBackend,captureEditorPreparationTarget,assertEditorPreparationTarget,projectEditorInputs,createNodeActionPress,
+    stageEditorMediaSync(...args){args.forEach(sameRealmJSON);return stageEditorMediaSync(...args);},
+    document:{querySelectorAll:()=>[]},renderNodes(){},renderInspector(){},
     collectPresetEditRequest(...args){args.forEach(sameRealmJSON);return collectPresetEditRequest(...args);},
     preparePresetEditGraph(...args){args.forEach(sameRealmJSON);return preparePresetEditGraph(...args);},
     applyEditorInterfaceGraph(...args){args.forEach(sameRealmJSON);return applyEditorInterfaceGraph(...args);},
@@ -53,6 +56,7 @@ export function hostHarness({fields = [field('prompt')], values = {prompt:'fallb
       state.calls.push({path,payload:payload&&structuredClone(payload)});
       if(state.onApi){const result=await state.onApi(path,payload);if(result!==undefined)return result;}
       if(path==='/api/engines')return {profiles:[{base_url:BACKEND,online:true},{base_url:OTHER,online:true}]};
+      if(path==='/api/status')return {backend_url:sandbox.settings.backend_url};
       if(path==='/api/packages/pack')return {package:{id:'pack',name:'Package',fields:state.fields,prompt:state.prompt}};
       if(path.endsWith('/backends'))return {current:sandbox.settings.backend_url};
       if(path==='/api/editor-workflows')return {id:'created'};

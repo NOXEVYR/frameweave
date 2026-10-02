@@ -29,6 +29,7 @@ import { repairInterfaceInputs, chooseMissingInputValues } from './interface-rep
 import { mergeDiagnosticChecks } from './diagnostics-view.mjs';
 import { createCanvasInspection, captureRequestInspection, inspectWithDiscovery } from './canvas-inspection.mjs';
 import { editorPreparationBackend, captureEditorPreparationTarget, assertEditorPreparationTarget, projectEditorInputs } from './editor-preparation.mjs';
+import { stageEditorMediaSync } from './editor-media-sync.mjs';
 import { createNodeActionPress } from './node-action-press.mjs';
 import { interfacePage, interfaceSearch } from './interface-pagination.mjs';
 import { INTERFACE_PAGE_SIZE } from './interface-limits.mjs';
@@ -61,6 +62,7 @@ let future = [];
 let csrf = '';
 const nativeSyncTargets = new WeakMap();
 const nativeSessionContexts = new WeakMap();
+const editorMediaSyncs = new WeakMap();
 const nodeActionPress = createNodeActionPress({ isCurrent: node => !!node && getNode(node.id) === node });
 const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copyText,
   ensureBackend: ensureWorkflowBackend,
@@ -125,6 +127,7 @@ const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copy
 
 /** Fixed direct-input witnesses survive source loading and the whole editor session. */
 function beginNativeEditorContext(node) {
+  if (editorMediaSyncs.has(node)) throw new Error('参考素材正在同步，请完成后再进入工作流');
   const previous = nativeSessionContexts.get(node);
   if (previous) { previous.assertCurrent(); return previous; }
   const target = getNode(node.id);
@@ -213,6 +216,63 @@ async function prepareNativeEditorSession(node, workflow) {
   }
   context.provenance = provenance; context.pending = pending;
   return { assertCurrent: context.assertCurrent, provenance: clone(provenance), ownMedia: clone(ownMedia), pending: clone(pending) };
+}
+
+function editorMediaSyncButton(node) {
+  const control = button(editorMediaSyncs.has(node) ? '正在同步参考素材…' : '同步参考素材到引擎', 'button quiet sync-editor-media', () => syncEditorMedia(node));
+  control.disabled = editorMediaSyncs.has(node); control.dataset.syncMediaNode = node.id;
+  control.title = '仅同步此工作流直接连接的图片、视频和音频，之后可进入内部查看；不开始生成';
+  return control;
+}
+async function syncEditorMedia(node) {
+  if (editorMediaSyncs.has(node)) return editorMediaSyncs.get(node);
+  if (nativeSessionContexts.has(node)) throw new Error('请先返回画布，再同步参考素材并重新进入工作流');
+  const backend = editorPreparationBackend(graph, node.id, settings.backend_url);
+  if (backend !== settings.backend_url) throw new Error('请先连接此工作流绑定的推理引擎，再同步参考素材');
+  const live = () => ({ canvasId: currentCanvasIdentity(), backend: settings.backend_url,
+    sourceRevision: node.data.package_id || node.data.editor_id || null, referenceImports, mediaTransfers: packageMediaTransfers });
+  const guard = captureEditorPreparationTarget(graph, node.id, live());
+  const check = () => {
+    if (nativeSessionContexts.has(node)) throw new Error('内部工作流已打开，未应用迟到的素材同步；请返回画布后重试');
+    return assertEditorPreparationTarget(guard, graph, live());
+  };
+  const showProgress = (done, total) => {
+    for (const control of document.querySelectorAll('[data-sync-media-node]')) if (control.dataset.syncMediaNode === node.id) {
+      control.disabled = true; control.textContent = total ? `正在同步参考素材 ${done}/${total}…` : '正在检查参考素材…';
+    }
+  };
+  const task = (async () => {
+    showProgress(0, 0);
+    const pack = node.data.package_id ? await ensurePackageDefinition(node.data.package_id) : null;
+    check();
+    const result = await stageEditorMediaSync(graph, node.id, { ...live(), fields: pack?.fields || [] }, api, check, showProgress);
+    const status = await api('/api/status'); check();
+    if (status.backend_url !== backend) throw new Error('同步期间引擎已切换，未改写画布；请重新连接后同步');
+    if (result.updates.length) mutate(() => {
+      for (const update of result.updates) {
+        const source = getNode(update.id);
+        source.data.name = update.name; source.data.uploadBackend = update.uploadBackend;
+      }
+    });
+    const reasons = { upstream_not_run: '上游尚未生成', mapping_unavailable: '尚未建立对应媒体接口',
+      ambiguous_connection: '同一端口存在多条连接', import_pending: '素材正在导入', import_failed: '素材导入失败',
+      media_type_mismatch: '素材类型与端口不一致', local_only: '本地素材不可用', other_backend: '缺少可重新同步的本地素材',
+      owner_unknown: '缺少可重新同步的本地素材', media_missing: '尚未选择素材' };
+    const pending = [...new Set(result.pending.map(item => reasons[item.reason] || '请检查素材和端口映射'))];
+    toast(`${result.updates.length ? `已同步 ${result.updates.length} 份参考素材，可进入工作流查看` : '没有需要同步的直接本地素材'}${pending.length ? `；待处理：${pending.join('、')}` : ''}。尚未开始生成`, !!pending.length);
+  })();
+  editorMediaSyncs.set(node, task);
+  try { return await task; }
+  finally {
+    editorMediaSyncs.delete(node); renderNodes(); renderInspector();
+    // Cached node cards can survive a redraw with unchanged content. Settle
+    // transient button state explicitly rather than leaving the old busy DOM.
+    for (const control of document.querySelectorAll('[data-sync-media-node]')) {
+      if (control.dataset.syncMediaNode === node.id && !editorMediaSyncs.has(getNode(node.id))) {
+        control.disabled = false; control.textContent = '同步参考素材到引擎';
+      }
+    }
+  }
 }
 
 function captureNativeInterfaceTarget(node) {
@@ -1027,6 +1087,7 @@ function renderNodes() {
         const actions = el('div', 'package-node-actions');
         actions.append(button(!node.data.package_id && !node.data.editor_id ? '选择工作流' : '进入工作流 ↗', 'button quiet enter-workflow', () => openNodeWorkflow(node)));
         if (pack) actions.append(button('管理外部接口', 'button quiet manage-package-interface', () => configurePackageInterface(node)));
+        actions.append(editorMediaSyncButton(node));
         body.append(actions, el('p', 'package-node-hint', view.hint));
         inputPorts(node, body);
         if (pack?.description) { const description = el('p', 'node-prompt-summary package-node-description', pack.description); description.title = pack.description; body.append(description); }
@@ -1040,7 +1101,7 @@ function renderNodes() {
         body.append(summary);
         let prompt = ''; try { prompt = generationPayload(graph, node.id).positive; } catch { /* API import has no prompt yet. */ }
         body.append(el('p', 'node-prompt-summary', node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
-        body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => openNodeWorkflow(node)));
+        body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => openNodeWorkflow(node)), editorMediaSyncButton(node));
       }
       const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || workflowCanvas?.isRunning() || node.data.kind==='package' && !node.data.package_id; run.dataset.runNode = node.id;
       const live = el('div','node-live-progress'); live.dataset.liveNode = node.id; live.hidden = true;
@@ -1798,7 +1859,7 @@ function renderInspector() {
       renderLoraFields(wrap, node);
     }
     const actions = el('div', 'inspector-actions'); actions.append(button('检查缺失项', 'button quiet', () => runDiagnostics(node)), button('导出执行 JSON', 'button quiet', () => compileNode(node))); wrap.append(actions);
-    wrap.append(button('↗ 进入工作流 · 内部调参','button quiet inspector-run',()=>openNodeWorkflow(node)));
+    wrap.append(button('↗ 进入工作流 · 内部调参','button quiet inspector-run',()=>openNodeWorkflow(node)), editorMediaSyncButton(node));
     const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || workflowCanvas?.isRunning() || node.data.kind==='package' && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
     wrap.append(el('p', 'form-note', '速度与质量取决于后端、模型、显存和参数。生成任务通过本机服务执行，可在队列中查看耗时与取消。'));
   } else if (node.type === 'prompt') {

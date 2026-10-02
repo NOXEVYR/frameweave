@@ -815,8 +815,18 @@ class App:
         saved = self.local_assets.create(data.get("name"), data.get("data"))
         return {**saved, "url": f"/api/assets/images/{saved['asset_id']}"}
 
-    def sync_local_image_asset(self, asset_id):
+    def media_sync_backend(self, data):
+        """Pin a client-selected backend before any explicit asset transfer."""
         with self.lock:
+            backend = self.backend
+            if "expected_backend" in data and local_url(data["expected_backend"]) != backend.url:
+                raise ValueError("素材目标引擎已变化，未上传；请重新选择引擎后同步")
+            return backend
+
+    def sync_local_image_asset(self, asset_id, *, expected_backend=None):
+        with self.lock:
+            if expected_backend is not None and self.backend is not expected_backend:
+                raise ValueError("同步期间后端已变化，请重新选择输入素材")
             content, _mime = self.local_assets.read(asset_id)
             result = self._upload_content(content, complete=True)
             return {**result, "asset_id": asset_id}
@@ -826,10 +836,10 @@ class App:
         return {**saved, "url": f"/api/assets/media/{saved['asset_id']}"}
 
     def sync_local_media_asset(self, asset_id, package_id=None, field_id=None, *, schema=None,
-                               expected_backend=None, source=None):
+                               expected_backend=None, source=None, values=None):
         content, mime, media_type = self.local_media_assets.read(asset_id)
         if media_type == "image":
-            if package_id is not None or field_id is not None:
+            if package_id is not None or field_id is not None or values is not None:
                 raise ValueError("图片同步只接受空对象")
             with self.lock:
                 if expected_backend is not None and self.backend is not expected_backend:
@@ -845,7 +855,7 @@ class App:
                 raise ValueError("同步期间后端已变化，请重新选择输入素材")
         package = self.packages.get(package_id)
         live_schema = schema if schema is not None else self._object_info_for_backend(backend)
-        validate_package_media_field(_stored_package_document(package), field_id, live_schema, media_type)
+        validate_package_media_field(_stored_package_document(package), field_id, live_schema, media_type, values=values)
         cache_key = (asset_id, backend)
 
         with self._transfer_lock(("local-media-upload", asset_id, backend.url)):
@@ -2065,22 +2075,27 @@ def make_server(app, port=0):
                 elif path == '/api/assets/images':
                     result = app.create_local_image_asset(data)
                 elif re.fullmatch(r'/api/assets/images/[0-9a-f]{64}/backend-input', path):
-                    if data:
-                        raise ValueError('同步本地图片只接受空对象')
+                    if set(data) - {"expected_backend"}:
+                        raise ValueError('同步本地图片只接受可选 expected_backend')
+                    backend = app.media_sync_backend(data)
                     asset_id = path.split('/')[4]
                     try:
-                        result = app.sync_local_image_asset(asset_id)
+                        result = app.sync_local_image_asset(asset_id, expected_backend=backend)
                     except FileNotFoundError:
                         self.respond({"error": "本地图片不存在"}, 404)
                         return
                 elif re.fullmatch(r'/api/assets/media/[0-9a-f]{64}/backend-input', path):
-                    if data and (set(data) != {"package_id", "field_id"}
-                                 or any(not isinstance(value, str) or not value for value in data.values())):
-                        raise ValueError('媒体同步只接受空对象或 package_id 和 field_id')
+                    binding_keys = set(data) - {"expected_backend", "values"}
+                    if binding_keys and (binding_keys != {"package_id", "field_id"}
+                                         or any(not isinstance(data[key], str) or not data[key] for key in binding_keys)):
+                        raise ValueError('媒体同步只接受可选 expected_backend 和成对的 package_id、field_id')
+                    if "values" in data and (binding_keys != {"package_id", "field_id"} or not isinstance(data["values"], dict)):
+                        raise ValueError('媒体同步 values 必须是绑定工作流的参数对象')
+                    backend = app.media_sync_backend(data)
                     asset_id = path.split('/')[4]
                     try:
                         result = app.sync_local_media_asset(
-                            asset_id, data.get("package_id"), data.get("field_id"))
+                            asset_id, data.get("package_id"), data.get("field_id"), expected_backend=backend, values=data.get("values"))
                     except FileNotFoundError:
                         self.respond({"error": "本地媒体不存在"}, 404)
                         return

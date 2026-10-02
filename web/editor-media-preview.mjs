@@ -57,10 +57,11 @@ export function createEditorMediaPreview({ document, container, onState } = {}) 
     }
     viewport.replaceChildren();
   }
-  function clear() {
+  function clear(message) {
     if (destroyed) return snapshot();
     generation++; release();
-    state = { status: 'empty', identity: null, type: null, filename: '', label: '', ordinal: null, message: '预览已清除；未修改参考槽', generation };
+    state = { status: 'empty', identity: null, type: null, filename: '', label: '', ordinal: null,
+      message: typeof message === 'string' && message ? message.slice(0, 512) : '预览已清除；未修改参考槽', generation };
     notify(); return snapshot();
   }
   function show(value = {}) {

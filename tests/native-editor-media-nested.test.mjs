@@ -24,7 +24,7 @@ class Element {
   pause(){this.operations.push('pause');} load(){this.operations.push('load');}
   set src(value){this._src=value;} get src(){return this._src||'';}
 }
-async function fixture({type='image',mask=false,shared=false,promoted=false,deep=false,exposures=[],exposureProof=true,noComparator=false,noCanvasHook=false}={}){
+async function fixture({type='image',mask=false,shared=false,promoted=false,deep=false,navigation=false,exposures=[],exposureProof=true,noComparator=false,noCanvasHook=false}={}){
   const input=type==='video'?'file':type,classType=mask?'LoadImageMask':{image:'LoadImage',video:'LoadVideo',audio:'LoadAudio'}[type];
   const ext={image:'png',video:'mp4',audio:'wav'}[type],native=`native/N.${ext}`,connected=`refs/C.${ext}`;
   const resources=[],handlers=new Map(),replies=[],waiters=new Map(),frames=[];let implementation,preview,sequence=0,extension;
@@ -50,11 +50,22 @@ async function fixture({type='image',mask=false,shared=false,promoted=false,deep
   if(middle)middle.graph=outerScope;
   const first=host(6,outerScope),second=host(7,outerScope),root=scope('root',shared?[first,second]:[first]);first.graph=second.graph=root;
   if(promoted){leaf.inputs[0].link=1;inside.links.set(1,{originIsIoNode:true,origin_slot:0,origin_id:-10,target_id:4,target_slot:0});
-    first.inputs=[{name:'instance-media',widget:{name:'instance-media'},link:null}];first.widgets=[{name:'instance-media',type:'combo',value:native,options:{values:[]}}];}
+    for(const item of [first,second]) {
+      item.inputs=[{name:'instance-media',widget:{name:'instance-media'},link:null}];
+      item.widgets=[{name:'instance-media',type:'combo',value:item===first?native:`native/B.${ext}`,options:{values:[]}}];
+    }}
   const serializeScope=value=>({id:value.id,nodes:value._nodes.map(node=>node.serialize()),links:[]});
   root.serialize=()=>({nodes:root._nodes.map(node=>node.serialize()),links:[],definitions:{subgraphs:[serializeScope(inside),...(deep?[serializeScope(outerScope)]:[])]}});
   const nodeId=deep?'6:2:4':'6:4';
   const canvas={graph:root,selected_nodes:{},canvas:{isConnected:true},setGraph(next){this.selected_nodes={};this.graph=next;return 'native-setGraph-result';},setDirty(){}};
+  if(navigation){
+    canvas.canvas.dispatchEvent=event=>{handlers.get(`doc:${event.type}`)?.({...event,target:canvas.canvas});return true;};
+    canvas.openSubgraph=function(subgraph,fromNode){const detail={subgraph,closingGraph:this.graph,fromNode};
+      if(this.canvas.dispatchEvent({type:'subgraph-opening',detail})){
+        this.setGraph(subgraph);this.canvas.dispatchEvent({type:'subgraph-opened',detail});
+      }
+    };
+  }
   if(noCanvasHook)delete canvas.setGraph;
   const app={graph:root,rootGraphOrUndefined:root,canvas,canvasOrUndefined:canvas,registerExtension(value){extension=value;},
     async graphToPrompt(){return{workflow:root.serialize(),output:Object.fromEntries(root._nodes.flatMap(node=>inside._nodes.map(child=>[`${node.id}:${deep?'2:':''}${child.id}`,{class_type:classType,inputs:{[input]:promoted&&child===leaf?node.widgets[0].value:child.widgets[0].value,...(mask?{channel:child.widgets[1].value}:{})}}])))};},
@@ -74,7 +85,9 @@ async function fixture({type='image',mask=false,shared=false,promoted=false,deep
   const binding={field_id:'reference',node_id:nodeId,input,class_type:classType,type,value:connected,media_owner:{name:connected,media_type:type,backend:window.__PRISM_EDITOR__.backendUrl}};
   const capture=()=>request('captureMedia',{bindings:[binding]});
   const select=(node=leaf)=>{canvas.setGraph(inside);canvas.selected_nodes={[node.id]:node};canvas.onSelectionChange?.(canvas.selected_nodes);implementation.refreshPreview();};
-  return {type,input,classType,native,connected,nodeId,binding,request,capture,select,app,canvas,root,inside,outerScope,first,second,middle,leaf,other,exposures,MediaNode,resources,frames,handlers,replies,
+  const selectOnly=node=>{canvas.selected_nodes={[node.id]:node};canvas.onSelectionChange?.(canvas.selected_nodes);implementation.refreshPreview();};
+  const enter=host=>{canvas.setGraph(root);canvas.openSubgraph(host.subgraph,host);selectOnly(leaf);};
+  return {type,input,classType,native,connected,nodeId,binding,request,capture,select,selectOnly,enter,app,canvas,root,inside,outerScope,first,second,middle,leaf,other,exposures,MediaNode,resources,frames,handlers,replies,
     media:()=>implementation,preview:()=>preview,currentMedia:()=>resources.at(-1)};
 }
 
@@ -243,4 +256,112 @@ test('nested selection requires actual selected object, and destroy restores nat
   h.select();h.canvas.selected_nodes[5]=h.other;h.canvas.onSelectionChange();assert.equal(h.preview().getState().status,'empty');
   h.media().destroy();assert.equal(Object.hasOwn(h.root,'onAfterChange'),false);assert.equal(Object.hasOwn(h.inside,'onNodeAdded'),false);
   assert.equal(Object.hasOwn(h.canvas,'onSelectionChange'),false);assert.equal(h.canvas.setGraph(h.root),'native-setGraph-result');
+});
+
+function secondBinding(h) {
+  const value=h.connected.replace('/C.','/D.');
+  return {...h.binding,field_id:'second-reference',node_id:'7:4',value,media_owner:{...h.binding.media_owner,name:value}};
+}
+
+for(const type of ['image','video','audio'])test(`shared promoted ${type}: actual bridge patches instance owners and previews the proven host path`,async()=>{
+  const h=await fixture({type,shared:true,promoted:true,navigation:true}),before=copy(h.root.serialize()),b=secondBinding(h);
+  const captured=await h.request('captureMedia',{bindings:[h.binding,b]});assert.equal(captured.error,undefined);
+  assert.equal(captured.result.captured.length,2);assert.deepEqual(h.root.serialize(),before);
+  const patch=(binding,index)=>({node_id:binding.node_id,widget_name:binding.input,class_type:binding.class_type,
+    media_receipt:captured.result.captured[index].receipt,value:binding.value});
+  assert.equal((await h.request('patch',{patches:[patch(h.binding,0),patch(b,1)]})).error,undefined);
+  assert.equal(h.first.widgets[0].value,h.connected);assert.equal(h.second.widgets[0].value,b.value);
+  assert.equal(h.leaf.widgets[0].value,h.native);assert.equal(h.leaf.imgs,undefined);
+  for(const [host,binding]of [[h.first,h.binding],[h.second,b],[h.first,h.binding]]){
+    h.canvas.setGraph(h.root);h.selectOnly(host);assert.equal(h.preview().getState().filename,binding.value);
+    h.canvas.openSubgraph(h.inside,host);h.selectOnly(h.leaf);
+    assert.equal(h.preview().getState().filename,binding.value);assert.ok(h.preview().getState().identity.startsWith(binding.node_id+':'));
+  }
+  const output=(await h.request('compile')).result.output;
+  assert.equal(output[h.nodeId].inputs[h.input],h.connected);assert.equal(output[b.node_id].inputs[h.input],b.value);
+  assert.equal(h.leaf.widgets[0].value,h.native);
+});
+
+test('shared promoted media requires exact opening host; direct definition navigation or unrelated events cannot borrow the last instance',async()=>{
+  const h=await fixture({shared:true,promoted:true,navigation:true});await h.capture();h.enter(h.first);
+  assert.equal(h.preview().getState().filename,h.native);
+  h.canvas.setGraph(h.root);h.canvas.setGraph(h.inside);h.selectOnly(h.leaf);
+  assert.equal(h.preview().getState().status,'empty');
+  assert.match(h.preview().getState().message,/从具体实例进入/);
+  h.canvas.canvas.dispatchEvent({type:'subgraph-opened',detail:{subgraph:h.inside,closingGraph:h.root,fromNode:h.first}});
+  assert.equal(h.preview().getState().status,'empty');
+  h.canvas.setGraph(h.root);h.canvas.openSubgraph(h.inside,{...h.first});h.selectOnly(h.leaf);
+  assert.equal(h.preview().getState().status,'empty');
+  h.enter(h.first);assert.equal(h.preview().getState().filename,h.native);
+});
+
+test('shared promoted media ignores late A decoder after selection changes to B and after widget changes',async()=>{
+  const h=await fixture({shared:true,promoted:true,navigation:true}),b=secondBinding(h);
+  await h.request('captureMedia',{bindings:[h.binding,b]});h.enter(h.first);
+  const old=h.currentMedia(),late=[...old.listeners.get('load')][0];
+  h.enter(h.second);const identity=h.preview().getState().identity;late();
+  assert.equal(h.preview().getState().identity,identity);assert.equal(h.preview().getState().filename,h.second.widgets[0].value);
+  assert.equal(old.src,'');
+  const next=[...h.currentMedia().listeners.get('load')][0];h.second.widgets[0].value='native/changed.png';next();
+  assert.equal(h.preview().getState().status,'empty');assert.equal(h.leaf.widgets[0].value,h.native);
+});
+
+for(const change of ['host-remove','widget-replace','slot-replace','preview-exposure'])test(`shared promoted ${change} revokes old receipts and preserves graph data`,async()=>{
+  const h=await fixture({shared:true,promoted:true,navigation:true}),b=secondBinding(h);
+  const captures=(await h.request('captureMedia',{bindings:[h.binding,b]})).result.captured;h.enter(h.first);
+  if(change==='host-remove')h.root._nodes=h.root._nodes.filter(node=>node!==h.first);
+  if(change==='widget-replace')h.first.widgets[0]={...h.first.widgets[0]};
+  if(change==='slot-replace')h.first.inputs[0]={...h.first.inputs[0]};
+  if(change==='preview-exposure')h.exposures.push({sourceNodeId:'4'});
+  h.root.onAfterChange();assert.equal(h.preview().getState().status,'empty');
+  const patch={node_id:h.nodeId,widget_name:h.input,class_type:h.classType,media_receipt:captures[0].receipt,value:h.connected};
+  assert.ok((await h.request('patch',{patches:[patch]})).error);
+  assert.equal(h.leaf.widgets[0].value,h.native);assert.equal(h.first.widgets[0].value,h.native);
+  const captureB=(await h.request('captureMedia',{bindings:[b]})).result;
+  if(change==='preview-exposure')assert.equal(captureB.captured.length,0);
+  else{assert.equal(captureB.captured.length,1);h.enter(h.second);assert.equal(h.preview().getState().filename,h.second.widgets[0].value);}
+});
+
+for(const type of ['image','video','audio'])test(`shared promoted ${type} projection cleans both instance overlays for persistence then restores display`,async()=>{
+  const h=await fixture({type,shared:true,promoted:true,navigation:true}),b=secondBinding(h),calls=[];
+  const originalB=h.second.widgets[0].value;
+  const request=async(action,args={})=>{calls.push(action);const reply=await h.request(action,args);if(reply.error)throw new Error(reply.error);return reply.result;};
+  const session=createEditorSessionProjection({request,assertCurrent(){},mappingCapture:true,mediaNestedCapture:true,
+    provenance:[h.binding,b].map(item=>({...item,origin:'connected'}))});
+  const initialized=await session.initialize();assert.equal(initialized.unmapped.length,0);assert.equal(initialized.applied.length,2);
+  h.enter(h.second);assert.equal(h.preview().getState().filename,b.value);assert.equal(h.leaf.widgets[0].value,h.native);
+  let saved;await session.prepare(value=>{saved=value;assert.equal(h.first.widgets[0].value,h.native);
+    assert.equal(h.second.widgets[0].value,originalB);assert.equal(h.preview().getState().filename,originalB);return true;});
+  assert.equal(saved.output[h.nodeId].inputs[h.input],h.native);assert.equal(saved.output[b.node_id].inputs[h.input],originalB);
+  assert.equal(saved.workflow.nodes[0].widgets_values[0],h.native);assert.equal(saved.workflow.nodes[1].widgets_values[0],originalB);
+  assert.equal(saved.workflow.definitions.subgraphs[0].nodes[0].widgets_values[0],h.native);
+  assert.equal(JSON.stringify(saved).includes('_receipt'),false);
+  assert.equal(JSON.stringify({workflow:saved.workflow,output:saved.output}).includes('refs/'),false);
+  assert.equal(h.first.widgets[0].value,h.connected);assert.equal(h.second.widgets[0].value,b.value);
+  assert.equal(h.preview().getState().filename,b.value);assert.equal(h.leaf.widgets[0].value,h.native);
+  assert.equal(calls.some(action=>/generate|prompt|queue|upload/i.test(action)),false);
+});
+
+test('official view notification replacement preserves receipts after fresh binding proof and restores the latest callbacks',async()=>{
+  const h=await fixture({shared:true,promoted:true,navigation:true}),b=secondBinding(h);
+  const captures=(await h.request('captureMedia',{bindings:[h.binding,b]})).result.captured;h.enter(h.first);
+  let added=0,removed=0;const onAdded=function(node){assert.equal(this,h.root);assert.equal(node,h.other);added++;return 'added';};
+  const onRemoved=function(node){assert.equal(this,h.root);assert.equal(node,h.other);removed++;return 'removed';};
+  h.root.onNodeAdded=onAdded;h.root.onNodeRemoved=onRemoved;
+  h.media().refreshPreview();assert.equal(h.preview().getState().filename,h.native);assert.equal(h.leaf.imgs,undefined);
+  assert.equal(h.root.onNodeAdded(h.other),'added');assert.equal(h.root.onNodeRemoved(h.other),'removed');assert.equal(added,1);assert.equal(removed,1);
+  const patch={node_id:b.node_id,widget_name:b.input,class_type:b.class_type,media_receipt:captures[1].receipt,value:b.value};
+  assert.equal((await h.request('patch',{patches:[patch]})).error,undefined);
+  h.enter(h.second);assert.equal(h.preview().getState().filename,b.value);
+  h.media().destroy();assert.equal(h.root.onNodeAdded,onAdded);assert.equal(h.root.onNodeRemoved,onRemoved);
+});
+
+for(const invalid of ['structure','readonly-callback','change-callback'])test(`notification renewal never conceals ${invalid} invalidation`,async()=>{
+  const h=await fixture({shared:true,promoted:true,navigation:true});await h.capture();h.enter(h.first);
+  if(invalid==='structure'){h.root.onNodeAdded=()=>{};h.first.widgets[0]={...h.first.widgets[0]};}
+  if(invalid==='readonly-callback')Object.defineProperty(h.root,'onNodeAdded',{value:()=>{},configurable:false});
+  if(invalid==='change-callback')h.root.onAfterChange=()=>{};
+  h.media().refreshPreview();assert.equal(h.preview().getState().status,'empty');
+  const current=(await h.request('compile')).result;assert.ok(current.controls.every(item=>!item.media_receipt));
+  assert.equal(h.leaf.widgets[0].value,h.native);
 });

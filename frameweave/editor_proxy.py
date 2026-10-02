@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .backend import local_url
@@ -30,6 +31,10 @@ WEBSOCKET_IDLE_TIMEOUT = 120
 WEBSOCKET_FRAME_BUFFER = 64 * 1024
 BRIDGE_PATH = "/prism-editor-bridge.js"
 BRIDGE_EXTENSION = BRIDGE_PATH
+MEDIA_MODULES = {
+    "/prism-editor-media.mjs": "native-editor-media.mjs",
+    "/prism-editor-media-preview.mjs": "editor-media-preview.mjs",
+}
 
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -49,6 +54,8 @@ _TASK_CONTROL_PATHS = {"/prompt", "/queue", "/interrupt", "/api/prompt", "/api/q
                       "/api/interrupt"}
 _ALWAYS_BLOCKED_PATHS = {"/interrupt", "/api/interrupt", "/upload/image", "/api/upload/image"}
 _SAFE_READ_ONLY_POST_PATHS = {"/manager/component/loads", "/api/manager/component/loads"}
+_EDITOR_SETTINGS_PATHS = {"/settings", "/api/settings", "/settings/Comfy.TutorialCompleted",
+                          "/api/settings/Comfy.TutorialCompleted"}
 _ENCODED_SEPARATOR = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
 _WEBSOCKET_KEY = re.compile(r"^[A-Za-z0-9+/]{22}==$|^[A-Za-z0-9+/]{23}=$")
 
@@ -101,17 +108,54 @@ def _inject_config(document, config):
     return "<head>" + snippet + "</head>" + document
 
 
+def _validate_query(parsed, decoded_path):
+    try:
+        fields = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("请求路径无效") from None
+    for name, value in fields:
+        for part in (name, value):
+            if (any(ord(ch) < 32 or ord(ch) == 127 for ch in part) or "\\" in part or
+                    re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|25|2e|2f|3a|5c|7f)", part, re.IGNORECASE)):
+                raise ValueError("请求路径无效")
+        if decoded_path in {"/view", "/api/view"} and name in {"filename", "subfolder"}:
+            # Current ComfyUI LoadImage also uses content-addressed assets.
+            # This is an identifier, not a drive path or an arbitrary scheme.
+            asset_hash = name == "filename" and re.fullmatch(r"blake3:[0-9a-f]{64}", value)
+            if (value.startswith("/") or (":" in value and not asset_hash) or
+                    any(segment.endswith((" ", ".")) for segment in value.split("/"))):
+                raise ValueError("请求路径无效")
+
+
 def _safe_target(target):
     if not isinstance(target, str) or len(target) > MAX_TARGET_LENGTH:
         raise ValueError("请求路径无效")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in target) or "\\" in target:
         raise ValueError("请求路径无效")
-    if _ENCODED_SEPARATOR.search(target):
-        raise ValueError("请求路径无效")
     parsed = urllib.parse.urlsplit(target)
     if parsed.scheme or parsed.netloc or parsed.fragment or not parsed.path.startswith("/"):
         raise ValueError("请求路径无效")
     if parsed.path.startswith("//"):
+        raise ValueError("请求路径无效")
+    for prefix in ("/userdata/", "/api/userdata/"):
+        if parsed.path.startswith(prefix):
+            if parsed.path == prefix:
+                _validate_query(parsed, prefix)
+                return parsed, prefix
+            try:
+                leaf = urllib.parse.unquote(parsed.path[len(prefix):], errors="strict")
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("请求路径无效") from None
+            # Frontend encodes the whole relative file, including directory slashes.
+            # Decode this leaf once only; it never changes the routing prefix.
+            if (not leaf or "%" in leaf or any(ch in leaf for ch in '\\:*?"<>|#') or
+                    any(ord(ch) < 32 or ord(ch) == 127 for ch in leaf) or
+                    any(part in {"", ".", ".."} or part.endswith((" ", "."))
+                        for part in leaf.split("/"))):
+                raise ValueError("请求路径无效")
+            _validate_query(parsed, prefix + leaf)
+            return parsed, prefix + leaf
+    if _ENCODED_SEPARATOR.search(parsed.path):
         raise ValueError("请求路径无效")
     decoded = parsed.path
     for _ in range(3):
@@ -121,10 +165,12 @@ def _safe_target(target):
             raise ValueError("请求路径无效") from None
         if (_ENCODED_SEPARATOR.search(decoded) or re.search(r"%2e", decoded, re.IGNORECASE) or
                 "\\" in decoded or decoded.startswith("//") or
-                any(part in {".", ".."} for part in decoded.split("/")) or "\x00" in decoded):
+                any(part in {".", ".."} for part in decoded.split("/")) or
+                any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded)):
             raise ValueError("请求路径无效")
         if "%" not in decoded:
             break
+    _validate_query(parsed, decoded)
     return parsed, decoded
 
 
@@ -332,6 +378,7 @@ class EditorProxy:
     def _proxy_http(self, handler, method, target):
         connection = None
         upstream_socket = None
+        editor_settings = urllib.parse.urlsplit(target).path in _EDITOR_SETTINGS_PATHS
         try:
             connection, upstream_socket = self._backend_connection()
             connection.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
@@ -339,6 +386,8 @@ class EditorProxy:
             connection.putheader("Accept-Encoding", "identity")
             connection.putheader("Connection", "close")
             for name in _REQUEST_HEADERS:
+                if editor_settings and name in {"If-None-Match", "If-Modified-Since", "If-Range", "Range"}:
+                    continue
                 value = handler.headers.get(name)
                 if value and "\r" not in value and "\n" not in value:
                     connection.putheader(name, value)
@@ -363,8 +412,16 @@ class EditorProxy:
                 body, content_type = self._inject_html(body, content_type)
             elif method == "GET" and urllib.parse.urlsplit(target).path in {"/extensions", "/api/extensions"}:
                 body, content_type = self._append_extension(body, content_type)
+            if method == "GET" and response.status == 200:
+                body, content_type = self._merge_session_settings(target, body, content_type)
+                body, content_type = self._editor_settings(target, body, content_type)
+            headers = response.getheaders()
+            if editor_settings:
+                headers = [(key, value) for key, value in headers
+                           if key.lower() not in {"etag", "last-modified", "cache-control", "expires"}]
+                headers.append(("Cache-Control", "no-store"))
             self._send_response(handler, response.status, body, content_type,
-                                response.getheaders(), head=(method == "HEAD"))
+                                headers, head=(method == "HEAD"))
         except (OSError, http.client.HTTPException, TimeoutError, ValueError) as exc:
             self._send_error(handler, 502, f"无法读取本机 ComfyUI：{str(exc)[:200]}")
         finally:
@@ -383,7 +440,8 @@ class EditorProxy:
         except (LookupError, UnicodeDecodeError):
             document = body.decode("utf-8", "replace")
             charset = "utf-8"
-        config = {"parentOrigin": self.parent_origin, "bridgeNonce": self.bridge_nonce}
+        config = {"parentOrigin": self.parent_origin, "bridgeNonce": self.bridge_nonce,
+                  "backendUrl": self.backend_url, "mediaProtocol": 1}
         injected = _inject_config(document, config).encode("utf-8")
         content_type = re.sub(r";\s*charset\s*=\s*[^;]+", "", content_type, flags=re.IGNORECASE)
         return injected, content_type + "; charset=utf-8"
@@ -435,14 +493,64 @@ class EditorProxy:
     def _session_key(self, category, path):
         return category, path
 
+    @staticmethod
+    def _editor_settings(target, body, content_type):
+        """Skip first-run onboarding only inside this document editor session."""
+        path = urllib.parse.urlsplit(target).path
+        if path in {"/settings/Comfy.TutorialCompleted", "/api/settings/Comfy.TutorialCompleted"}:
+            return b"true", "application/json; charset=utf-8"
+        if path not in {"/settings", "/api/settings"} or "json" not in content_type.lower():
+            return body, content_type
+        try:
+            settings = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body, content_type
+        if not isinstance(settings, dict):
+            return body, content_type
+        settings["Comfy.TutorialCompleted"] = True
+        return json.dumps(settings, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), content_type
+
     def _session_read(self, category, path):
+        if category == "settings" and path == "Comfy.TutorialCompleted":
+            return b"true", "application/json; charset=utf-8"
         with self._data_lock:
+            if category == "settings":
+                saved = self._session_data.get(self._session_key(category, ""))
+                if path and saved is not None:
+                    settings = json.loads(saved[0])
+                    if path in settings:
+                        return json.dumps(settings[path], ensure_ascii=False).encode("utf-8"), saved[1]
+                # Aggregate GET merges the session overlay with upstream defaults.
+                return None
             return self._session_data.get(self._session_key(category, path))
 
-    def _session_write(self, category, path, body, content_type):
-        key = self._session_key(category, path)
+    def _merge_session_settings(self, target, body, content_type):
+        if urllib.parse.urlsplit(target).path not in {"/settings", "/api/settings"}:
+            return body, content_type
+        if "json" not in content_type.lower():
+            return body, content_type
+        try:
+            settings = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body, content_type
+        if not isinstance(settings, dict):
+            return body, content_type
         with self._data_lock:
+            saved = self._session_data.get(self._session_key("settings", ""))
+            if saved is not None:
+                settings.update(json.loads(saved[0]))
+        return json.dumps(settings, ensure_ascii=False).encode("utf-8"), content_type
+
+    def _session_write(self, category, path, body, content_type):
+        with self._data_lock:
+            key = self._session_key(category, "" if category == "settings" else path)
             old = self._session_data.get(key)
+            if category == "settings":
+                value = json.loads(body)
+                settings = json.loads(old[0]) if old is not None else {}
+                settings.update({path: value} if path else value)
+                body = json.dumps(settings, ensure_ascii=False).encode("utf-8")
+                content_type = "application/json; charset=utf-8"
             old_size = len(old[0]) if old else 0
             if self._session_data_bytes - old_size + len(body) > MAX_SESSION_WRITE_BYTES:
                 raise ValueError("本会话临时数据超过 64 MiB 上限")
@@ -714,13 +822,27 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             body = self.proxy.bridge_script.encode("utf-8")
             self.proxy._send_response(self, 200, body, "application/javascript; charset=utf-8", ())
             return
-        if method == "GET" and decoded_path in {"/userdata", "/userdata/", "/api/userdata"}:
+        if decoded_path in MEDIA_MODULES:
+            if method != "GET":
+                self.proxy._send_error(self, 403, "媒体编辑模块只允许读取")
+                return
+            path = Path(__file__).resolve().parent.parent / "web" / MEDIA_MODULES[decoded_path]
+            try:
+                body = path.read_bytes()
+                if len(body) > MAX_REQUEST_BYTES:
+                    raise ValueError("媒体模块超过大小限制")
+            except (OSError, ValueError):
+                self.proxy._send_error(self, 503, "媒体编辑模块尚未可用")
+                return
+            self.proxy._send_response(self, 200, body, "application/javascript; charset=utf-8", ())
+            return
+        if method == "GET" and decoded_path in {"/userdata", "/userdata/", "/api/userdata", "/api/userdata/"}:
             self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
             return
         if method == "GET" and decoded_path == "/api/global_subgraphs":
             self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
             return
-        if method == "PUT" and self._is_session_write(decoded_path):
+        if method in {"POST", "PUT"} and self._is_session_write(decoded_path):
             self._session_write(decoded_path)
             return
         if method == "GET" and self._is_session_read(decoded_path):
@@ -728,9 +850,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             saved = self.proxy._session_read(category, key)
             if saved is not None:
                 body, content_type = saved
+                body, content_type = self.proxy._editor_settings(decoded_path, body, content_type)
                 if self.proxy._needs_css_type(self.path):
                     content_type = "text/css; charset=utf-8"
-                self.proxy._send_response(self, 200, body, content_type, ())
+                cache_headers = (("Cache-Control", "no-store"),) if decoded_path in _EDITOR_SETTINGS_PATHS else ()
+                self.proxy._send_response(self, 200, body, content_type, cache_headers)
                 return
         if method == "POST" and decoded_path in _SAFE_READ_ONLY_POST_PATHS:
             content_lengths = self.headers.get_all("Content-Length", [])
@@ -774,6 +898,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             content_type = self.headers.get("Content-Type", "application/octet-stream")
+            if category == "settings":
+                try:
+                    value = json.loads(body)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.proxy._send_error(self, 400, "设置必须是有效 JSON")
+                    return
+                if not key and not isinstance(value, dict):
+                    self.proxy._send_error(self, 400, "完整设置必须是 JSON 对象")
+                    return
             if self.proxy._needs_css_type(self.path):
                 content_type = "text/css; charset=utf-8"
             self.proxy._session_write(category, key, body, content_type)

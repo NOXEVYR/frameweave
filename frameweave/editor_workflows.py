@@ -14,6 +14,7 @@ import secrets
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .packages import normalize_prompt
@@ -28,31 +29,38 @@ ID_PATTERN = re.compile(r"e-[0-9a-f]{24}\Z")
 REVISION_PATTERN = re.compile(r"revision-([0-9]{8})\.json\Z")
 
 
+class _JSONContractError(ValueError):
+    """A safe parser diagnostic, without source text or user field values."""
+
+
 def _pairs_no_duplicates(items):
     value = {}
     for key, item in items:
         if key in value:
-            raise ValueError("JSON 不能包含重复键")
+            raise _JSONContractError("JSON 不能包含重复键")
         value[key] = item
     return value
 
 
 def _parse_integer(token):
-    value = int(token)
+    try:
+        value = int(token)
+    except ValueError:
+        raise _JSONContractError("JSON 整数位数超出解析上限") from None
     if abs(value) > MAX_SAFE_INTEGER:
-        raise ValueError("JSON 整数超过浏览器的精确范围")
+        raise _JSONContractError("JSON 整数超过浏览器的精确范围（绝对值不能超过 9007199254740991）")
     return value
 
 
 def _parse_float(token):
     value = float(token)
     if not math.isfinite(value):
-        raise ValueError("JSON 数字必须有限")
+        raise _JSONContractError("JSON 数字必须有限，不能使用 NaN 或 Infinity")
     return value
 
 
 def _reject_constant(_token):
-    raise ValueError("JSON 数字必须有限")
+    raise _JSONContractError("JSON 数字必须有限，不能使用 NaN 或 Infinity")
 
 
 def _walk_json(value):
@@ -126,7 +134,11 @@ def _parse_document(source):
                               object_pairs_hook=_pairs_no_duplicates,
                               parse_int=_parse_integer, parse_float=_parse_float,
                               parse_constant=_reject_constant)
-    except (json.JSONDecodeError, TypeError, ValueError, OverflowError,
+    except _JSONContractError as exc:
+        raise ValueError(f"ComfyUI 工作流无法导入：{exc}；请从原工具修复或重新导出，原文件未修改") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ComfyUI 工作流 JSON 语法错误（第 {exc.lineno} 行，第 {exc.colno} 列）；请检查该位置后重新导入，原文件未修改") from None
+    except (TypeError, ValueError, OverflowError,
             UnicodeError, RecursionError):
         raise ValueError("ComfyUI 工作流 JSON 无效或嵌套过深") from None
     _validate_document(document)
@@ -341,7 +353,9 @@ class EditorWorkflowStore:
                     or not math.isfinite(data["updated_at"])
                     or data["updated_at"] <= 0):
                 raise ValueError("compiled prompt 元数据无效")
-            prompt = normalize_prompt(data.get("prompt"))
+            # This is the saved full editor graph. Validate dependency closure only
+            # for selected outputs at execution; unfinished islands remain editable.
+            prompt = normalize_prompt(data.get("prompt"), check_dependencies=False)
             return {"prompt": prompt, "revision": revision,
                     "updated_at": data["updated_at"]}
         except (OSError, json.JSONDecodeError, TypeError, ValueError,
@@ -514,7 +528,7 @@ class EditorWorkflowStore:
         raw = _encode_document(document)
         normalized_prompt = None
         if prompt not in (None, {}):
-            normalized_prompt = normalize_prompt(prompt)
+            normalized_prompt = normalize_prompt(prompt, check_dependencies=False)
         with self.lock:
             record_dir = self._record_dir(workflow_id)
             if not record_dir.is_dir():
@@ -546,6 +560,48 @@ class EditorWorkflowStore:
                 compiled_updated_at=compiled_updated_at)
             self._write_atomic(record_dir / "meta.json", _json_bytes(new_meta))
             return self._summary(new_meta, document)
+
+    @contextmanager
+    def revision_transaction(self, workflow_id, document, prompt=None):
+        """Restore exact visible metadata if a coordinated package publish fails.
+
+        Revision/compiled files remain immutable, including unreferenced failed
+        attempts. This is an exception transaction for one locked service, not a
+        crash-atomic transaction across both stores.
+        """
+        with self.lock:
+            record_dir = self._record_dir(workflow_id)
+            self._read_meta(record_dir, workflow_id)
+            meta_path = self._safe_file(record_dir, Path('meta.json'))
+            original = meta_path.read_bytes()
+            backup = None
+            keep_backup = False
+            try:
+                with tempfile.NamedTemporaryFile('wb', prefix='.apply-meta-', suffix='.backup',
+                                                 dir=record_dir, delete=False) as stream:
+                    backup = Path(stream.name)
+                    stream.write(original)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    revision = self.save_revision(workflow_id, document, prompt)
+                    yield revision
+                except BaseException as apply_error:
+                    try:
+                        if meta_path.read_bytes() != original:
+                            os.replace(backup, meta_path)
+                    except OSError as rollback_error:
+                        keep_backup = True
+                        raise OSError(
+                            f'工作流应用失败（{apply_error}）；恢复原revision也失败（{rollback_error}）。'
+                            f'原meta完整备份已保留：{backup}；请停止写入并恢复该备份') from apply_error
+                    raise
+            finally:
+                if backup is not None and not keep_backup:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def get_compiled(self, workflow_id):
         with self.lock:

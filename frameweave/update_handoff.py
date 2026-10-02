@@ -22,8 +22,12 @@ import subprocess
 import tempfile
 import time
 import uuid
+import secrets
+import sys
 
-from .instance import InstanceLock
+from . import __version__
+from .instance import InstanceLock, _FileLock
+from .updates import compare_versions
 
 
 MAX_PLAN_BYTES = 1024 * 1024
@@ -45,6 +49,8 @@ def launch_handoff(current_exe, data_dir, staged, port, open_browser=True):
     if not current_exe.is_file() or current_exe.suffix.lower() != ".exe":
         raise ValueError("当前程序文件不可用")
     _validate_staged(staged, data_dir=data_dir)
+    if compare_versions(staged["version"], __version__) <= 0:
+        raise ValueError("更新版本必须严格高于当前版本")
     port = _port(port)
     if type(open_browser) is not bool:
         raise ValueError("窗口启动选项无效")
@@ -61,7 +67,11 @@ def launch_handoff(current_exe, data_dir, staged, port, open_browser=True):
         "helper_exe": str(helper),
         "result_path": str(result_path),
         "current_exe": str(current_exe),
-        "install_base": str(current_exe.parent.parent),
+        "install_base": str(_install_base(current_exe)),
+        "current_version": __version__,
+        "current_sha256": _sha256_file(current_exe),
+        "candidate_nonce": secrets.token_hex(32),
+        "old_processes": _owned_processes(current_exe),
         "data_dir": str(data_dir),
         "staged": staged,
         "port": port,
@@ -78,156 +88,186 @@ def launch_handoff(current_exe, data_dir, staged, port, open_browser=True):
 
 
 def run_handoff(plan_path, *, lock_factory=None, prepare_install_fn=None,
-                spawn=None, probe_fn=None, port_in_use_fn=None,
-                shortcut_fn=None, restore_shortcuts_fn=None, sleep_fn=None, monotonic_fn=None,
+                spawn=None, probe_fn=None, port_in_use_fn=None, metadata_fn=None,
+                process_wait_fn=None, shortcut_fn=None, restore_shortcuts_fn=None,
+                sleep_fn=None, monotonic_fn=None,
                 health_timeout=HEALTH_WAIT_SECONDS, lock_timeout=LOCK_WAIT_SECONDS):
-    """Execute one helper plan and write its private result JSON.
+    """Execute one durable transaction. Interrupted launches are never repeated.
 
-    Dependencies are keyword-injectable for isolated tests. No failure path
-    terminates an unverified listener or any process it did not start.
+    Probe and process dependencies remain injectable; no path kills a process.
+    A transaction journal stores phases before mutations, without CSRF tokens.
     """
     lock_factory = lock_factory or InstanceLock
     if prepare_install_fn is None:
         from .update_install import prepare_install as prepare_install_fn
     spawn = spawn or subprocess.Popen
     probe_fn = probe_fn or _probe_candidate
+    metadata_fn = metadata_fn or _read_instance_metadata
+    process_wait_fn = process_wait_fn or _wait_owned_processes
     port_in_use_fn = port_in_use_fn or _port_in_use
     shortcut_fn = shortcut_fn or update_desktop_shortcuts
     restore_shortcuts_fn = restore_shortcuts_fn or restore_desktop_shortcuts
     sleep_fn = sleep_fn or time.sleep
     monotonic_fn = monotonic_fn or time.monotonic
-
-    result_path = None
-    lock = None
-    lock_acquired = False
-    candidate_process = None
     plan = None
-    result = {"state": "failed", "message": "更新交接未完成"}
+    result_path = None
+    journal_path = None
+    transaction_lock = None
+    lock = None
+    candidate_process = None
+    old_recovery_attempted = False
+    ready_for_recovery = False
+    journal = {}
+
+    def phase(name, **details):
+        journal.update(details)
+        journal["phase"] = name
+        _write_json_atomic(journal_path, journal)
+
+    def finish(state, message, **details):
+        result = {"state": state, "version": plan["staged"]["version"],
+                  "message": message, **details}
+        phase("finished", result=result)
+        return _finish(result_path, result)
+
+    def identity(payload, version, executable, nonce=None):
+        try:
+            metadata = metadata_fn(Path(plan["data_dir"]))
+            return _bound_identity(payload, metadata, version, executable,
+                                   plan["data_dir"], plan["port"], nonce)
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def wait_healthy(version, executable, nonce=None):
+        return _wait_for_candidate(
+            plan["port"], version, probe_fn, health_timeout,
+            sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
+            identity_fn=lambda payload: identity(payload, version, executable, nonce),
+        )
+
+    def recover(state, message):
+        nonlocal lock, old_recovery_attempted
+        if old_recovery_attempted:
+            return finish("recovery-unverified", "原版本重启已经尝试，未重复启动")
+        # One-file bootloader parents can outlive the Python service. Waiting
+        # for the exact Popen handle plus the data lock prevents overlapping it.
+        if candidate_process is not None and not _process_exited(candidate_process):
+            return finish("candidate-unverified", "候选进程尚未确认退出，未启动原版本")
+        if lock is None:
+            lock = _wait_for_lock(plan["data_dir"], lock_factory, lock_timeout,
+                                  sleep_fn=sleep_fn, monotonic_fn=monotonic_fn)
+        if lock is None or _safe_port_in_use(port_in_use_fn, plan["port"]):
+            return finish("recovery-blocked", "实例或端口状态不明，未启动原版本")
+        if _sha256_file(plan["current_exe"]) != plan["current_sha256"]:
+            return finish("recovery-blocked", "原程序发生变化，未启动未经核验的文件")
+        phase("recovering-old")
+        lock.release()
+        lock = None
+        old_recovery_attempted = True
+        _spawn_candidate(plan["current_exe"], plan["data_dir"], plan["port"],
+                         plan["open_browser"], Path(plan["data_dir"]) / "updates" /
+                         "previous-version-recovery.log", spawn)
+        if wait_healthy(plan["current_version"], plan["current_exe"]) is None:
+            return finish("recovery-unverified", "已尝试重启原版本，但尚未核验其服务和实例身份")
+        return finish(state, message)
+
     try:
         plan = _read_plan(plan_path)
         result_path = Path(plan["result_path"])
+        journal_path = result_path.with_name(result_path.name.replace(".result.json", ".transaction.json"))
+        transaction_lock = _FileLock(journal_path.with_suffix(".lock"))
+        if not transaction_lock.acquire():
+            return {"state": "transaction-busy", "message": "该更新交接正在执行"}
+        if journal_path.exists():
+            previous = _read_private_json(journal_path)
+            if previous.get("phase") == "finished" and isinstance(previous.get("result"), dict):
+                return _finish(result_path, previous["result"])
+            # A crash may have occurred after spawn or shortcut mutation. Keep
+            # the evidence for explicit recovery instead of replaying commands.
+            return _finish(result_path, {"state": "transaction-interrupted",
+                           "version": plan["staged"]["version"],
+                           "message": "上次交接中断，已保留阶段记录；未重复启动或切换快捷方式"})
+        journal = {"handoff_id": Path(plan_path).stem, "candidate_version": plan["staged"]["version"],
+                   "previous_version": plan["current_version"], "previous_exe": plan["current_exe"],
+                   "previous_sha256": plan["current_sha256"]}
+        phase("waiting-old")
         lock = _wait_for_lock(plan["data_dir"], lock_factory, lock_timeout,
                               sleep_fn=sleep_fn, monotonic_fn=monotonic_fn)
         if lock is None:
-            result = {"state": "instance-busy", "version": plan["staged"]["version"],
-                      "message": "棱光仍在运行，更新尚未切换"}
-            return _finish(result_path, result)
-        lock_acquired = True
-
+            return finish("instance-busy", "棱光仍在运行，更新尚未切换")
+        if not process_wait_fn(plan["old_processes"], lock_timeout,
+                               sleep_fn=sleep_fn, monotonic_fn=monotonic_fn):
+            return finish("instance-busy", "原版本进程尚未完全退出，未安装候选程序")
         if _safe_port_in_use(port_in_use_fn, plan["port"]):
-            result = {"state": "port-occupied", "version": plan["staged"]["version"],
-                      "message": "目标端口已有服务，未安装或启动候选程序"}
-            return _finish(result_path, result)
+            return finish("port-occupied", "目标端口已有服务，未安装或启动候选程序")
+        ready_for_recovery = True
+        phase("preparing")
         prepared = prepare_install_fn(plan["staged"], plan["install_base"], plan["current_exe"])
         candidate = _validate_prepared(prepared, plan)
+        phase("prepared", candidate_exe=candidate["path"], candidate_sha256=prepared["sha256"])
         if _safe_port_in_use(port_in_use_fn, plan["port"]):
-            result = {"state": "port-occupied", "version": candidate["version"],
-                      "message": "目标端口已有服务，未启动候选程序"}
-            return _finish(result_path, result)
-
-        # Hold the instance lock through extraction and release immediately
-        # before spawn, preventing an old client from entering during install.
+            return finish("port-occupied", "目标端口已有服务，未启动候选程序")
+        phase("launching-candidate")
         lock.release()
         lock = None
         candidate_process = _spawn_candidate(
             candidate["path"], plan["data_dir"], plan["port"], plan["open_browser"],
             Path(plan["data_dir"]) / "updates" / f"candidate-{candidate['version']}.log", spawn,
+            nonce=plan["candidate_nonce"],
         )
-        healthy = _wait_for_candidate(
-            plan["port"], candidate["version"], probe_fn, health_timeout,
-            sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
-        )
+        phase("checking-candidate")
+        healthy = wait_healthy(candidate["version"], candidate["path"], plan["candidate_nonce"])
         if healthy is None:
-            if _process_exited(candidate_process) and not port_in_use_fn(plan["port"]):
-                _spawn_candidate(plan["current_exe"], plan["data_dir"], plan["port"],
-                                 plan["open_browser"],
-                                 Path(plan["data_dir"]) / "updates" / "previous-version-recovery.log", spawn)
-                state = "recovered-old-version"
-                message = "候选程序未通过启动检查，已在端口空闲后启动原版本"
-            else:
-                state = "candidate-unverified"
-                message = "未能确认候选程序身份；为避免影响其他服务，没有关闭或重启任何监听进程"
-            result = {"state": state, "version": candidate["version"], "message": message}
-            return _finish(result_path, result)
-
+            return recover("recovered-old-version", "候选检查失败，已核验原版本恢复")
+        phase("switching-shortcuts")
         try:
             shortcut_result = shortcut_fn(
                 plan["current_exe"], candidate["path"], candidate["version"],
                 backup_dir=Path(plan["data_dir"]) / "updates" / "shortcut-backups",
             )
         except Exception:
-            # Rollback is allowed only after a fresh identity check proves the
-            # server is this exact candidate and returns its in-memory token.
-            stopped = (False if _process_exited(candidate_process) else _shutdown_confirmed_candidate(
+            stopped = _shutdown_confirmed_candidate(
                 plan["port"], candidate["version"], healthy.get("csrf"),
                 probe_fn=probe_fn, port_in_use_fn=port_in_use_fn,
                 sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
-            ))
+                identity_fn=lambda payload: identity(payload, candidate["version"],
+                                                     candidate["path"], plan["candidate_nonce"]),
+            )
             if stopped:
-                _spawn_candidate(plan["current_exe"], plan["data_dir"], plan["port"],
-                                 plan["open_browser"],
-                                 Path(plan["data_dir"]) / "updates" / "previous-version-rollback.log", spawn)
-                result = {"state": "rolled-back", "version": candidate["version"],
-                          "message": "快捷方式切换失败，已确认关闭候选服务并恢复原版本"}
-            else:
-                result = {"state": "shortcut-failed", "version": candidate["version"],
-                          "message": "候选程序已通过检查，但快捷方式切换失败；未关闭身份无法确认的服务"}
-            return _finish(result_path, result)
-
+                _wait_process_exit(candidate_process, SHUTDOWN_WAIT_SECONDS, sleep_fn, monotonic_fn)
+                return recover("rolled-back", "快捷方式切换失败，已核验原版本回退")
+            return finish("shortcut-failed", "候选服务已核验，但快捷方式切换失败；未关闭身份不明的进程")
+        backups = list(shortcut_result.get("backups", []))[:64]
+        phase("checking-after-shortcuts", shortcut_backups=backups)
         final_health = probe_fn(plan["port"], candidate["version"])
-        if not _candidate_identity(final_health, candidate["version"]):
-            restored = 0
-            restore_error = False
+        if (not identity(final_health, candidate["version"], candidate["path"], plan["candidate_nonce"])
+                or not hmac.compare_digest(final_health["csrf"], healthy["csrf"])):
+            phase("restoring-shortcuts")
             try:
-                restored = restore_shortcuts_fn(
-                    shortcut_result.get("backups", []),
-                    backup_dir=Path(plan["data_dir"]) / "updates" / "shortcut-backups",
-                ).get("restored", 0)
+                restored = restore_shortcuts_fn(backups, backup_dir=Path(plan["data_dir"]) /
+                                                "updates" / "shortcut-backups").get("restored", 0)
+                phase("shortcuts-restored", shortcuts_restored=restored)
             except Exception:
-                restore_error = True
-            if _process_exited(candidate_process) and not _safe_port_in_use(port_in_use_fn, plan["port"]):
-                _spawn_candidate(plan["current_exe"], plan["data_dir"], plan["port"],
-                                 plan["open_browser"],
-                                 Path(plan["data_dir"]) / "updates" / "previous-version-recovery.log", spawn)
-                result = {"state": "recovered-old-version", "version": candidate["version"],
-                          "message": "候选程序在快捷方式切换后退出，已在端口空闲后恢复原版本",
-                          "shortcuts_restored": restored}
-            else:
-                result = {"state": "candidate-unverified", "version": candidate["version"],
-                          "message": "候选程序二次检查未通过；未关闭身份无法确认的服务",
-                          "shortcuts_restored": restored, "shortcut_restore_failed": restore_error}
-            return _finish(result_path, result)
-
-        result = {"state": "installed", "version": candidate["version"],
-                  "message": "候选程序通过启动检查", "shortcuts_updated": int(shortcut_result.get("updated", 0)),
-                  "shortcut_backups": list(shortcut_result.get("backups", []))[:64]}
-        return _finish(result_path, result)
+                return finish("shortcut-restore-failed", "候选二次检查失败，快捷方式恢复未完成；未启动原版本")
+            return recover("recovered-old-version", "候选在切换后退出，已核验原版本恢复")
+        return finish("installed", "候选程序及同一数据目录的实例身份已通过检查",
+                      shortcuts_updated=int(shortcut_result.get("updated", 0)), shortcut_backups=backups)
     except Exception as exc:
-        if lock is not None:
-            lock.release()
-            lock = None
-        message = _safe_error(exc)
-        if (plan is not None and lock_acquired and candidate_process is None
-                and not _safe_port_in_use(port_in_use_fn, plan["port"])):
+        if plan is not None and journal_path is not None:
             try:
-                _spawn_candidate(plan["current_exe"], plan["data_dir"], plan["port"],
-                                 plan["open_browser"],
-                                 Path(plan["data_dir"]) / "updates" / "previous-version-recovery.log", spawn)
-                result = {"state": "recovered-old-version", "version": plan["staged"]["version"],
-                          "message": "更新准备失败，已在端口空闲后重新启动原版本"}
-            except Exception:
-                result = {"state": "failed", "version": plan.get("staged", {}).get("version"),
-                          "message": message}
-        else:
-            result = {"state": "failed", "version": (plan or {}).get("staged", {}).get("version"),
-                      "message": message}
-        return _finish(result_path, result)
-    finally:
-        if lock is not None:
-            try:
-                lock.release()
+                if ready_for_recovery and candidate_process is None and not old_recovery_attempted:
+                    return recover("recovered-old-version", "更新准备失败，已核验原版本恢复")
+                return finish("failed", _safe_error(exc))
             except Exception:
                 pass
+        return {"state": "failed", "message": "更新交接失败，已保留已有程序与事务记录"}
+    finally:
+        for held in (lock, transaction_lock):
+            if held is not None:
+                try:
+                    held.release()
+                except Exception:
+                    pass
 
 
 def update_desktop_shortcuts(old_exe, new_exe, version, *, backup_dir=None, runner=None):
@@ -438,8 +478,25 @@ def _read_plan(plan_path):
         raise ValueError("更新计划中的辅助程序路径无效")
     if Path(plan["current_exe"]).suffix.lower() != ".exe" or not Path(plan["current_exe"]).is_file():
         raise ValueError("原程序文件不可用")
-    if Path(plan["install_base"]).resolve() != Path(plan["current_exe"]).parent.parent.resolve():
+    if Path(plan["install_base"]).resolve() != _install_base(Path(plan["current_exe"])):
         raise ValueError("安装目录与原程序不匹配")
+    if not isinstance(plan.get("current_version"), str) or not _VERSION.fullmatch(plan["current_version"]):
+        raise ValueError("原版本身份缺失")
+    if compare_versions(plan["staged"].get("version"), plan["current_version"]) <= 0:
+        raise ValueError("更新版本必须严格高于原版本")
+    if (not isinstance(plan.get("current_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", plan["current_sha256"])
+            or _sha256_file(plan["current_exe"]) != plan["current_sha256"]):
+        raise ValueError("原程序与交接记录不一致")
+    if not isinstance(plan.get("candidate_nonce"), str) or not re.fullmatch(r"[0-9a-f]{64}", plan["candidate_nonce"]):
+        raise ValueError("候选启动身份缺失")
+    if not isinstance(plan.get("old_processes"), list) or len(plan["old_processes"]) > 2:
+        raise ValueError("原版本进程记录无效")
+    for process in plan["old_processes"]:
+        if (not isinstance(process, dict) or type(process.get("pid")) is not int or process["pid"] < 1
+                or type(process.get("created")) is not int or process["created"] < 1
+                or process.get("executable") != str(Path(plan["current_exe"]).resolve())):
+            raise ValueError("原版本进程记录无效")
     plan["port"] = _port(plan.get("port"))
     if type(plan.get("open_browser")) is not bool:
         raise ValueError("窗口启动选项无效")
@@ -486,6 +543,8 @@ def _validate_prepared(prepared, plan):
         raise ValueError("候选程序 SHA-256 无效")
     if _sha256_file(path).lower() != digest.lower():
         raise ValueError("候选程序 SHA-256 校验失败")
+    if size != plan["staged"]["exe_bytes"] or digest.lower() != plan["staged"]["exe_sha256"].lower():
+        raise ValueError("候选程序与暂存发布清单不一致")
     if path.resolve() == Path(plan["current_exe"]).resolve():
         raise ValueError("候选程序路径仍指向当前版本")
     expected = Path(plan["install_base"]).resolve() / f"PrismCanvas-{version}" / "PrismCanvas.exe"
@@ -507,13 +566,13 @@ def _wait_for_lock(data_dir, lock_factory, timeout, *, sleep_fn, monotonic_fn):
         sleep_fn(min(0.1, max(0.01, deadline - monotonic_fn())))
 
 
-def _wait_for_candidate(port, version, probe_fn, timeout, *, sleep_fn, monotonic_fn):
+def _wait_for_candidate(port, version, probe_fn, timeout, *, sleep_fn, monotonic_fn, identity_fn=None):
     if not isinstance(timeout, (int, float)) or timeout < 0 or timeout > 180:
         raise ValueError("候选程序检查时限无效")
     deadline = monotonic_fn() + timeout
     while True:
         response = probe_fn(port, version)
-        if _candidate_identity(response, version):
+        if (identity_fn(response) if identity_fn else _candidate_identity(response, version)):
             return response
         if monotonic_fn() >= deadline:
             return None
@@ -552,19 +611,153 @@ def _candidate_identity(payload, version):
             and bool(_CSRF.fullmatch(payload["csrf"])))
 
 
+def _read_private_json(path):
+    path = Path(path)
+    if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
+        raise ValueError("本地身份记录不是普通文件")
+    if path.stat().st_size > MAX_PLAN_BYTES:
+        raise ValueError("本地身份记录过大")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("本地身份记录无效")
+    return payload
+
+
+def _read_instance_metadata(data_dir):
+    return _read_private_json(Path(data_dir) / "instance.json")
+
+
+def _bound_identity(payload, metadata, version, executable, data_dir, port, nonce):
+    """Bind bootstrap to the lock owner's durable record and launch request."""
+    if not _candidate_identity(payload, version) or not isinstance(metadata, dict):
+        return False
+    instance = payload.get("instance")
+    if not isinstance(instance, dict) or not isinstance(metadata.get("instance"), dict):
+        return False
+    if instance != metadata["instance"] or metadata.get("version") != version:
+        return False
+    if (type(instance.get("pid")) is not int or instance["pid"] < 1
+            or metadata.get("pid") != instance["pid"]
+            or metadata.get("url") != f"http://127.0.0.1:{port}/"):
+        return False
+    try:
+        if (_local_path(instance.get("executable"), "实例程序").resolve() != Path(executable).resolve()
+                or _local_path(instance.get("data_dir"), "实例数据目录").resolve() != Path(data_dir).resolve()):
+            return False
+    except (ValueError, OSError):
+        return False
+    if nonce is not None:
+        return (isinstance(instance.get("nonce"), str)
+                and hmac.compare_digest(instance["nonce"], nonce))
+    # Rollback receives no new nonce, but its process must have independently
+    # published the matching executable/data-dir identity after acquiring lock.
+    return True
+
+
+def _install_base(executable):
+    executable = Path(executable).resolve()
+    parent = executable.parent
+    if re.fullmatch(r"(?:PrismCanvas-)?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", parent.name):
+        return parent.parent
+    return parent
+
+
+def _native_process_identity(pid):
+    """Read a Windows process's creation time/image; never terminate it."""
+    if os.name != "nt":
+        raise OSError("进程身份检查只支持 Windows EXE 交接")
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: process is gone.
+            return None
+        raise OSError(error, "无法核验原版本进程身份")
+    try:
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise OSError("无法核验原版本进程状态")
+        if code.value != 259:
+            return None
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in (created, exited, system, user))):
+            raise OSError("无法核验原版本进程创建时间")
+        capacity = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(capacity.value)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(capacity)):
+            raise OSError("无法核验原版本程序路径")
+        return {"pid": pid, "created": (created.dwHighDateTime << 32) | created.dwLowDateTime,
+                "executable": str(Path(image.value).resolve())}
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _owned_processes(executable):
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return []
+    own = _native_process_identity(os.getpid())
+    if own is None or Path(own["executable"]) != Path(executable).resolve():
+        raise ValueError("当前 EXE 与运行进程不一致")
+    result = [own]
+    # PyInstaller one-file bootloader uses a second parent with the same image.
+    parent = _native_process_identity(os.getppid())
+    if parent is not None and Path(parent["executable"]) == Path(own["executable"]):
+        result.append(parent)
+    for process in result:
+        process["executable"] = str(Path(executable).resolve())
+    return result
+
+
+def _wait_owned_processes(processes, timeout, *, sleep_fn, monotonic_fn):
+    deadline = monotonic_fn() + timeout
+    while True:
+        try:
+            alive = False
+            for expected in processes:
+                current = _native_process_identity(expected["pid"])
+                if (current is not None and current["created"] == expected["created"]
+                        and Path(current["executable"]) == Path(expected["executable"])):
+                    alive = True
+        except OSError:
+            return False
+        if not alive:
+            return True
+        if monotonic_fn() >= deadline:
+            return False
+        sleep_fn(0.1)
+
+
+def _wait_process_exit(process, timeout, sleep_fn, monotonic_fn):
+    deadline = monotonic_fn() + timeout
+    while not _process_exited(process):
+        if monotonic_fn() >= deadline:
+            return False
+        sleep_fn(0.1)
+    return True
+
+
 def _shutdown_confirmed_candidate(port, version, csrf, *, probe_fn, port_in_use_fn,
-                                  sleep_fn, monotonic_fn):
+                                  sleep_fn, monotonic_fn, identity_fn=None):
     """Shutdown only the exact healthy candidate whose token was just observed."""
     if not isinstance(csrf, str) or not _CSRF.fullmatch(csrf):
         return False
     current = probe_fn(port, version)
-    if (not _candidate_identity(current, version)
+    if (not (identity_fn(current) if identity_fn else _candidate_identity(current, version))
             or not hmac.compare_digest(current["csrf"], csrf)):
         return False
     if not _post_shutdown(port, csrf):
         return False
     deadline = monotonic_fn() + SHUTDOWN_WAIT_SECONDS
-    while port_in_use_fn(port):
+    while _safe_port_in_use(port_in_use_fn, port):
         if monotonic_fn() >= deadline:
             return False
         sleep_fn(0.1)
@@ -608,7 +801,7 @@ def _safe_port_in_use(port_in_use_fn, port):
         return True
 
 
-def _spawn_candidate(executable, data_dir, port, open_browser, log_path, spawn):
+def _spawn_candidate(executable, data_dir, port, open_browser, log_path, spawn, *, nonce=None):
     executable = str(Path(executable))
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     arguments = [executable, "--data-dir", str(data_dir), "--port", str(port)]
@@ -622,6 +815,9 @@ def _spawn_candidate(executable, data_dir, port, open_browser, log_path, spawn):
     if os.name != "nt":
         options["start_new_session"] = True
     options["env"] = _pyinstaller_environment()
+    options["env"].pop("PRISMCANVAS_UPDATE_NONCE", None)
+    if nonce is not None:
+        options["env"]["PRISMCANVAS_UPDATE_NONCE"] = nonce
     with Path(log_path).open("ab", buffering=0) as stream:
         options["stdout"] = stream
         return spawn(arguments, **options)
@@ -651,6 +847,8 @@ def _copy_current_exe(source, destination):
             os.fsync(writer.fileno())
         if Path(source).stat().st_size != temporary.stat().st_size:
             raise OSError("辅助程序复制后大小不一致")
+        if _sha256_file(source) != _sha256_file(temporary):
+            raise OSError("辅助程序复制后 SHA-256 不一致")
         os.replace(temporary, destination)
     except Exception:
         try:
@@ -718,7 +916,7 @@ def _process_exited(process):
     try:
         return process.poll() is not None
     except (AttributeError, OSError, ValueError):
-        return True
+        return False
 
 
 def _sha256_file(path):

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 
-from .workflows import _expanded_inputs, _input_fields, _spec, _type_names, validate_prompt
+from .media_contract import MEDIA_TYPES
+from .workflows import _expanded_inputs, _input_fields, _spec, _type_names, validate_editor_prompt
 
 
 def _audio_output_inputs(object_info):
@@ -30,48 +31,23 @@ def _audio_output_inputs(object_info):
     return sorted(result, key=lambda item: (item["class_type"].casefold(), item["input"].casefold()))
 
 
-def _allow_empty_upload_fields(package, prompt, object_info):
-    """Let schema validation accept blank upload placeholders, without loosening other fields."""
+def _pending_upload_fields(package, prompt):
+    """Identify only explicitly exposed, empty media-upload placeholders."""
     fields = package.get("fields", [])
     if not isinstance(fields, list):
-        return
-    cloned_schema_types = set()
+        return set()
+    pending = set()
     for field in fields:
-        if not isinstance(field, dict) or field.get("type") not in {"audio", "image"}:
+        if not isinstance(field, dict) or field.get("type") not in MEDIA_TYPES:
             continue
         node_id, input_name = field.get("node_id"), field.get("input")
         node = prompt.get(node_id) if isinstance(node_id, str) else None
         if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
             continue
-        if not isinstance(input_name, str) or node["inputs"].get(input_name) not in ("", None):
+        if not isinstance(input_name, str) or node["inputs"].get(input_name) != "":
             continue
-        class_type = node.get("class_type")
-        if not isinstance(class_type, str):
-            continue
-        if class_type not in cloned_schema_types:
-            original = object_info.get(class_type)
-            if not isinstance(original, dict):
-                continue
-            object_info[class_type] = copy.deepcopy(original)
-            cloned_schema_types.add(class_type)
-        schema = object_info.get(class_type, {})
-        inputs = schema.get("input", {}) if isinstance(schema, dict) else {}
-        for group in ("required", "optional"):
-            definitions = inputs.get(group, {}) if isinstance(inputs, dict) else {}
-            definition = definitions.get(input_name) if isinstance(definitions, dict) else None
-            if not isinstance(definition, list) or not definition:
-                continue
-            kind = definition[0]
-            if isinstance(kind, list):
-                if "" not in kind:
-                    kind.append("")
-                break
-            if kind in {"COMBO", "COMFY_DYNAMICCOMBO_V3"} and len(definition) > 1:
-                meta = definition[1]
-                choices = meta.get("options") if isinstance(meta, dict) else None
-                if isinstance(choices, list) and "" not in choices:
-                    choices.append("")
-                break
+        pending.add((node_id, input_name, field["type"]))
+    return pending
 
 
 def _package_audio_outputs(package, object_info, output_schemas):
@@ -79,11 +55,14 @@ def _package_audio_outputs(package, object_info, output_schemas):
     if not isinstance(source_prompt, dict) or not source_prompt:
         return False, [], ["工作流包没有可校验的 API 图"]
     prompt = copy.deepcopy(source_prompt)
-    schema = object_info.copy()
-    _allow_empty_upload_fields(package, prompt, schema)
     try:
-        validate_prompt(prompt, schema)
+        readiness = validate_editor_prompt(prompt, object_info)
     except (TypeError, ValueError):
+        return False, [], ["节点或参数与当前后端定义不兼容"]
+    pending = _pending_upload_fields(package, prompt)
+    if any(issue.get("code") != "missing_media" or
+           (issue.get("node_id"), issue.get("input"), issue.get("resource_type")) not in pending
+           for issue in readiness["issues"]):
         return False, [], ["节点或参数与当前后端定义不兼容"]
 
     output_fields = {(item["class_type"], item["input"]) for item in output_schemas}

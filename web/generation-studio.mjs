@@ -1,12 +1,24 @@
-import { liveProgressText } from './job-progress.mjs';
-import { progressPercent } from './graph.mjs';
+import { elapsedText, updateLiveProgress } from './job-progress.mjs';
+import { isJobActive, jobStatusLabel, jobStateDetail, canCancelJob, canRefreshJob, cancelActionLabel } from './job-state.mjs';
 import { STUDIO_MODES, newDraft, restoreDraft, buildStudioRequest, performanceSuggestion } from './studio-state.mjs';
-import { audioIntegrationRequest, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields, initialAudioValues } from './audio-studio.mjs';
+import { audioIntegrationRequest, audioMediaIssue, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields, initialAudioValues, restoreAudioMediaPreviews } from './audio-studio.mjs';
+import { createMediaTransfers } from './media-transfers.mjs';
+import { resultReferenceOutputs, resultReferenceOutputKey, transferOwnedOutput } from './result-reference.mjs';
+
+import { draftFromStudioRecipe, studioModeForKind } from './studio-recipes.mjs';
+import { createSdxlCapabilities } from './studio-capabilities.mjs';
+import { createH3ReferenceBuilder } from './h3-reference-builder.mjs';
+export { studioSdxlEncoderNames, studioExternalModelOptions } from './studio-capabilities.mjs';
 
 const STORAGE = 'prismcanvas.studio.v1';
 const node = (tag, className = '', text) => { const n = document.createElement(tag); n.className = className; if (text !== undefined) n.textContent = text; return n; };
 const labels = { queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', cancelled: '已取消', unknown: '待确认' };
 const safeURL = value => { try { const url = new URL(value, location.origin); return url.origin === location.origin && /^https?:$/.test(url.protocol) ? url.href : ''; } catch { return ''; } };
+
+export function studioOutputSize(summary = {}) {
+  const refined = summary.refine?.enabled === true, size = refined ? summary.refine : summary;
+  return `${size.width || '—'} × ${size.height || '—'}${refined ? ' · 二次重绘' : ''}`;
+}
 
 export function studioModelNames(names, families, key, kind, search = '') {
   const family = kind.startsWith('h3') ? 'h3' : kind.startsWith('sdxl') ? 'sdxl' : kind.startsWith('qwen21') ? 'qwen21' : kind;
@@ -21,27 +33,23 @@ export function studioModelNames(names, families, key, kind, search = '') {
   });
 }
 
-export function studioSdxlEncoderNames(engine, key) {
-  const field = key === 'sdxl_clip_l' ? 'clip_name1' : key === 'sdxl_clip_g' ? 'clip_name2' : '';
-  const names = field && engine?.generation_options?.sdxl_clip?.[field];
-  return Array.isArray(names) ? [...new Set(names.map(item => typeof item === 'string' ? item : item?.name).filter(name => typeof name === 'string' && name))] : [];
-}
-
-export function studioExternalModelOptions(names, current) {
-  const candidates = [...new Set((Array.isArray(names) ? names : []).filter(name => typeof name === 'string' && name))];
-  const options = [{ value: '', label: '不使用外置覆盖', disabled: false }];
-  for (const name of candidates) options.push({ value: name, label: name, disabled: false });
-  if (current && !candidates.includes(current)) options.push({ value: current, label: `${current} · 当前列表未找到`, disabled: true, missing: true });
-  return options;
-}
-
 export function createGenerationStudio(host) {
   let active = 'canvas', drafts = Object.fromEntries(Object.keys(STUDIO_MODES).map(mode => [mode, newDraft(mode)]));
   let kindDrafts = {}, pending = {}, selectedJobs = {}, busy = new Set(), panels = new Map(), lastMedia = new Map(), lastCatalog = new Map(), initialized = false, storageWarned = false;
   let audioDrafts = { voice: newAudioDraft(), music: newAudioDraft() }, audioCategory = 'voice', audioChoices = { stale: true, available: false, packages: [] }, audioCapability = null, audioCapabilitiesBackend = '', audioLoading = false, audioLoadError = '', audioContextEpoch = 0, audioObservedBackend = null;
   const root = document.querySelector('#studio-root');
+  const mediaTransfers = createMediaTransfers();
+  const resultTransfers = new Set(), recipeTransfers = new Set();
+  let recipeBackups = {};
+  let navigationEpoch = 0;
+  let mediaBackendEpoch = 0;
+  function mediaOwner(draft, mode) { return `${mode}:${draft.kind}`; }
+  function mediaIssue(draft, mode) {
+    try { mediaTransfers.assertReady([mediaOwner(draft, mode)]); return ''; }
+    catch (error) { return error.message; }
+  }
   const save = (critical = false) => {
-    try { localStorage.setItem(STORAGE, JSON.stringify({ drafts, kindDrafts, pending, selectedJobs, audioDrafts, audioCategory })); }
+    try { localStorage.setItem(STORAGE, JSON.stringify({ drafts, kindDrafts, pending, selectedJobs, audioDrafts, audioCategory, recipeBackups })); }
     catch { if (critical) throw new Error('无法保存提交记录，请先检查浏览器本地存储'); if (!storageWarned) { host.toast('工作台草稿保存失败，请导出参数后检查存储空间', true); storageWarned = true; } }
   };
   const action = (text, className, fn) => { const b = node('button', className, text); b.type = 'button'; b.addEventListener('click', () => Promise.resolve().then(fn).catch(host.reportError)); return b; };
@@ -49,14 +57,15 @@ export function createGenerationStudio(host) {
   const backend = () => host.engine().backend_url || '';
   function syncAudioBackendContext() {
     const current = backend();
-    if (audioObservedBackend !== null && audioObservedBackend !== current) audioContextEpoch++;
+    if (audioObservedBackend !== null && audioObservedBackend !== current) { audioContextEpoch++; mediaBackendEpoch++; }
     audioObservedBackend = current;
     return current;
   }
-  function newAudioDraft() { return { package_id: '', values: {}, valuesByPackage: {}, mediaBackends: {}, mediaBackendsByPackage: {} }; }
+  function newAudioDraft() { return { package_id: '', values: {}, valuesByPackage: {}, mediaBackends: {}, mediaBackendsByPackage: {}, mediaPreviewsByPackage: {} }; }
   function open(mode) {
     syncAudioBackendContext();
     if (mode !== 'canvas' && !STUDIO_MODES[mode] && mode !== 'audio') return;
+    if (active !== mode) navigationEpoch++;
     pause(root); active = mode; document.body.dataset.workspace = mode; document.body.classList.remove('canvas-focus');
     document.querySelectorAll('.workspace-nav[data-workspace]').forEach(button => { button.classList.toggle('active', button.dataset.workspace === mode); button.setAttribute('aria-pressed', String(button.dataset.workspace === mode)); });
     root.hidden = mode === 'canvas';
@@ -115,20 +124,6 @@ export function createGenerationStudio(host) {
     search.addEventListener('input', update); select.addEventListener('change', () => { change(select.value); save(); refresh(); });
     wrap.append(title, search, select); wrap.updateCatalog = update; update(); return wrap;
   }
-  function explicitModelSelector(mode, key, label, names, target, change) {
-    const wrap = node('label', 'studio-field studio-model'), title = node('span', '', label), select = node('select');
-    select.setAttribute('aria-label', label); select.dataset.model = key;
-    const update = () => {
-      const current = target(); select.replaceChildren();
-      for (const choice of studioExternalModelOptions(names(), current)) {
-        const option = node('option', '', choice.label); option.value = choice.value; option.disabled = choice.disabled;
-        if (choice.missing) option.dataset.missing = 'true'; select.append(option);
-      }
-      select.value = current || '';
-    };
-    select.addEventListener('change', () => { change(select.value); save(); });
-    wrap.append(title, select); wrap.updateCatalog = update; update(); return wrap;
-  }
   function loraRows(mode, container) {
     container.replaceChildren(); const draft = drafts[mode], clip = draft.kind.startsWith('sdxl');
     draft.loras.forEach((item, index) => {
@@ -146,37 +141,52 @@ export function createGenerationStudio(host) {
   }
   function references(mode, container) {
     pause(container); container.replaceChildren(); const draft = drafts[mode];
+    const owner = mediaOwner(draft, mode), transfer = mediaTransfers.state(owner, 'references');
     draft.references.forEach((ref, index) => {
-      const row = node('div', 'studio-reference'); const image = node('img'); image.src = safeURL(ref.url); image.alt = ref.label || ref.name;
+      const row = node('div', 'studio-reference'); const image = node('img'); if (ref.url) image.src = safeURL(ref.url); image.alt = ref.label || ref.name;
       const qwenEdit = draft.kind === 'qwen21_edit', label = qwenEdit ? index === 0 ? '编辑目标 · 图 1' : `参考图 · 图 ${index + 1}` : draft.kind === 'h3_i2v' ? index ? '尾帧' : '首帧' : '参考图';
+      if (!ref.url) { image.hidden = true; row.append(node('small', 'studio-help', '历史参考图 · 预览记录不可用，请检查依赖确认原文件仍在')); }
       row.append(image, node('span', '', `${label} · ${ref.label || ref.name}`));
       if (qwenEdit) {
         const up = action('↑', 'button quiet compact', () => { [draft.references[index - 1], draft.references[index]] = [draft.references[index], draft.references[index - 1]]; save(); references(mode, container); });
-        up.disabled = index === 0; up.setAttribute('aria-label', `图 ${index + 1} 上移`); up.title = '上移';
+        up.disabled = !!transfer || index === 0; up.setAttribute('aria-label', `图 ${index + 1} 上移`); up.title = '上移';
         const down = action('↓', 'button quiet compact', () => { [draft.references[index], draft.references[index + 1]] = [draft.references[index + 1], draft.references[index]]; save(); references(mode, container); });
-        down.disabled = index === draft.references.length - 1; down.setAttribute('aria-label', `图 ${index + 1} 下移`); down.title = '下移'; row.append(up, down);
+        down.disabled = !!transfer || index === draft.references.length - 1; down.setAttribute('aria-label', `图 ${index + 1} 下移`); down.title = '下移'; row.append(up, down);
       }
-      row.append(action('移除', 'button quiet', () => { draft.references.splice(index, 1); save(); references(mode, container); })); container.append(row);
+      const remove = action('移除', 'button quiet', () => { draft.references.splice(index, 1); save(); references(mode, container); refresh(); }); remove.disabled = !!transfer; row.append(remove); container.append(row);
     });
     const input = node('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.multiple = draft.kind === 'qwen21_edit' || draft.kind === 'h3_ref'; input.hidden = true;
     const upload = action(draft.references.length ? '＋ 添加图片' : '＋ 上传参考图片', 'button studio-upload', () => input.click());
-    const limit = draft.kind === 'qwen21_edit' ? 10 : mode === 'img2img' ? 1 : draft.kind === 'h3_i2v' ? 2 : 9; upload.disabled = draft.references.length >= limit;
+    const limit = draft.kind === 'qwen21_edit' ? 10 : mode === 'img2img' ? 1 : draft.kind === 'h3_i2v' ? 2 : 9; upload.disabled = !transfer && draft.references.length >= limit;
+    if (transfer) {
+      upload.textContent = '重新选择图片';
+      container.append(node('small', 'field-error', `${transfer.status === 'pending' ? '正在上传新参考图' : '新参考图上传失败'}；原参考列表已保留。请等待完成、重新选择，或保留原参考图。`));
+      container.append(action('保留原参考图', 'button quiet studio-keep-media', () => { mediaTransfers.discard(owner, 'references'); references(mode, container); refresh(); }));
+    }
     input.addEventListener('change', async () => {
-      upload.disabled = true;
-      const startedBackend = backend();
+      const selectedFiles = Array.from(input.files || []); if (!selectedFiles.length) return;
+      const ticket = mediaTransfers.start(owner, 'references', '参考图片');
+      const startedBackend = syncAudioBackendContext(), startedEpoch = mediaBackendEpoch;
+      const originalReferences = draft.references;
+      const stillCurrent = () => syncAudioBackendContext() === startedBackend && mediaBackendEpoch === startedEpoch && mediaTransfers.current(ticket) && drafts[mode] === draft && draft.references === originalReferences;
+      references(mode, container); refresh();
       try {
-        const selectedFiles = Array.from(input.files), remaining = limit - draft.references.length;
+        const remaining = limit - originalReferences.length;
         if (selectedFiles.length > remaining) host.toast(`当前还可添加 ${remaining} 张图片，本次多选的 ${selectedFiles.length - remaining} 张不会上传`, true);
         const files = selectedFiles.slice(0, remaining);
+        if (!files.length) throw new Error('参考图片数量已达上限，请先保留原参考图，再移除不需要的图片');
+        const uploadedReferences = [];
         for (const file of files) {
           if (!/^image\/(png|jpeg|webp)$/.test(file.type) || file.size > 20 * 1024 * 1024) throw new Error('参考图支持 PNG/JPEG/WebP，每张最多 20 MiB');
           const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); });
+          if (!stillCurrent()) throw new Error('模式、参考图或引擎已切换，请重新选择参考图');
           const uploaded = await host.api('/api/upload', { data });
-          if (drafts[mode] !== draft || startedBackend !== backend()) throw new Error('模式或引擎已切换，请重新选择参考图');
-          draft.references.push({ ...uploaded, label: file.name, backend: startedBackend }); save();
+          if (!uploaded?.name || uploaded.backend && uploaded.backend !== startedBackend || !stillCurrent()) throw new Error('模式、参考图或引擎已切换，或上传未返回有效素材；请重新选择参考图');
+          uploadedReferences.push({ ...uploaded, label: file.name, backend: startedBackend });
         }
-      } catch (error) { host.reportError(error); }
-      finally { if (drafts[mode] === draft) references(mode, container); }
+        draft.references = [...originalReferences, ...uploadedReferences]; mediaTransfers.finish(ticket); save();
+      } catch (error) { if (mediaTransfers.current(ticket)) { mediaTransfers.fail(ticket, error); host.reportError(error); } }
+      finally { if (drafts[mode] === draft) { references(mode, container); refresh(); } }
     });
     const help = draft.kind === 'qwen21_edit' ? 'Qwen Image 2.1 条件编辑：第 1 张是编辑目标，第 2–10 张依序作为参考；可用 ↑ / ↓ 调整顺序。固定完整采样（denoise=1），不使用 SDXL 低去噪重绘。' : mode === 'img2img' ? 'SDXL 重绘会根据画幅缩放参考图；去噪越低，越接近原图。' : '首尾帧按添加顺序排列；参考素材保留在你的推理引擎。';
     container.append(input, upload, node('small', 'studio-help', help));
@@ -186,7 +196,9 @@ export function createGenerationStudio(host) {
     const old = panels.get(mode); pause(old); old?.remove(); const draft = drafts[mode], config = STUDIO_MODES[mode];
     const panel = node('section', 'studio-panel'); panel.dataset.studioMode = mode;
     const header = node('header', 'studio-heading'), heading = node('div'); heading.append(node('span', 'eyebrow', 'GENERATION STUDIO'), node('h1', '', config.title), node('p', '', config.subtitle));
-    const tools = node('div', 'studio-heading-actions'); tools.append(action('刷新模型', 'button quiet', async () => { await host.refreshEngine(true); updateCatalogs(panel); refresh(); }), action('引擎设置', 'button', () => host.openSettings()), action('开始生成', 'button primary studio-run-top', () => submit(mode))); header.append(heading, tools);
+    const tools = node('div', 'studio-heading-actions');
+    const undoRecipe = action('恢复加载前草稿', 'button quiet studio-restore-draft', () => restoreRecipeDraft(mode)); tools.append(undoRecipe);
+    tools.append(action('刷新模型', 'button quiet', async () => { await host.refreshEngine(true); updateCatalogs(panel); refresh(); }), action('引擎设置', 'button', () => host.openSettings()), action('开始生成', 'button primary studio-run-top', () => submit(mode))); header.append(heading, tools);
     const layout = node('div', 'studio-layout'), form = node('div', 'studio-form'), results = node('div', 'studio-results');
     const section = (title, hint = '') => { const block = node('section', 'studio-section'); block.append(node('h2', '', title)); if (hint) block.append(node('p', 'studio-help', hint)); form.append(block); return block; };
     const qwen21 = draft.kind.startsWith('qwen21');
@@ -200,22 +212,20 @@ export function createGenerationStudio(host) {
     const isSdxl = ['sdxl', 'sdxl_i2i'].includes(draft.kind);
     const modelKeys = isSdxl ? [['checkpoint', 'Checkpoint 主模型'], ['vae', '独立 VAE 覆盖']] : [['dit', 'DiT 主模型'], ['text_encoder', '文本编码器'], ['vae', '图像 / 视频 VAE'], ...(mode === 'video' ? [['audio_vae', '音频 VAE']] : [])];
     modelKeys.forEach(([key, label]) => models.append(modelSelector(mode, key, label, () => draft.models[key], value => { draft.models[key] = value; })));
-    if (isSdxl) {
-      const clip = host.engine().generation_options?.sdxl_clip || {};
-      const clipBlock = node('details', 'studio-details'); clipBlock.open = !!clip.available;
-      clipBlock.append(node('summary', '', 'SDXL 外置文本编码器'));
-      if (clip.available && clip.types?.includes('sdxl')) {
-        clipBlock.append(node('small', 'studio-help', '需要同时指定 CLIP-L 与 CLIP-G。留空则继续使用 Checkpoint 内置编码器。'));
-        for (const [key, label] of [['sdxl_clip_l', 'CLIP-L 文件'], ['sdxl_clip_g', 'CLIP-G 文件']]) {
-          clipBlock.append(explicitModelSelector(mode, key, label, () => studioSdxlEncoderNames(host.engine(), key), () => draft.models[key] || '', value => { draft.models[key] = value; }));
-        }
-      } else {
-        clipBlock.append(node('p', 'studio-help disabled-capability', clip.reason || `当前后端未声明兼容的 DualCLIPLoader（缺少实时 SDXL 类型或编码器选项）。${(clip.missing || []).join('、')}`));
-      }
-      models.append(clipBlock);
-    }
+    const capabilities = isSdxl ? createSdxlCapabilities({ draft, engine: host.engine, onChange: () => { save(); refresh(); } }) : null;
+    if (capabilities) { models.append(capabilities.encoders); panel.updateCapabilities = capabilities.update; }
     const loras = node('details', 'studio-details'); loras.open = true; loras.append(node('summary', '', 'LoRA 叠加 · 最多 4 个')); const rows = node('div'); loraRows(mode, rows); loras.append(rows, node('small', 'studio-help', '选择与主模型架构兼容的 LoRA。文件名推荐不代表兼容性已验证；模型 / 文本强度可分别调整。')); models.append(loras);
-    if (mode === 'img2img' || draft.kind === 'qwen21_edit' || ['h3_i2v', 'h3_ref'].includes(draft.kind)) { const block = section(draft.kind === 'qwen21_edit' ? '02  编辑目标与条件参考图' : '02  参考图片'); const refs = node('div'); references(mode, refs); block.append(refs); }
+    if (mode === 'img2img' || draft.kind === 'qwen21_edit' || ['h3_i2v', 'h3_ref'].includes(draft.kind)) { const block = section(draft.kind === 'qwen21_edit' ? '02  编辑目标与条件参考图' : '02  参考图片'); const refs = node('div'); references(mode, refs); block.append(refs);
+      if (draft.kind === 'h3_ref') {
+        const multimodal = createH3ReferenceBuilder({ engine: host.engine, draft: () => drafts[mode], api: host.api, reportError: host.reportError,
+          context: () => JSON.stringify([backend(), active, navigationEpoch, host.canvasIdentity?.(), host.canvasSnapshot?.()]),
+          onPrepared: (document, guard) => {
+            if (!host.prepareH3Package) throw new Error('当前客户端尚未注册工作流包编辑入口');
+            return host.prepareH3Package(document, guard);
+          } });
+        block.append(multimodal.element); panel.updateH3Reference = multimodal.update;
+      }
+    }
     const prompts = section('提示词'); prompts.append(field(mode, '正向提示词', 'positive', { multiline: true, rows: 6, placeholder: '描述主体、环境、光线、构图；视频可加入动作与运镜…' }), field(mode, '负向提示词', 'negative', { multiline: true, rows: 3, placeholder: '不希望出现的内容…' }), action('复制提示词', 'button quiet', () => host.copyText(`${draft.positive}${draft.negative ? `\n\n负向提示词：${draft.negative}` : ''}`)));
     const qwenEdit = draft.kind === 'qwen21_edit', controls = section(qwenEdit ? '尺寸策略与采样' : '画幅与采样'), presets = node('div', 'studio-presets');
     if (qwenEdit) {
@@ -240,29 +250,7 @@ export function createGenerationStudio(host) {
     if (mode === 'video') grid.append(field(mode, '时长 / 秒', 'seconds', { number: true, min: 1, max: 30, step: .1, help: 'H3 固定 24 fps，实际帧数以编译结果为准。' }));
     controls.append(grid, field(mode, '随机种子', 'seed', { number: true, min: 0, max: Number.MAX_SAFE_INTEGER, step: 1 }), action('换一个随机种子', 'button quiet', () => { draft.seed = crypto.getRandomValues(new Uint32Array(1))[0]; panel.querySelector('[name=seed]').value = draft.seed; save(); }));
     if (mode === 'video') { const advanced = node('details', 'studio-details'); advanced.append(node('summary', '', '高级视频参数')); const g = node('div', 'studio-grid'); g.append(field(mode, '视频 Shift', 'shift_video', { number: true, min: .01, max: 100, step: .01 }), field(mode, '音频 Shift', 'shift_audio', { number: true, min: .01, max: 100, step: .01 })); if (draft.kind === 'h3_ref') g.append(field(mode, '参考图尺寸策略', 'ref_image_size', { select: ['match', 'max'] })); advanced.append(g); controls.append(advanced); }
-    if (isSdxl) {
-      const capability = host.engine().generation_options?.refine || {};
-      const refine = node('details', 'studio-details studio-refine'); refine.open = draft.refine.enabled === true && !!capability.available;
-      refine.append(node('summary', '', '高清二次重绘'));
-      if (!capability.available) refine.append(node('p', 'studio-help disabled-capability', capability.reason || `当前后端的实时 schema 不支持二次重绘。${(capability.missing || []).join('、')}`));
-      else {
-        const enabled = node('label', 'studio-field studio-check'), checkbox = node('input'); checkbox.type = 'checkbox'; checkbox.checked = draft.refine.enabled === true; checkbox.setAttribute('aria-label', '启用高清二次重绘');
-        checkbox.addEventListener('change', () => { draft.refine.enabled = checkbox.checked; save(); refine.classList.toggle('enabled', checkbox.checked); });
-        enabled.append(checkbox, node('span', '', '启用第二阶段潜空间放大与重绘')); refine.append(enabled);
-        const grid = node('div', 'studio-grid');
-        for (const [label, key, min, max, step] of [['二次宽度 / px', 'width', 64, 8192, 8], ['二次高度 / px', 'height', 64, 8192, 8], ['二次采样步数', 'steps', 1, 200, 1], ['二次去噪', 'denoise', 0, 1, .05]]) {
-          const wrap = node('label', 'studio-field'), title = node('span', '', label), input = node('input'); input.type = 'number'; input.min = min; input.max = max; input.step = step; input.value = draft.refine[key]; input.setAttribute('aria-label', label);
-          input.addEventListener('input', () => { draft.refine[key] = input.value === '' ? '' : Number(input.value); save(); }); wrap.append(title, input); grid.append(wrap);
-        }
-        refine.append(grid);
-        const method = node('label', 'studio-field'); method.append(node('span', '', '潜空间放大方法'));
-        const select = node('select'); setOptions(select, (capability.upscale_methods || []).map(value => [value, value]), draft.refine.upscale_method || capability.upscale_methods?.[0] || '', false);
-        if (!draft.refine.upscale_method && capability.upscale_methods?.length) draft.refine.upscale_method = capability.upscale_methods[0];
-        select.addEventListener('change', () => { draft.refine.upscale_method = select.value; save(); }); method.append(select); refine.append(method);
-        refine.append(node('small', 'studio-help', '后端会将此阶段编译为同一冻结图中的潜空间放大与第二个采样器；目标宽高独立于首阶段。'));
-      }
-      controls.append(refine);
-    }
+    if (capabilities) controls.append(capabilities.refine);
     const footer = node('div', 'studio-submit');
     footer.append(action('检查依赖', 'button quiet', () => inspect(mode, 'diagnostics')), action('预览执行参数', 'button quiet', () => inspect(mode, 'compile')));
     const generate = action('开始生成', 'button primary studio-generate', () => submit(mode)); generate.dataset.studioGenerate = mode; footer.append(generate);
@@ -274,7 +262,7 @@ export function createGenerationStudio(host) {
     layout.append(form, results); panel.append(header, layout); root.append(panel); panels.set(mode, panel); lastMedia.delete(mode); lastCatalog.delete(mode); panel.hidden = active !== mode;
   }
   function saveAudioDrafts(critical = false) {
-    try { localStorage.setItem(STORAGE, JSON.stringify({ drafts, kindDrafts, pending, selectedJobs, audioDrafts, audioCategory })); }
+    try { localStorage.setItem(STORAGE, JSON.stringify({ drafts, kindDrafts, pending, selectedJobs, audioDrafts, audioCategory, recipeBackups })); }
     catch { if (critical) throw new Error('无法保存音频提交记录，请检查浏览器本地存储'); if (!storageWarned) { host.toast('音频工作台草稿保存失败，请检查浏览器本地存储', true); storageWarned = true; } }
   }
   function audioKey() { return `audio_${audioCategory}`; }
@@ -343,13 +331,13 @@ export function createGenerationStudio(host) {
       if (chosen.requirements?.nodes?.length) block.append(node('small', 'studio-help', `所需节点：${chosen.requirements.nodes.join('、')}`));
       const dynamic = node('div', 'audio-package-fields');
       const expectedUploadContext = { epoch: renderEpoch, category, draft, packageId: chosen.id, backend: backend() };
-      renderAudioFields(dynamic, { pack: chosen, draft, api: host.api, backend: backend(), currentBackend: backend, isCurrent: ({ field }) => {
+      renderAudioFields(dynamic, { pack: chosen, draft, api: host.api, storeMedia: host.storeLocalMedia, backend: backend(), currentBackend: backend, isCurrent: ({ field }) => {
         syncAudioBackendContext();
         const currentDraft = audioDrafts[category], currentPack = currentAudioPackage(category);
         return audioUploadContextMatches(expectedUploadContext, {
           epoch: audioContextEpoch, category: audioCategory, draft: currentDraft, packageId: currentDraft.package_id,
           backend: backend(), capabilitiesBackend: audioCapabilitiesBackend, stale: audioChoices.stale, fields: currentPack?.fields,
-        }, field.id);
+        }, field);
       }, onChange: () => { draft.valuesByPackage[chosen.id] = structuredClone(draft.values); draft.mediaBackendsByPackage[chosen.id] = { ...draft.mediaBackends }; saveAudioDrafts(); refreshAudio(); }, reportError: host.reportError });
       block.append(dynamic);
     }
@@ -383,11 +371,12 @@ export function createGenerationStudio(host) {
     const supported = !!pack && pack.eligible === true && pack.available !== false && !audioChoices.stale && audioCapabilitiesBackend === backend();
     const hasEligiblePackage = (audioChoices.packages || []).some(item => item.eligible === true && item.available !== false);
     const hasForeignMedia = Object.entries(draft.mediaBackends || {}).some(([field, owner]) => draft.values?.[field] && owner && owner !== backend());
+    const uploadIssue = audioMediaIssue(draft);
     const generate = panel.querySelector('.studio-generate'), status = panel.querySelector('.studio-operation'), query = panel.querySelector('.studio-query'), resume = panel.querySelector('.studio-resume');
-    generate.disabled = submitting || !!entry || !host.engine().online || !supported || hasForeignMedia;
+    generate.disabled = submitting || !!entry || !host.engine().online || !supported || hasForeignMedia || !!uploadIssue;
     generate.textContent = submitting ? '正在处理…' : entry ? '上次提交待确认' : '开始生成';
     const topRun = panel.querySelector('.studio-run-top'); topRun.disabled = generate.disabled; topRun.textContent = generate.textContent;
-    status.textContent = entry ? `原请求 ${entry.request_id.slice(0, 8)} · 请先查询，避免重复生成` : hasForeignMedia ? '音频/图片输入属于另一个推理引擎，请重新上传' : supported ? '本地 AUDIO 工作流 · 任务可在后台继续执行' : audioLoadError || (host.engine().online ? pack ? (pack.reason || '所选工作流包尚未通过当前引擎检查') : hasEligiblePackage ? `请选择一个${audioCategory === 'voice' ? '声音' : '音乐'}工作流包` : '当前引擎尚未配置可用的声音 / 音乐生成工作流' : '引擎未连接：先连接本地 ComfyUI，再检查工作流能力');
+    status.textContent = entry ? `原请求 ${entry.request_id.slice(0, 8)} · 请先查询，避免重复生成` : uploadIssue || (hasForeignMedia ? '音频/图片输入属于另一个推理引擎，请重新上传' : supported ? '本地 AUDIO 工作流 · 任务可在后台继续执行' : audioLoadError || (host.engine().online ? pack ? (pack.reason || '所选工作流包尚未通过当前引擎检查') : hasEligiblePackage ? `请选择一个${audioCategory === 'voice' ? '声音' : '音乐'}工作流包` : '当前引擎尚未配置可用的声音 / 音乐生成工作流' : '引擎未连接：先连接本地 ComfyUI，再检查工作流能力'));
     query.hidden = !entry; query.disabled = submitting; resume.hidden = !entry?.canResume; resume.disabled = submitting;
     resultPanel(key, panel);
   }
@@ -422,6 +411,8 @@ export function createGenerationStudio(host) {
     }
   }
   function updateCatalogs(panel) {
+    panel.updateCapabilities?.();
+    panel.updateH3Reference?.();
     panel.querySelectorAll('.studio-model').forEach(wrap => wrap.updateCatalog());
     const mode = panel.dataset.studioMode, options = samplerOptions(mode);
     for (const [key, source] of [['sampler', options.samplers], ['scheduler', options.schedulers]]) if (source?.length) setOptions(panel.querySelector(`[name=${key}]`), source, drafts[mode][key]);
@@ -432,6 +423,7 @@ export function createGenerationStudio(host) {
       if (audioCapabilitiesBackend !== backend() || audioChoices.stale) throw new Error('请先刷新当前引擎的音频工作流能力');
       return buildAudioPackageRequest(pack, draft, backend());
     }
+    mediaTransfers.assertReady([mediaOwner(drafts[mode], mode)]);
     validateSelectedQwenModels(drafts[mode]);
     return buildStudioRequest(drafts[mode], backend(), host.engine().generation_options || {});
   }
@@ -442,6 +434,7 @@ export function createGenerationStudio(host) {
     catch (error) { details.querySelector('pre').textContent = error.message; throw error; }
   }
   async function submit(mode) {
+    if (recipeTransfers.has(mode)) throw new Error('正在读取历史参数，请等待完成后再生成');
     if (busy.has(mode) || pending[mode]) return;
     const request = buildRequest(mode);
     if (!host.engine().online) throw new Error('本地引擎未连接，请先设置引擎地址');
@@ -474,19 +467,89 @@ export function createGenerationStudio(host) {
       else host.toast('提交结果仍待确认；保留原请求，请核实原后端队列与历史。', true);
     } finally { busy.delete(mode); refresh(); }
   }
-  async function useImageOutput(job, imageIndex, targetMode) {
+  async function useImageOutput(job, outputId, targetMode) {
+    if (resultTransfers.has(targetMode)) return;
     if (job.backend !== backend()) throw new Error('结果属于另一个推理引擎，请切回原引擎后再导入为参考图');
-    const output = await host.api(`/api/jobs/${encodeURIComponent(job.id)}/image-input`, { output_index: imageIndex });
-    if (!output?.name || !output?.url || output.backend && output.backend !== backend()) throw new Error('当前引擎没有返回可用的图片输入；请确认任务结果仍属于此引擎');
+    const selected = resultReferenceOutputs(job).find(item => item.output_id === outputId && item.type === 'image');
+    if (!selected) throw new Error('所选图片没有可核验的输出身份，请刷新已完成任务后重试');
     const draft = drafts[targetMode], targetKind = targetMode === 'video' ? 'h3_i2v' : draft.kind === 'qwen21_edit' ? 'qwen21_edit' : 'sdxl_i2i';
-    if (draft.kind !== targetKind) {
-      kindDrafts[targetMode] ||= {}; kindDrafts[targetMode][draft.kind] = structuredClone(draft);
-      const previousText = { positive: draft.positive, negative: draft.negative };
-      drafts[targetMode] = kindDrafts[targetMode][targetKind] ? restoreDraft(targetMode, kindDrafts[targetMode][targetKind]) : newDraft(targetMode, targetKind);
-      drafts[targetMode].positive ||= previousText.positive; drafts[targetMode].negative ||= previousText.negative;
+    const cached = kindDrafts[targetMode]?.[targetKind];
+    const next = draft.kind === targetKind ? structuredClone(draft) : cached ? restoreDraft(targetMode, cached) : newDraft(targetMode, targetKind);
+    if (draft.kind !== targetKind) { next.positive ||= draft.positive; next.negative ||= draft.negative; }
+    const owner = mediaOwner(next, targetMode);
+    mediaTransfers.assertReady([owner]);
+    const startedBackend = syncAudioBackendContext(), startedEpoch = mediaBackendEpoch, startedNavigation = navigationEpoch;
+    const sourceKey = active === 'audio' ? audioKey() : active, sourceSelection = selectedJobs[sourceKey];
+    const signature = JSON.stringify(draft), cachedSignature = JSON.stringify(cached);
+    const ticket = mediaTransfers.start(owner, 'references', '生成结果参考图');
+    const check = () => {
+      if (syncAudioBackendContext() !== startedBackend || mediaBackendEpoch !== startedEpoch || navigationEpoch !== startedNavigation
+        || selectedJobs[sourceKey] !== sourceSelection || !mediaTransfers.current(ticket) || drafts[targetMode] !== draft
+        || JSON.stringify(draft) !== signature || kindDrafts[targetMode]?.[targetKind] !== cached
+        || JSON.stringify(cached) !== cachedSignature) throw new Error('传入期间页面、目标草稿、素材或引擎已变化；已保留当前草稿，请重新传入');
+    };
+    resultTransfers.add(targetMode); refresh(); host.toast('正在准备参考图；完成前不会修改目标草稿');
+    try {
+      const output = await transferOwnedOutput({ backend: startedBackend, jobId: job.id, output: structuredClone(selected),
+        outputIndex: job.outputs.filter(item => item.type === 'image').indexOf(selected) }, { api: host.api, check });
+      check();
+      // Replace only the editing target / first frame. Additional Qwen references
+      // and the H3 end frame retain their order and ownership.
+      next.references = [{ ...output, label: selected.filename || output.name, backend: startedBackend }, ...next.references.slice(1)];
+      if (draft.kind !== targetKind) { kindDrafts[targetMode] ||= {}; kindDrafts[targetMode][draft.kind] = structuredClone(draft); }
+      drafts[targetMode] = next; mediaTransfers.finish(ticket);
+      save(); render(targetMode); open(targetMode);
+      host.toast(targetMode === 'video' ? '图片结果已设为 H3 视频首帧，已保留尾帧与其他参数' : '图片结果已设为编辑目标，已保留其他参考图与参数');
+    } finally {
+      mediaTransfers.finish(ticket); resultTransfers.delete(targetMode); refresh();
     }
-    drafts[targetMode].references = [{ ...output, label: job.outputs.filter(item => item.type === 'image')[imageIndex]?.filename || output.name, backend: output.backend || backend() }];
-    save(); render(targetMode); open(targetMode); host.toast(targetMode === 'video' ? '图片结果已设为 H3 视频首帧' : '图片结果已设为图生图目标');
+  }
+  function restoreRecipeDraft(mode) {
+    if (!recipeBackups[mode]) return;
+    if (recipeTransfers.has(mode)) throw new Error('参数读取中，请等待完成后再恢复草稿');
+    mediaTransfers.assertReady([mediaOwner(drafts[mode], mode), mediaOwner(recipeBackups[mode], mode)]);
+    const before = drafts[mode], restored = restoreDraft(mode, recipeBackups[mode]);
+    kindDrafts[mode] ||= {}; kindDrafts[mode][before.kind] = structuredClone(before);
+    drafts[mode] = restored; delete recipeBackups[mode]; save(); render(mode); refresh();
+    host.toast('已恢复加载参数之前的草稿；没有提交生成');
+  }
+  async function reuseRecipe(job, sourceMode, destination) {
+    if (recipeTransfers.has(sourceMode)) return;
+    const targetMode = studioModeForKind(job.kind);
+    if (destination === 'studio' && !targetMode) throw new Error('此任务请复制到画布编辑完整工作流');
+    if (!host.jobs().some(item => item.id === job.id && item.kind === job.kind && item.backend === job.backend)) throw new Error('原任务已变化，请刷新后重试');
+    const draft = targetMode && drafts[targetMode], signature = JSON.stringify(draft), cache = targetMode && kindDrafts[targetMode], cacheSignature = JSON.stringify(cache);
+    if (destination === 'studio') mediaTransfers.assertReady([mediaOwner(draft, targetMode), `${targetMode}:${job.kind}`]);
+    const startedBackend = syncAudioBackendContext(), startedEpoch = mediaBackendEpoch, startedNavigation = navigationEpoch, startedActive = active;
+    const sourceSelection = selectedJobs[sourceMode];
+    const canvasIdentity = destination === 'canvas' ? host.canvasIdentity?.() : null;
+    const canvasSnapshot = destination === 'canvas' ? host.canvasSnapshot?.() : null;
+    if (destination === 'canvas' && (!canvasIdentity || typeof canvasSnapshot !== 'string')) throw new Error('画布尚未准备好，请稍后重试');
+    const check = () => {
+      if (syncAudioBackendContext() !== startedBackend || mediaBackendEpoch !== startedEpoch || navigationEpoch !== startedNavigation || active !== startedActive
+        || selectedJobs[sourceMode] !== sourceSelection || !host.jobs().some(item => item.id === job.id && item.kind === job.kind && item.backend === job.backend)) throw new Error('读取期间页面、任务或引擎已变化；未修改当前内容，请重新加载');
+      if (destination === 'studio') {
+        if (drafts[targetMode] !== draft || JSON.stringify(draft) !== signature || kindDrafts[targetMode] !== cache || JSON.stringify(cache) !== cacheSignature) throw new Error('读取期间草稿已变化，已保留当前编辑；请重新加载');
+        mediaTransfers.assertReady([mediaOwner(draft, targetMode), `${targetMode}:${job.kind}`]);
+      } else if (host.canvasIdentity() !== canvasIdentity || host.canvasSnapshot() !== canvasSnapshot) throw new Error('读取期间画布已变化，未添加节点；请重新复制');
+    };
+    recipeTransfers.add(sourceMode); refresh();
+    host.toast('正在读取历史参数；完成后仍需手动生成');
+    try {
+      const recipe = await host.api(`/api/jobs/${encodeURIComponent(job.id)}/recipe`); check();
+      if (destination === 'canvas') {
+        host.addRecipe({ ...recipe, backend: job.backend }); open('canvas'); host.toast('已复制参数到画布，可继续编辑工作流');
+      } else {
+        const known = [...Object.values(drafts), ...Object.values(kindDrafts).flatMap(kinds => Object.values(kinds || {}))].flatMap(value => value.references || []);
+        const recovered = draftFromStudioRecipe(recipe, job, known);
+        if (recovered.mode !== targetMode) throw new Error('历史参数模式与原任务不同，请刷新后重试');
+        check(); recipeBackups[targetMode] = structuredClone(draft);
+        kindDrafts[targetMode] ||= {}; kindDrafts[targetMode][draft.kind] = structuredClone(draft);
+        drafts[targetMode] = recovered.draft; save(); render(targetMode); open(targetMode);
+        host.toast(`历史参数已加载到${STUDIO_MODES[targetMode].title}，可修改后生成；原草稿可恢复${recovered.missingPreviews ? '。部分历史参考图没有预览记录，请先检查依赖' : ''}`);
+      }
+      for (const warning of recipe.warnings || []) host.toast(warning);
+    } finally { recipeTransfers.delete(sourceMode); refresh(); }
   }
   function resultPanel(mode, panel) {
     const audioMode = mode.startsWith('audio_'), audioIds = new Set((audioChoices.packages || []).map(pack => pack.id));
@@ -494,25 +557,36 @@ export function createGenerationStudio(host) {
       ? (job.kind === 'package' && audioIds.has(job.summary?.package_id)) || (job.outputs || []).some(output => output.type === 'audio') || selectedJobs[mode] === job.id
       : STUDIO_MODES[mode].kinds.some(([kind]) => kind === job.kind) || selectedJobs[mode] === job.id).slice(0, 30);
     const chosen = matching.find(job => job.id === selectedJobs[mode]) || matching[0];
-    const toolbar = panel.querySelector('.studio-result-toolbar'); toolbar.replaceChildren(node('h2', '', '生成结果'), node('span', 'studio-job-state', chosen ? labels[chosen.status] || chosen.status : '等待创作'));
+    const toolbar = panel.querySelector('.studio-result-toolbar'); toolbar.replaceChildren(node('h2', '', '生成结果'), node('span', 'studio-job-state', chosen ? jobStatusLabel(chosen) : '等待创作'));
+    if (chosen) toolbar.append(node('span', 'studio-elapsed', elapsedText(chosen)));
     const history = panel.querySelector('.studio-history'); history.replaceChildren(node('h3', '', '最近任务'));
-    for (const job of matching) { const item = action(`${labels[job.status] || job.status} · ${job.summary?.width || '—'} × ${job.summary?.height || '—'} · ${job.id.slice(0, 10)}`, `studio-history-item${job.id === chosen?.id ? ' selected' : ''}`, () => { selectedJobs[mode] = job.id; save(); refresh(); }); history.append(item); }
-    const signature = JSON.stringify([chosen?.id, chosen?.status, chosen?.outputs, chosen?.error, chosen?.progress, chosen?.stage, chosen?.execution_node, chosen?.step, chosen?.steps, chosen?.progress_connected, chosen?.preview_url]);
+    for (const job of matching) { const item = action(`${jobStatusLabel(job)} · ${studioOutputSize(job.summary)} · ${job.id.slice(0, 10)}`, `studio-history-item${job.id === chosen?.id ? ' selected' : ''}`, () => { selectedJobs[mode] = job.id; save(); refresh(); }); history.append(item); }
+    const signature = JSON.stringify([backend(), chosen?.id, chosen?.status, chosen?.cancellation, host.isJobControlling?.(chosen?.id), chosen?.outputs, chosen?.error, chosen?.progress, chosen?.stage, chosen?.execution_node, chosen?.execution_label, chosen?.execution_nodes, chosen?.cached_nodes, chosen?.queue_position, chosen?.progress_identity_unknown, chosen?.step, chosen?.steps, chosen?.progress_connected, chosen?.progress_stale, chosen?.preview_stale, chosen?.client_connection_lost, chosen?.preview_url]);
+    const area = panel.querySelector('.studio-preview');
+    const updateControls = () => {
+      const cancel = area.querySelector('.studio-job-cancel'), query = area.querySelector('.studio-job-refresh');
+      if (cancel) { cancel.hidden = !isJobActive(chosen); cancel.disabled = !canCancelJob(chosen) || !!host.isJobControlling?.(chosen?.id); cancel.textContent = cancelActionLabel(chosen); }
+      if (query) { query.hidden = !canRefreshJob(chosen); query.disabled = !!host.isJobControlling?.(chosen?.id); }
+    };
+    const currentLive = area.querySelector('.studio-live-progress');
+    const updateLive = live => updateLiveProgress({detail:live.querySelector('.live-detail'),bar:live.querySelector('progress'),image:live.querySelector('.live-preview'),caption:live.querySelector('.live-preview-status')},chosen);
+    if (currentLive?.dataset.jobId === chosen?.id && isJobActive(chosen)) { updateLive(currentLive); updateControls(); lastMedia.set(mode, signature); return; }
     if (lastMedia.get(mode) === signature) return; lastMedia.set(mode, signature);
-    const area = panel.querySelector('.studio-preview'); pause(area); area.replaceChildren();
-    if (chosen && ['queued', 'running'].includes(chosen.status)) {
+    pause(area); area.replaceChildren();
+    if (isJobActive(chosen)) {
       const live = node('div', 'studio-live-progress');
-      live.append(node('p', 'live-detail', liveProgressText(chosen)));
+      live.dataset.jobId = chosen.id;
+      live.append(node('p', 'live-detail'));
       const bar = node('progress'); bar.max = 100; bar.setAttribute('aria-label', '当前节点采样进度');
-      const value = progressPercent(chosen.progress); if (value !== null) bar.value = value;
       live.append(bar);
-      if (chosen.preview_url) { const image = node('img', 'live-preview'); image.src = safeURL(chosen.preview_url); image.alt = '采样中间预览，尚未完成'; live.append(image); }
-      live.append(node('small', '', '进度对应当前执行节点；中间预览尚未完成。')); area.append(live);
+      const image = node('img', 'live-preview'); image.alt = '采样中间预览，尚未完成'; live.append(image);
+      live.append(node('small', 'live-preview-status')); updateLive(live); area.append(live);
     } else if (!chosen?.outputs?.length) {
       const empty = node('div', 'studio-result-empty');
       const audioMode = mode.startsWith('audio_'), category = mode === 'audio_music' ? '音乐' : '声音';
       empty.append(node('div', 'studio-prism', audioMode ? '♫' : '◈'), node('h2', '', chosen ? labels[chosen.status] || '等待结果' : audioMode ? `下一段${category}，从这里开始` : '你的下一张作品，从这里开始'), node('p', '', chosen?.error || (chosen ? '任务由本地推理引擎执行，可自由切换页面。' : audioMode ? '选择已验证 AUDIO 输出的工作流包，填写台词、音乐描述或参数，再在本机生成。' : '选择模型、写下提示词，再把画面交给棱光。'))); area.append(empty);
     }
+    if (!isJobActive(chosen) && jobStateDetail(chosen)) area.append(node('p', 'form-note studio-cancellation-message', jobStateDetail(chosen)));
     for (const [outputIndex, output] of (chosen?.outputs || []).entries()) {
       const card = node('div', 'studio-output'), media = node(output.type === 'video' ? 'video' : output.type === 'audio' ? 'audio' : 'img');
       media.src = safeURL(output.url); if (media.tagName === 'IMG') media.alt = output.filename || '生成结果'; else { media.controls = true; media.preload = 'metadata'; }
@@ -533,17 +607,21 @@ export function createGenerationStudio(host) {
         if (result?.opened === false || result?.open === false) throw new Error(result.message || '输出目录未打开；请确认这是当前客户端配置的本机目录');
         host.toast(result?.path || result?.output_path ? `已打开：${result.path || result.output_path}` : '已请求打开本机输出目录');
       }));
-      if (output.type === 'image' && chosen.backend === backend()) {
-        const imageIndex = chosen.outputs.slice(0, outputIndex).filter(item => item.type === 'image').length;
-        controls.append(action('用作图生图目标', 'button quiet', () => useImageOutput(chosen, imageIndex, 'img2img')),
-          action('用作视频首帧', 'button quiet', () => useImageOutput(chosen, imageIndex, 'video')));
+      if (output.type === 'image' && chosen.status === 'completed' && chosen.backend === backend()
+        && resultReferenceOutputs(chosen).some(item => resultReferenceOutputKey(item) === resultReferenceOutputKey(output))) {
+        controls.append(action('用作图生图目标', 'button quiet', () => useImageOutput(chosen, output.output_id, 'img2img')),
+          action('用作视频首帧', 'button quiet', () => useImageOutput(chosen, output.output_id, 'video')));
       }
       card.append(meta, media, controls, locationInfo); area.append(card);
     }
     if (chosen) {
       const actions = node('div', 'studio-result-actions');
-      actions.append(action('结果放入画布', 'button', () => { open('canvas'); host.placeJob(chosen.id); }), action('参数重新编辑', 'button quiet', async () => { const recipe = await host.api(`/api/jobs/${encodeURIComponent(chosen.id)}/recipe`); open('canvas'); host.addRecipe(recipe); }));
-      if (['queued', 'running'].includes(chosen.status)) actions.append(action('取消此任务', 'button quiet', async () => { await host.api(`/api/jobs/${encodeURIComponent(chosen.id)}/cancel`, {}); await host.refreshJobs(); refresh(); })); area.append(actions);
+      actions.append(action('结果放入画布', 'button', () => { host.placeJob(chosen.id); open('canvas'); }));
+      if (studioModeForKind(chosen.kind)) actions.append(action('加载参数到本工作台', 'button quiet', () => reuseRecipe(chosen, mode, 'studio')));
+      actions.append(action('复制参数到画布', 'button quiet', () => reuseRecipe(chosen, mode, 'canvas')));
+      if (isJobActive(chosen)) actions.append(action('取消任务', 'button quiet studio-job-cancel', () => host.controlJob(chosen.id, 'cancel')),
+        action('查询原任务', 'button quiet studio-job-refresh', () => host.controlJob(chosen.id, 'refresh')));
+      area.append(actions); updateControls();
     }
   }
   function refresh() {
@@ -551,13 +629,15 @@ export function createGenerationStudio(host) {
     if (!initialized || active === 'canvas') return;
     if (active === 'audio') { refreshAudio(); return; }
     const panel = panels.get(active); if (!panel) return;
-    const catalogSignature = JSON.stringify([host.engine().models, host.engine().generation_options, drafts[active].models?.dit, drafts[active].sampler]);
+    const catalogSignature = JSON.stringify([backend(), host.engine().models, host.engine().generation_options, drafts[active].models?.dit, drafts[active].sampler]);
     if (lastCatalog.get(active) !== catalogSignature) { updateCatalogs(panel); lastCatalog.set(active, catalogSignature); }
+    const restoreButton = panel.querySelector('.studio-restore-draft'); if (restoreButton) restoreButton.hidden = !recipeBackups[active];
     const submitting = busy.has(active), entry = pending[active], generate = panel.querySelector('.studio-generate'), status = panel.querySelector('.studio-operation'), query = panel.querySelector('.studio-query');
-    generate.disabled = submitting || !!entry || !host.engine().online;
-    generate.textContent = submitting ? '正在处理…' : entry ? '上次提交待确认' : '开始生成';
+    const uploadIssue = mediaIssue(drafts[active], active);
+    generate.disabled = submitting || !!entry || !host.engine().online || !!uploadIssue || recipeTransfers.has(active);
+    generate.textContent = submitting ? '正在处理…' : entry ? '上次提交待确认' : recipeTransfers.has(active) ? '正在读取历史参数…' : '开始生成';
     const topRun = panel.querySelector('.studio-run-top'); topRun.disabled = generate.disabled; topRun.textContent = generate.textContent;
-    status.textContent = entry ? `原请求 ${entry.request_id.slice(0, 8)} · 请先查询，避免重复生成` : host.engine().online ? '本地执行 · 支持切换页面继续工作' : '引擎未连接：打开引擎设置，连接本地 ComfyUI 后刷新模型';
+    status.textContent = entry ? `原请求 ${entry.request_id.slice(0, 8)} · 请先查询，避免重复生成` : uploadIssue || (host.engine().online ? '本地执行 · 支持切换页面继续工作' : '引擎未连接：打开引擎设置，连接本地 ComfyUI 后刷新模型');
     query.hidden = !entry; query.disabled = submitting;
     const resume = panel.querySelector('.studio-resume'); resume.hidden = !entry?.canResume; resume.disabled = submitting;
     resultPanel(active, panel);
@@ -569,21 +649,22 @@ export function createGenerationStudio(host) {
         const saved = JSON.parse(localStorage.getItem(STORAGE) || '{}');
         for (const mode of Object.keys(drafts)) {
           drafts[mode] = restoreDraft(mode, saved.drafts?.[mode]); kindDrafts[mode] = {};
+          if (saved.recipeBackups?.[mode] && studioModeForKind(saved.recipeBackups[mode].kind) === mode) recipeBackups[mode] = restoreDraft(mode, saved.recipeBackups[mode]);
           for (const [kind] of STUDIO_MODES[mode].kinds) if (saved.kindDrafts?.[mode]?.[kind]?.kind === kind) kindDrafts[mode][kind] = restoreDraft(mode, saved.kindDrafts[mode][kind]);
         }
         pending = saved.pending && typeof saved.pending === 'object' && !Array.isArray(saved.pending) ? saved.pending : {}; selectedJobs = saved.selectedJobs || {};
         if (saved.audioDrafts && typeof saved.audioDrafts === 'object') {
           for (const category of ['voice', 'music']) {
             const source = saved.audioDrafts[category]; if (!source || typeof source !== 'object') continue;
-            audioDrafts[category] = { ...newAudioDraft(), package_id: typeof source.package_id === 'string' ? source.package_id.slice(0, 200) : '', values: source.values && typeof source.values === 'object' && !Array.isArray(source.values) ? source.values : {}, valuesByPackage: source.valuesByPackage && typeof source.valuesByPackage === 'object' ? source.valuesByPackage : {}, mediaBackends: source.mediaBackends && typeof source.mediaBackends === 'object' ? source.mediaBackends : {}, mediaBackendsByPackage: source.mediaBackendsByPackage && typeof source.mediaBackendsByPackage === 'object' ? source.mediaBackendsByPackage : {} };
+            audioDrafts[category] = { ...newAudioDraft(), package_id: typeof source.package_id === 'string' ? source.package_id.slice(0, 200) : '', values: source.values && typeof source.values === 'object' && !Array.isArray(source.values) ? source.values : {}, valuesByPackage: source.valuesByPackage && typeof source.valuesByPackage === 'object' ? source.valuesByPackage : {}, mediaBackends: source.mediaBackends && typeof source.mediaBackends === 'object' ? source.mediaBackends : {}, mediaBackendsByPackage: source.mediaBackendsByPackage && typeof source.mediaBackendsByPackage === 'object' ? source.mediaBackendsByPackage : {}, mediaPreviewsByPackage: restoreAudioMediaPreviews(source.mediaPreviewsByPackage) };
           }
           audioCategory = saved.audioCategory === 'music' ? 'music' : 'voice';
         }
       } catch { host.toast('生成草稿读取失败，已保留原存储并打开默认表单', true); }
       initialized = true; document.querySelectorAll('.workspace-nav[data-workspace]').forEach(button => button.addEventListener('click', () => open(button.dataset.workspace)));
-      document.querySelector('#toggle-inspector')?.addEventListener('click', () => { document.body.classList.toggle('inspector-open'); window.dispatchEvent(new Event('resize')); });
+      document.querySelector('#toggle-inspector')?.addEventListener('click', event => { const open = document.body.classList.toggle('inspector-open'); event.currentTarget.setAttribute('aria-pressed', String(open)); window.dispatchEvent(new Event('resize')); });
       open('canvas');
-    }, open, refresh, hasPending: () => busy.size > 0 || Object.keys(pending).length > 0,
+    }, open, refresh, hasPending: () => busy.size > 0 || resultTransfers.size > 0 || recipeTransfers.size > 0 || Object.keys(pending).length > 0,
     diagnosticsRequest() {
       if (active === 'audio') { try { return buildRequest(audioKey()); } catch { return null; } }
       const mode = STUDIO_MODES[active] ? active : 'txt2img', draft = drafts[mode];

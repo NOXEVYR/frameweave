@@ -155,10 +155,14 @@ class EngineManagerTests(unittest.TestCase):
 
     def test_invalid_profile_url_is_rejected_before_becoming_startable(self):
         bad = dict(self.profile, base_url="http://example.com:8188")
-        self.data.joinpath("engines.json").write_text(
-            json.dumps({"version": 1, "profiles": [bad]}), encoding="utf-8")
-        with self.assertRaises(ValueError):
-            EngineManager(self.data)
+        content = json.dumps({"version": 1, "profiles": [bad]}).encode("utf-8")
+        self.data.joinpath("engines.json").write_bytes(content)
+        manager = EngineManager(self.data)
+        self.assertEqual(manager._profiles, [])
+        self.assertFalse(manager.config_protected)
+        self.assertIn("引擎配置", manager.load_error)
+        backup, = self.data.glob("engines.recovery-*.json")
+        self.assertEqual(backup.read_bytes(), content)
 
     def test_missing_start_files_return_error_without_spawning(self):
         self.manager._profiles[0]["python_executable"] = str(Path(self.temp.name) / "missing.exe")

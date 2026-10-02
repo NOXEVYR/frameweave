@@ -80,6 +80,34 @@ class EditorInterfaceTests(unittest.TestCase):
         )
         self.assertEqual(result["outputs"], [])
 
+    def test_media_labels_use_only_explicit_custom_node_titles(self):
+        info = {
+            "LoadImage": {"display_name": "Load Image", "input": {"required": {
+                "image": [["input.png"], {"image_upload": True}],
+            }}, "output": ["IMAGE"]},
+            "AudioLoaderCustom": {"display_name": "Load Audio", "input": {"required": {
+                "audio": ["STRING", {"audio_upload": True}],
+            }}, "output": ["AUDIO"]},
+            "LoadVideo": {"display_name": "Load Video", "input": {"required": {
+                "file": ["COMBO", {"options": ["input.mp4"], "video_upload": True}],
+            }}, "output": ["VIDEO"]},
+        }
+        for node_type, input_name, value in (
+            ("LoadImage", "image", "input.png"),
+            ("AudioLoaderCustom", "audio", "input.wav"),
+            ("LoadVideo", "file", "input.mp4"),
+        ):
+            prompt = {"7": {"class_type": node_type, "inputs": {input_name: value}}}
+            original_label = inspect_interface(prompt, info)["fields"][0]["label"]
+            for title in ("  主参考素材  ", node_type, info[node_type]["display_name"], " ", None):
+                with self.subTest(node_type=node_type, title=title):
+                    prompt["7"]["_meta"] = {"title": title}
+                    before = copy.deepcopy(prompt)
+                    field = inspect_interface(prompt, info)["fields"][0]
+                    self.assertEqual(field["label"], "主参考素材 · 7" if title == "  主参考素材  "
+                                     else original_label)
+                    self.assertEqual(prompt, before)
+
     def test_inspection_reports_known_and_schema_inferred_output_media(self):
         prompt = {
             "1": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]},
@@ -131,7 +159,7 @@ class EditorInterfaceTests(unittest.TestCase):
         default_fields = inspect_document(prompt, info)["fields"]
         all_fields = inspect_document(prompt, info, field_limit=None)["fields"]
         limited = inspect_document(prompt, info, field_limit=1)["fields"]
-        self.assertEqual(len(default_fields), 64)
+        self.assertEqual(default_fields, all_fields)
         self.assertGreater(len(all_fields), 64)
         self.assertEqual(len(limited), 1)
         self.assertEqual(limited[0]["type"], "image")

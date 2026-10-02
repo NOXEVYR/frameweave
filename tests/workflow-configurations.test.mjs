@@ -22,6 +22,7 @@ function makeBundle() {
       { id: 'negative-field', label: 'Negative prompt', type: 'text' },
       { id: 'image-field', label: 'Reference', type: 'image' },
       { id: 'audio-field', label: 'Audio', type: 'audio' },
+      { id: 'video-field', label: 'Video', type: 'video' },
       { id: 'quality-field', label: 'Quality', type: 'number' },
     ],
     packageValues: {
@@ -29,11 +30,13 @@ function makeBundle() {
       'negative-field': 'old negative prompt',
       'image-field': 'PRIVATE_MEDIA_IMAGE_NAME.png',
       'audio-field': 'PRIVATE_MEDIA_AUDIO_NAME.wav',
+      'video-field': 'PRIVATE_MEDIA_VIDEO_NAME.mp4',
       'quality-field': 0.7,
     },
     packageMediaBackends: {
       'image-field': { name: 'PRIVATE_MEDIA_IMAGE_NAME.png', backend: BACKEND },
       'audio-field': { name: 'PRIVATE_MEDIA_AUDIO_NAME.wav', backend: BACKEND },
+      'video-field': { name: 'PRIVATE_MEDIA_VIDEO_NAME.mp4', backend: BACKEND, preview_url: `/api/media/${'b'.repeat(32)}` },
     },
     editor_baseline: { 'prompt-field': 'baseline prompt', 'quality-field': 0.5 },
     editor_controls: [{ node_id: 'inner-node', input: 'prompt', widget_node_id: '10', widget_name: 'text' }],
@@ -83,6 +86,7 @@ test('configuration export is a single reusable package node and preserves its i
   assert.equal(saved.data.packageValues['quality-field'], 0.7);
   assert.equal(saved.data.packageValues['image-field'], '');
   assert.equal(saved.data.packageValues['audio-field'], '');
+  assert.equal(saved.data.packageValues['video-field'], '');
   assert.deepEqual(saved.data.packageMediaBackends, {});
   assert.deepEqual(saved.data.editor_baseline, originalNode.data.editor_baseline);
   assert.deepEqual(saved.data.editor_controls, originalNode.data.editor_controls);

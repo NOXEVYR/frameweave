@@ -1,4 +1,7 @@
-import { parseGraph, serializeGraph } from './graph.mjs';
+import { parseGraph, serializeGraph, generationInputPorts, edgeInputField } from './graph.mjs';
+import { cachedPackageField } from './canvas-port-layout.mjs';
+import { mergeHiddenUpdates } from './editor-hidden-updates.mjs';
+import { remapTextCompositions } from './text-input-composition.mjs';
 
 export function editorOutputEdges(graph, nodeId) {
   const previews = new Set(graph.edges.filter(edge => edge.source === nodeId &&
@@ -9,7 +12,7 @@ export function editorOutputEdges(graph, nodeId) {
 
 export const editorOutputKey = edge => edge.sourceOutput || `legacy-${edge.id}`;
 
-function remappedMediaOwners(node, fields, values, backend, rebindings) {
+function remappedMediaOwners(node, fields, values, backend, rebindings, invalidated = []) {
   const oldFields = new Map((node.data.packageFields || []).map(field => [field.id, field]));
   const nextFields = new Map(fields.map(field => [field.id, field]));
   const oldValues = node.data.packageValues || {};
@@ -17,11 +20,14 @@ function remappedMediaOwners(node, fields, values, backend, rebindings) {
   const owners = {};
   const mediaTypes = new Set(['image', 'audio', 'video']);
   const engineChanged = Boolean(node.data.editor_backend && backend && node.data.editor_backend !== backend);
+  if (!Array.isArray(invalidated) || invalidated.some(id => typeof id !== 'string')) throw new Error('媒体归属失效记录无效');
+  const invalidatedIds = new Set(invalidated);
 
   for (const [oldId, oldField] of oldFields) {
     if (!mediaTypes.has(oldField.type)) continue;
     const nextId = Object.hasOwn(rebindings, oldId) ? rebindings[oldId] : oldId;
     if (!nextId) continue;
+    if (invalidatedIds.has(oldId) || invalidatedIds.has(nextId)) continue;
     const nextField = nextFields.get(nextId);
     if (!nextField || nextField.type !== oldField.type) continue;
 
@@ -32,6 +38,8 @@ function remappedMediaOwners(node, fields, values, backend, rebindings) {
     const prior = oldOwners[oldId];
     if (prior?.name === oldName && prior.backend) {
       owners[nextId] = { name: nextName, backend: prior.backend };
+      if (!engineChanged && backend === prior.backend && nextId === oldId && !Object.hasOwn(rebindings, oldId) &&
+          /^\/api\/media\/[a-f0-9]{32}$/.test(prior.preview_url || '')) owners[nextId].preview_url = prior.preview_url;
     } else if (engineChanged) {
       // Older canvases did not record media ownership. Keep the old editor's
       // engine as the conservative source so applying the interface on a new
@@ -49,24 +57,28 @@ export function editorConnectionSummary(graph, nodeId, outputs) {
   }));
   return [...inputs, ...editorOutputEdges(graph, nodeId).map(edge => {
     const output = outputs.find(item => item.id === edge.sourceOutput);
-    return { direction: 'output', outputId: editorOutputKey(edge), mediaType: output?.mediaType || 'image',
+    const target = graph.nodes.find(node => node.id === edge.target);
+    const expected = generationInputPorts(target).find(field => field.id === edgeInputField(graph, edge))?.type;
+    return { direction: 'output', outputId: editorOutputKey(edge), mediaType: output?.mediaType || expected || 'unknown',
       label: output?.label || `旧图片连接 · ${graph.nodes.find(node => node.id === edge.target)?.data.title || edge.id}` };
   })];
 }
 
 /** Validate the entire proposed graph before changing the live canvas. */
-export function applyEditorInterfaceGraph(graph, nodeId, result) {
+export function applyEditorInterfaceGraph(graph, nodeId, result, { preserveOutputIndices = false } = {}) {
   const copy = structuredClone(graph);
   const node = copy.nodes.find(item => item.id === nodeId);
   if (!node) throw new Error('工作流节点已不存在');
   const fields = result.package.fields;
   const valid = new Set(fields.map(field => field.id));
   const outputs = new Set(editorOutputEdges(copy, nodeId).map(edge => edge.id));
-  const packageMediaBackends = remappedMediaOwners(node, fields, result.values, result.backend_url, result.rebindings || {});
+  const packageMediaBackends = remappedMediaOwners(node, fields, result.values, result.backend_url, result.rebindings || {}, result.invalidated_media_fields || []);
+  const packageTextCompositions = remapTextCompositions(node.data.packageTextCompositions, node.data.packageFields, fields, result.rebindings || {});
+  const hiddenUpdates = mergeHiddenUpdates(node.data.editor_hidden_updates || [], result.hidden_updates || [], result.hidden_updates_reset === true, fields);
   Object.assign(node.data, { package_id: result.package.id, packageValues: result.values,
-    packageFields: fields.map(({ id, label, type }) => ({ id, label, type })),
+    packageFields: fields.map(cachedPackageField),
     editor_backend: result.backend_url, editor_baseline: result.baseline,
-    editor_outputs: result.output_nodes, editor_output_fields: result.outputs, packageMediaBackends });
+    editor_outputs: result.output_nodes, editor_output_fields: result.outputs, packageMediaBackends, packageTextCompositions, editor_hidden_updates: hiddenUpdates });
   if (result.controls) node.data.editor_controls = result.controls;
   copy.edges = copy.edges.filter(edge => {
     if (edge.target === nodeId && edge.targetField) {
@@ -83,7 +95,9 @@ export function applyEditorInterfaceGraph(graph, nodeId, result) {
         const target = result.output_rebindings[key];
         if (target === null) return false;
         edge.sourceOutput = target;
-        edge.outputIndex = 0;
+        // Only the verified initial preset migration preserves the same batch
+        // ordinal. User-directed output branch changes keep their reset rule.
+        if (!preserveOutputIndices) edge.outputIndex = 0;
       } else if (!edge.sourceOutput || !result.output_nodes.includes(edge.sourceOutput)) {
         throw new Error('输出连线尚未明确选择输出分支或解除');
       }

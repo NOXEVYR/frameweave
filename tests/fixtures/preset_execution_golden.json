@@ -1,0 +1,7009 @@
+{
+  "captured_before_refactor": true,
+  "schemas": {
+    "964d6f3ede9d": {
+      "CheckpointLoaderSimple": {
+        "input": {
+          "required": {
+            "ckpt_name": [
+              [
+                "checkpoints/studio_xl.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP",
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "UNETLoader": {
+        "input": {
+          "required": {
+            "unet_name": [
+              [
+                "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+                "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+                "diffusion_models/krea2_turbo_fp8.safetensors",
+                "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+                "QwenImage21/qwen_image_2.1_bf16_from_diffusers.safetensors"
+              ]
+            ],
+            "weight_dtype": [
+              [
+                "default"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "CLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name": [
+              [
+                "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+                "text_encoders/qwen3vl_4b.safetensors",
+                "QwenImage21/qwen3vl_8b_int8_convrot.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "minimax",
+                "krea2",
+                "qwen_image"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "VAELoader": {
+        "input": {
+          "required": {
+            "vae_name": [
+              [
+                "vae/minimax_h3_video_vae.safetensors",
+                "vae/minimax_h3_audio_vae.safetensors",
+                "vae/qwen_image_vae.safetensors",
+                "QwenImage21/qwen_image_2.1_vae_bf16.safetensors",
+                "vae/test_sdxl_vae.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "CLIPTextEncode": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "text": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "ConditioningZeroOut": {
+        "input": {
+          "required": {
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "KSampler": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 1,
+                "max": 1000
+              }
+            ],
+            "cfg": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "sampler_name": [
+              [
+                "euler",
+                "heun"
+              ]
+            ],
+            "scheduler": [
+              [
+                "simple",
+                "karras"
+              ]
+            ],
+            "positive": [
+              "CONDITIONING"
+            ],
+            "negative": [
+              "CONDITIONING"
+            ],
+            "latent_image": [
+              "LATENT"
+            ],
+            "denoise": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 1
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptyLatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptySD3LatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEEncode": {
+        "input": {
+          "required": {
+            "pixels": [
+              "IMAGE"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEDecode": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "VAEDecodeAudio": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "AUDIO"
+        ],
+        "output_node": false
+      },
+      "SaveImage": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [],
+        "output_node": true
+      },
+      "LoadImage": {
+        "input": {
+          "required": {
+            "image": [
+              [
+                "first.png",
+                "last.png",
+                "style.png"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE",
+          "MASK"
+        ],
+        "output_node": false
+      },
+      "ImageScale": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "image": [
+              "IMAGE"
+            ],
+            "upscale_method": [
+              [
+                "lanczos"
+              ]
+            ],
+            "crop": [
+              [
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ImageToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {
+            "first_frame": [
+              "IMAGE"
+            ],
+            "last_frame": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ReferenceToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "audio_vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "ref_image_size": [
+              "COMBO",
+              {
+                "options": [
+                  "match",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "optional": {
+            "ref_images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "ref_image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "prefix": "ref_image_",
+                  "min": 0,
+                  "max": 9
+                }
+              }
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3SigmaShift": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LTXVSeparateAVLatent": {
+        "input": {
+          "required": {
+            "av_latent": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "CreateVideo": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "fps": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "audio": [
+              "AUDIO"
+            ]
+          }
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": false
+      },
+      "SaveVideo": {
+        "input": {
+          "required": {
+            "video": [
+              "VIDEO"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ],
+            "format": [
+              "COMBO",
+              {
+                "options": [
+                  "mp4",
+                  "auto"
+                ]
+              }
+            ],
+            "codec": [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                "options": [
+                  {
+                    "key": "auto",
+                    "inputs": {}
+                  },
+                  {
+                    "key": "h264",
+                    "inputs": {
+                      "optional": {
+                        "crf": [
+                          "FLOAT",
+                          {
+                            "min": 0,
+                            "max": 100
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": true
+      },
+      "Krea2OstrisEditModelPatch": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "TextEncodeKrea2OstrisEdit": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ],
+            "image1": [
+              "IMAGE"
+            ],
+            "image2": [
+              "IMAGE"
+            ],
+            "image3": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderBypassModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoader": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/second.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "strength_clip": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3DualClockSamplerT8": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "av_latent": [
+              "LATENT"
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "sampler_name": [
+              "COMBO",
+              {
+                "options": [
+                  "dual_clock_euler"
+                ]
+              }
+            ],
+            "scheduler": [
+              "COMBO",
+              {
+                "options": [
+                  "native_flow",
+                  "simple"
+                ]
+              }
+            ]
+          }
+        },
+        "output": [
+          "MODEL",
+          "SAMPLER",
+          "SIGMAS"
+        ],
+        "output_node": false
+      },
+      "RandomNoise": {
+        "input": {
+          "required": {
+            "noise_seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "NOISE"
+        ],
+        "output_node": false
+      },
+      "BasicGuider": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "GUIDER"
+        ],
+        "output_node": false
+      },
+      "SamplerCustomAdvanced": {
+        "input": {
+          "required": {
+            "noise": [
+              "NOISE"
+            ],
+            "guider": [
+              "GUIDER"
+            ],
+            "sampler": [
+              "SAMPLER"
+            ],
+            "sigmas": [
+              "SIGMAS"
+            ],
+            "latent_image": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "TextEncodeQwenImage21": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "negative_prompt": [
+              "STRING"
+            ],
+            "resolution": [
+              "INT",
+              {
+                "default": 1024,
+                "min": 0,
+                "max": 4096,
+                "step": 32
+              }
+            ],
+            "images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "names": [
+                    "image_1",
+                    "image_2",
+                    "image_3",
+                    "image_4",
+                    "image_5",
+                    "image_6",
+                    "image_7",
+                    "image_8",
+                    "image_9",
+                    "image_10",
+                    "image_11",
+                    "image_12",
+                    "image_13",
+                    "image_14",
+                    "image_15",
+                    "image_16"
+                  ],
+                  "min": 0
+                }
+              }
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "CONDITIONING",
+          "LATENT"
+        ]
+      },
+      "DualCLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name1": [
+              [
+                "text_encoders/clip_l.safetensors"
+              ]
+            ],
+            "clip_name2": [
+              [
+                "text_encoders/clip_g.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "sdxl",
+                "flux"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "LatentUpscale": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "upscale_method": [
+              [
+                "nearest-exact",
+                "bislerp"
+              ]
+            ],
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "crop": [
+              [
+                "disabled",
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      }
+    },
+    "f0fe98205d88": {
+      "CheckpointLoaderSimple": {
+        "input": {
+          "required": {
+            "ckpt_name": [
+              [
+                "checkpoints/studio_xl.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP",
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "UNETLoader": {
+        "input": {
+          "required": {
+            "unet_name": [
+              [
+                "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+                "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+                "diffusion_models/krea2_turbo_fp8.safetensors",
+                "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+                "QwenImage21/qwen_image_2.1_bf16_from_diffusers.safetensors"
+              ]
+            ],
+            "weight_dtype": [
+              [
+                "default"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "CLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name": [
+              [
+                "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+                "text_encoders/qwen3vl_4b.safetensors",
+                "QwenImage21/qwen3vl_8b_int8_convrot.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "minimax",
+                "krea2",
+                "qwen_image"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "VAELoader": {
+        "input": {
+          "required": {
+            "vae_name": [
+              [
+                "vae/minimax_h3_video_vae.safetensors",
+                "vae/minimax_h3_audio_vae.safetensors",
+                "vae/qwen_image_vae.safetensors",
+                "QwenImage21/qwen_image_2.1_vae_bf16.safetensors",
+                "vae/test_sdxl_vae.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "CLIPTextEncode": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "text": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "ConditioningZeroOut": {
+        "input": {
+          "required": {
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "KSampler": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 1,
+                "max": 1000
+              }
+            ],
+            "cfg": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "sampler_name": [
+              [
+                "euler",
+                "heun"
+              ]
+            ],
+            "scheduler": [
+              [
+                "simple",
+                "karras"
+              ]
+            ],
+            "positive": [
+              "CONDITIONING"
+            ],
+            "negative": [
+              "CONDITIONING"
+            ],
+            "latent_image": [
+              "LATENT"
+            ],
+            "denoise": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 1
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptyLatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptySD3LatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEEncode": {
+        "input": {
+          "required": {
+            "pixels": [
+              "IMAGE"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEDecode": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "SaveImage": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [],
+        "output_node": true
+      },
+      "LoadImage": {
+        "input": {
+          "required": {
+            "image": [
+              [
+                "first.png",
+                "last.png",
+                "style.png"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE",
+          "MASK"
+        ],
+        "output_node": false
+      },
+      "ImageScale": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "image": [
+              "IMAGE"
+            ],
+            "upscale_method": [
+              [
+                "lanczos"
+              ]
+            ],
+            "crop": [
+              [
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ImageToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {
+            "first_frame": [
+              "IMAGE"
+            ],
+            "last_frame": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ReferenceToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "audio_vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "ref_image_size": [
+              "COMBO",
+              {
+                "options": [
+                  "match",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "optional": {
+            "ref_images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "ref_image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "prefix": "ref_image_",
+                  "min": 0,
+                  "max": 9
+                }
+              }
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3SigmaShift": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "CreateVideo": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "fps": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "audio": [
+              "AUDIO"
+            ]
+          }
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": false
+      },
+      "SaveVideo": {
+        "input": {
+          "required": {
+            "video": [
+              "VIDEO"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ],
+            "format": [
+              "COMBO",
+              {
+                "options": [
+                  "mp4",
+                  "auto"
+                ]
+              }
+            ],
+            "codec": [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                "options": [
+                  {
+                    "key": "auto",
+                    "inputs": {}
+                  },
+                  {
+                    "key": "h264",
+                    "inputs": {
+                      "optional": {
+                        "crf": [
+                          "FLOAT",
+                          {
+                            "min": 0,
+                            "max": 100
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": true
+      },
+      "Krea2OstrisEditModelPatch": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "TextEncodeKrea2OstrisEdit": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ],
+            "image1": [
+              "IMAGE"
+            ],
+            "image2": [
+              "IMAGE"
+            ],
+            "image3": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderBypassModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoader": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/second.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "strength_clip": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3DualClockSamplerT8": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "av_latent": [
+              "LATENT"
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "sampler_name": [
+              "COMBO",
+              {
+                "options": [
+                  "dual_clock_euler"
+                ]
+              }
+            ],
+            "scheduler": [
+              "COMBO",
+              {
+                "options": [
+                  "native_flow",
+                  "simple"
+                ]
+              }
+            ]
+          }
+        },
+        "output": [
+          "MODEL",
+          "SAMPLER",
+          "SIGMAS"
+        ],
+        "output_node": false
+      },
+      "RandomNoise": {
+        "input": {
+          "required": {
+            "noise_seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "NOISE"
+        ],
+        "output_node": false
+      },
+      "BasicGuider": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "GUIDER"
+        ],
+        "output_node": false
+      },
+      "SamplerCustomAdvanced": {
+        "input": {
+          "required": {
+            "noise": [
+              "NOISE"
+            ],
+            "guider": [
+              "GUIDER"
+            ],
+            "sampler": [
+              "SAMPLER"
+            ],
+            "sigmas": [
+              "SIGMAS"
+            ],
+            "latent_image": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "TextEncodeQwenImage21": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "negative_prompt": [
+              "STRING"
+            ],
+            "resolution": [
+              "INT",
+              {
+                "default": 1024,
+                "min": 0,
+                "max": 4096,
+                "step": 32
+              }
+            ],
+            "images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "names": [
+                    "image_1",
+                    "image_2",
+                    "image_3",
+                    "image_4",
+                    "image_5",
+                    "image_6",
+                    "image_7",
+                    "image_8",
+                    "image_9",
+                    "image_10",
+                    "image_11",
+                    "image_12",
+                    "image_13",
+                    "image_14",
+                    "image_15",
+                    "image_16"
+                  ],
+                  "min": 0
+                }
+              }
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "CONDITIONING",
+          "LATENT"
+        ]
+      },
+      "DualCLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name1": [
+              [
+                "text_encoders/clip_l.safetensors"
+              ]
+            ],
+            "clip_name2": [
+              [
+                "text_encoders/clip_g.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "sdxl",
+                "flux"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "LatentUpscale": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "upscale_method": [
+              [
+                "nearest-exact",
+                "bislerp"
+              ]
+            ],
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "crop": [
+              [
+                "disabled",
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3AVDecodeT8": {
+        "input": {
+          "required": {
+            "av_latent": [
+              "LATENT"
+            ],
+            "video_vae": [
+              "VAE"
+            ],
+            "audio_vae": [
+              "VAE"
+            ]
+          }
+        },
+        "output": [
+          "IMAGE",
+          "AUDIO"
+        ]
+      }
+    },
+    "b81a3bdb5113": {
+      "CheckpointLoaderSimple": {
+        "input": {
+          "required": {
+            "ckpt_name": [
+              [
+                "checkpoints/studio_xl.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP",
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "UNETLoader": {
+        "input": {
+          "required": {
+            "unet_name": [
+              [
+                "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+                "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+                "diffusion_models/krea2_turbo_fp8.safetensors",
+                "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+                "QwenImage21/qwen_image_2.1_bf16_from_diffusers.safetensors"
+              ]
+            ],
+            "weight_dtype": [
+              [
+                "default"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "CLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name": [
+              [
+                "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+                "text_encoders/qwen3vl_4b.safetensors",
+                "QwenImage21/qwen3vl_8b_int8_convrot.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "minimax",
+                "krea2",
+                "qwen_image"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "VAELoader": {
+        "input": {
+          "required": {
+            "vae_name": [
+              [
+                "vae/minimax_h3_video_vae.safetensors",
+                "vae/minimax_h3_audio_vae.safetensors",
+                "vae/qwen_image_vae.safetensors",
+                "QwenImage21/qwen_image_2.1_vae_bf16.safetensors",
+                "vae/test_sdxl_vae.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "CLIPTextEncode": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "text": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "ConditioningZeroOut": {
+        "input": {
+          "required": {
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "KSampler": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 1,
+                "max": 1000
+              }
+            ],
+            "cfg": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "sampler_name": [
+              [
+                "euler",
+                "heun"
+              ]
+            ],
+            "scheduler": [
+              [
+                "simple",
+                "karras"
+              ]
+            ],
+            "positive": [
+              "CONDITIONING"
+            ],
+            "negative": [
+              "CONDITIONING"
+            ],
+            "latent_image": [
+              "LATENT"
+            ],
+            "denoise": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 1
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptyLatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptySD3LatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEEncode": {
+        "input": {
+          "required": {
+            "pixels": [
+              "IMAGE"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEDecode": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "VAEDecodeAudio": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "AUDIO"
+        ],
+        "output_node": false
+      },
+      "SaveImage": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [],
+        "output_node": true
+      },
+      "LoadImage": {
+        "input": {
+          "required": {
+            "image": [
+              [
+                "first.png",
+                "last.png",
+                "style.png"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE",
+          "MASK"
+        ],
+        "output_node": false
+      },
+      "ImageScale": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "image": [
+              "IMAGE"
+            ],
+            "upscale_method": [
+              [
+                "lanczos"
+              ]
+            ],
+            "crop": [
+              [
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ImageToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {
+            "first_frame": [
+              "IMAGE"
+            ],
+            "last_frame": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ReferenceToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "audio_vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "ref_image_size": [
+              "COMBO",
+              {
+                "options": [
+                  "match",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "optional": {
+            "ref_images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "ref_image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "prefix": "ref_image_",
+                  "min": 0,
+                  "max": 9
+                }
+              }
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3SigmaShift": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LTXVSeparateAVLatent": {
+        "input": {
+          "required": {
+            "av_latent": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "CreateVideo": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "fps": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "audio": [
+              "AUDIO"
+            ]
+          }
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": false
+      },
+      "SaveVideo": {
+        "input": {
+          "required": {
+            "video": [
+              "VIDEO"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ],
+            "format": [
+              "COMBO",
+              {
+                "options": [
+                  "mp4",
+                  "auto"
+                ]
+              }
+            ],
+            "codec": [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                "options": [
+                  {
+                    "key": "auto",
+                    "inputs": {}
+                  },
+                  {
+                    "key": "h264",
+                    "inputs": {
+                      "optional": {
+                        "crf": [
+                          "FLOAT",
+                          {
+                            "min": 0,
+                            "max": 100
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": true
+      },
+      "Krea2OstrisEditModelPatch": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "TextEncodeKrea2OstrisEdit": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ],
+            "image1": [
+              "IMAGE"
+            ],
+            "image2": [
+              "IMAGE"
+            ],
+            "image3": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoader": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/second.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "strength_clip": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3DualClockSamplerT8": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "av_latent": [
+              "LATENT"
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "sampler_name": [
+              "COMBO",
+              {
+                "options": [
+                  "dual_clock_euler"
+                ]
+              }
+            ],
+            "scheduler": [
+              "COMBO",
+              {
+                "options": [
+                  "native_flow",
+                  "simple"
+                ]
+              }
+            ]
+          }
+        },
+        "output": [
+          "MODEL",
+          "SAMPLER",
+          "SIGMAS"
+        ],
+        "output_node": false
+      },
+      "RandomNoise": {
+        "input": {
+          "required": {
+            "noise_seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "NOISE"
+        ],
+        "output_node": false
+      },
+      "BasicGuider": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "GUIDER"
+        ],
+        "output_node": false
+      },
+      "SamplerCustomAdvanced": {
+        "input": {
+          "required": {
+            "noise": [
+              "NOISE"
+            ],
+            "guider": [
+              "GUIDER"
+            ],
+            "sampler": [
+              "SAMPLER"
+            ],
+            "sigmas": [
+              "SIGMAS"
+            ],
+            "latent_image": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "TextEncodeQwenImage21": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "negative_prompt": [
+              "STRING"
+            ],
+            "resolution": [
+              "INT",
+              {
+                "default": 1024,
+                "min": 0,
+                "max": 4096,
+                "step": 32
+              }
+            ],
+            "images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "names": [
+                    "image_1",
+                    "image_2",
+                    "image_3",
+                    "image_4",
+                    "image_5",
+                    "image_6",
+                    "image_7",
+                    "image_8",
+                    "image_9",
+                    "image_10",
+                    "image_11",
+                    "image_12",
+                    "image_13",
+                    "image_14",
+                    "image_15",
+                    "image_16"
+                  ],
+                  "min": 0
+                }
+              }
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "CONDITIONING",
+          "LATENT"
+        ]
+      },
+      "DualCLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name1": [
+              [
+                "text_encoders/clip_l.safetensors"
+              ]
+            ],
+            "clip_name2": [
+              [
+                "text_encoders/clip_g.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "sdxl",
+                "flux"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "LatentUpscale": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "upscale_method": [
+              [
+                "nearest-exact",
+                "bislerp"
+              ]
+            ],
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "crop": [
+              [
+                "disabled",
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      }
+    },
+    "83ce1cd39475": {
+      "CheckpointLoaderSimple": {
+        "input": {
+          "required": {
+            "ckpt_name": [
+              [
+                "checkpoints/studio_xl.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP",
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "UNETLoader": {
+        "input": {
+          "required": {
+            "unet_name": [
+              [
+                "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+                "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+                "diffusion_models/krea2_turbo_fp8.safetensors",
+                "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+                "QwenImage21/qwen_image_2.1_bf16_from_diffusers.safetensors"
+              ]
+            ],
+            "weight_dtype": [
+              [
+                "default"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "CLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name": [
+              [
+                "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+                "text_encoders/qwen3vl_4b.safetensors",
+                "QwenImage21/qwen3vl_8b_int8_convrot.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "minimax",
+                "krea2",
+                "qwen_image"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "VAELoader": {
+        "input": {
+          "required": {
+            "vae_name": [
+              [
+                "vae/minimax_h3_video_vae.safetensors",
+                "vae/minimax_h3_audio_vae.safetensors",
+                "vae/qwen_image_vae.safetensors",
+                "QwenImage21/qwen_image_2.1_vae_bf16.safetensors",
+                "vae/test_sdxl_vae.safetensors"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VAE"
+        ],
+        "output_node": false
+      },
+      "CLIPTextEncode": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "text": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "ConditioningZeroOut": {
+        "input": {
+          "required": {
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "KSampler": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 1,
+                "max": 1000
+              }
+            ],
+            "cfg": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "sampler_name": [
+              [
+                "euler",
+                "heun"
+              ]
+            ],
+            "scheduler": [
+              [
+                "simple",
+                "karras"
+              ]
+            ],
+            "positive": [
+              "CONDITIONING"
+            ],
+            "negative": [
+              "CONDITIONING"
+            ],
+            "latent_image": [
+              "LATENT"
+            ],
+            "denoise": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 1
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptyLatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "EmptySD3LatentImage": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "batch_size": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEEncode": {
+        "input": {
+          "required": {
+            "pixels": [
+              "IMAGE"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "VAEDecode": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "VAEDecodeAudio": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "vae": [
+              "VAE"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "AUDIO"
+        ],
+        "output_node": false
+      },
+      "SaveImage": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [],
+        "output_node": true
+      },
+      "LoadImage": {
+        "input": {
+          "required": {
+            "image": [
+              [
+                "first.png",
+                "last.png",
+                "style.png"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE",
+          "MASK"
+        ],
+        "output_node": false
+      },
+      "ImageScale": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "image": [
+              "IMAGE"
+            ],
+            "upscale_method": [
+              [
+                "lanczos"
+              ]
+            ],
+            "crop": [
+              [
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "IMAGE"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ImageToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {
+            "first_frame": [
+              "IMAGE"
+            ],
+            "last_frame": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3ReferenceToVideo": {
+        "input": {
+          "required": {
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "vae": [
+              "VAE"
+            ],
+            "audio_vae": [
+              "VAE"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "length": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "ref_image_size": [
+              "COMBO",
+              {
+                "options": [
+                  "match",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "optional": {
+            "ref_images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "ref_image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "prefix": "ref_image_",
+                  "min": 0,
+                  "max": 9
+                }
+              }
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3SigmaShift": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LTXVSeparateAVLatent": {
+        "input": {
+          "required": {
+            "av_latent": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "CreateVideo": {
+        "input": {
+          "required": {
+            "images": [
+              "IMAGE"
+            ],
+            "fps": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "audio": [
+              "AUDIO"
+            ]
+          }
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": false
+      },
+      "SaveVideo": {
+        "input": {
+          "required": {
+            "video": [
+              "VIDEO"
+            ],
+            "filename_prefix": [
+              "STRING"
+            ],
+            "format": [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                "options": [
+                  {
+                    "key": "mp4",
+                    "inputs": {
+                      "required": {
+                        "codec": [
+                          [
+                            "h264",
+                            "auto"
+                          ]
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "VIDEO"
+        ],
+        "output_node": true
+      },
+      "Krea2OstrisEditModelPatch": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "TextEncodeKrea2OstrisEdit": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ],
+            "image1": [
+              "IMAGE"
+            ],
+            "image2": [
+              "IMAGE"
+            ],
+            "image3": [
+              "IMAGE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoaderBypassModelOnly": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/qwen_image_2.1_style.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL"
+        ],
+        "output_node": false
+      },
+      "LoraLoader": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "clip": [
+              "CLIP"
+            ],
+            "lora_name": [
+              [
+                "loras/turbo.safetensors",
+                "loras/second.safetensors"
+              ]
+            ],
+            "strength_model": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "strength_clip": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "MODEL",
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "MiniMaxH3DualClockSamplerT8": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "av_latent": [
+              "LATENT"
+            ],
+            "steps": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ],
+            "shift_video": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "shift_audio": [
+              "FLOAT",
+              {
+                "min": 0,
+                "max": 100
+              }
+            ]
+          },
+          "optional": {
+            "sampler_name": [
+              "COMBO",
+              {
+                "options": [
+                  "dual_clock_euler"
+                ]
+              }
+            ],
+            "scheduler": [
+              "COMBO",
+              {
+                "options": [
+                  "native_flow",
+                  "simple"
+                ]
+              }
+            ]
+          }
+        },
+        "output": [
+          "MODEL",
+          "SAMPLER",
+          "SIGMAS"
+        ],
+        "output_node": false
+      },
+      "RandomNoise": {
+        "input": {
+          "required": {
+            "noise_seed": [
+              "INT",
+              {
+                "min": 0,
+                "max": 18446744073709551615
+              }
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "NOISE"
+        ],
+        "output_node": false
+      },
+      "BasicGuider": {
+        "input": {
+          "required": {
+            "model": [
+              "MODEL"
+            ],
+            "conditioning": [
+              "CONDITIONING"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "GUIDER"
+        ],
+        "output_node": false
+      },
+      "SamplerCustomAdvanced": {
+        "input": {
+          "required": {
+            "noise": [
+              "NOISE"
+            ],
+            "guider": [
+              "GUIDER"
+            ],
+            "sampler": [
+              "SAMPLER"
+            ],
+            "sigmas": [
+              "SIGMAS"
+            ],
+            "latent_image": [
+              "LATENT"
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT",
+          "LATENT"
+        ],
+        "output_node": false
+      },
+      "TextEncodeQwenImage21": {
+        "input": {
+          "required": {
+            "clip": [
+              "CLIP"
+            ],
+            "prompt": [
+              "STRING"
+            ],
+            "negative_prompt": [
+              "STRING"
+            ],
+            "resolution": [
+              "INT",
+              {
+                "default": 1024,
+                "min": 0,
+                "max": 4096,
+                "step": 32
+              }
+            ],
+            "images": [
+              "COMFY_AUTOGROW_V3",
+              {
+                "template": {
+                  "input": {
+                    "required": {
+                      "image": [
+                        "IMAGE"
+                      ]
+                    }
+                  },
+                  "names": [
+                    "image_1",
+                    "image_2",
+                    "image_3",
+                    "image_4",
+                    "image_5",
+                    "image_6",
+                    "image_7",
+                    "image_8",
+                    "image_9",
+                    "image_10",
+                    "image_11",
+                    "image_12",
+                    "image_13",
+                    "image_14",
+                    "image_15",
+                    "image_16"
+                  ],
+                  "min": 0
+                }
+              }
+            ]
+          },
+          "optional": {
+            "vae": [
+              "VAE"
+            ]
+          }
+        },
+        "output": [
+          "CONDITIONING",
+          "CONDITIONING",
+          "LATENT"
+        ]
+      },
+      "DualCLIPLoader": {
+        "input": {
+          "required": {
+            "clip_name1": [
+              [
+                "text_encoders/clip_l.safetensors"
+              ]
+            ],
+            "clip_name2": [
+              [
+                "text_encoders/clip_g.safetensors"
+              ]
+            ],
+            "type": [
+              [
+                "sdxl",
+                "flux"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "CLIP"
+        ],
+        "output_node": false
+      },
+      "LatentUpscale": {
+        "input": {
+          "required": {
+            "samples": [
+              "LATENT"
+            ],
+            "upscale_method": [
+              [
+                "nearest-exact",
+                "bislerp"
+              ]
+            ],
+            "width": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "height": [
+              "INT",
+              {
+                "min": 0,
+                "max": 16384,
+                "step": 8
+              }
+            ],
+            "crop": [
+              [
+                "disabled",
+                "center"
+              ]
+            ]
+          },
+          "optional": {}
+        },
+        "output": [
+          "LATENT"
+        ],
+        "output_node": false
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "h3_t2v",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_t2v",
+        "references": []
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "5": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124
+            }
+          },
+          "6": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "7": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "5",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "6",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "5",
+                0
+              ],
+              "negative": [
+                "7",
+                0
+              ],
+              "latent_image": [
+                "5",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "9": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "8",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "9",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "9",
+                1
+              ],
+              "vae": [
+                "4",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "10",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "11",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "12",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_t2v",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 1.0,
+          "warnings": [
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 13,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "h3_i2v",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_i2v",
+        "references": [
+          "first.png",
+          "last.png"
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "5": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "last.png"
+            }
+          },
+          "6": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "7": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124,
+              "first_frame": [
+                "4",
+                0
+              ],
+              "last_frame": [
+                "5",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "9": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "7",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "8",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "7",
+                0
+              ],
+              "negative": [
+                "9",
+                0
+              ],
+              "latent_image": [
+                "7",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "11": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "10",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "11",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "11",
+                1
+              ],
+              "vae": [
+                "6",
+                0
+              ]
+            }
+          },
+          "14": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "12",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "13",
+                0
+              ]
+            }
+          },
+          "15": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "14",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_i2v",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 1.0,
+          "warnings": [
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 15,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 2,
+          "reference_roles": [
+            "start",
+            "end"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "h3_ref",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_ref",
+        "references": [
+          "first.png",
+          "style.png"
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "5": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "style.png"
+            }
+          },
+          "6": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "7": {
+            "class_type": "MiniMaxH3ReferenceToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124,
+              "audio_vae": [
+                "6",
+                0
+              ],
+              "ref_image_size": "match",
+              "ref_images.ref_image_0": [
+                "4",
+                0
+              ],
+              "ref_images.ref_image_1": [
+                "5",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "9": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "7",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "8",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "7",
+                0
+              ],
+              "negative": [
+                "9",
+                0
+              ],
+              "latent_image": [
+                "7",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "11": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "10",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "11",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "11",
+                1
+              ],
+              "vae": [
+                "6",
+                0
+              ]
+            }
+          },
+          "14": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "12",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "13",
+                0
+              ]
+            }
+          },
+          "15": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "14",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_ref",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 1.0,
+          "warnings": [
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 15,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 2,
+          "reference_roles": [
+            "reference",
+            "reference"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "krea",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "krea",
+        "references": []
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/krea2_turbo_fp8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_4b.safetensors",
+              "type": "krea2"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/qwen_image_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "5": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "4",
+                0
+              ]
+            }
+          },
+          "6": {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          "7": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 8,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "4",
+                0
+              ],
+              "negative": [
+                "5",
+                0
+              ],
+              "latent_image": [
+                "6",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "7",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "8",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "krea",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 8,
+          "cfg": 1.0,
+          "warnings": [],
+          "models": {
+            "dit": "diffusion_models/krea2_turbo_fp8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_4b.safetensors",
+            "vae": "vae/qwen_image_vae.safetensors"
+          },
+          "nodes": 9,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "sdxl",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "sdxl",
+        "references": []
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {
+              "ckpt_name": "checkpoints/studio_xl.safetensors"
+            }
+          },
+          "2": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "3": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": ""
+            }
+          },
+          "4": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          "5": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 7.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "2",
+                0
+              ],
+              "negative": [
+                "3",
+                0
+              ],
+              "latent_image": [
+                "4",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "6": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "5",
+                0
+              ],
+              "vae": [
+                "1",
+                2
+              ]
+            }
+          },
+          "7": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "6",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "sdxl",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 7.0,
+          "warnings": [],
+          "models": {
+            "checkpoint": "checkpoints/studio_xl.safetensors"
+          },
+          "nodes": 7,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "sdxl_i2i",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "sdxl_i2i",
+        "references": [
+          "first.png"
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {
+              "ckpt_name": "checkpoints/studio_xl.safetensors"
+            }
+          },
+          "2": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "3": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": ""
+            }
+          },
+          "5": {
+            "class_type": "ImageScale",
+            "inputs": {
+              "image": [
+                "2",
+                0
+              ],
+              "upscale_method": "lanczos",
+              "width": 1024,
+              "height": 1024,
+              "crop": "center"
+            }
+          },
+          "6": {
+            "class_type": "VAEEncode",
+            "inputs": {
+              "pixels": [
+                "5",
+                0
+              ],
+              "vae": [
+                "1",
+                2
+              ]
+            }
+          },
+          "7": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 7.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "3",
+                0
+              ],
+              "negative": [
+                "4",
+                0
+              ],
+              "latent_image": [
+                "6",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "7",
+                0
+              ],
+              "vae": [
+                "1",
+                2
+              ]
+            }
+          },
+          "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "8",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "sdxl_i2i",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 7.0,
+          "warnings": [],
+          "models": {
+            "checkpoint": "checkpoints/studio_xl.safetensors"
+          },
+          "nodes": 9,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 1,
+          "reference_roles": [
+            "reference"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "qwen21_t2i",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "qwen21_t2i",
+        "references": []
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+              "type": "qwen_image"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "TextEncodeQwenImage21",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "negative_prompt": "",
+              "resolution": 1024
+            }
+          },
+          "5": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          "6": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 40,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "4",
+                0
+              ],
+              "negative": [
+                "4",
+                1
+              ],
+              "latent_image": [
+                "5",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "7": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "6",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "7",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "qwen21_t2i",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 40,
+          "cfg": 1.0,
+          "warnings": [],
+          "models": {
+            "dit": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+            "text_encoder": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+            "vae": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors"
+          },
+          "ref_resolution": 1024,
+          "nodes": 8,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "qwen21_edit",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "qwen21_edit",
+        "references": [
+          "first.png",
+          "style.png"
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+              "type": "qwen_image"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "5": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "style.png"
+            }
+          },
+          "6": {
+            "class_type": "TextEncodeQwenImage21",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "negative_prompt": "",
+              "resolution": 1024,
+              "vae": [
+                "3",
+                0
+              ],
+              "images.image_1": [
+                "4",
+                0
+              ],
+              "images.image_2": [
+                "5",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 25,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "6",
+                0
+              ],
+              "negative": [
+                "6",
+                1
+              ],
+              "latent_image": [
+                "6",
+                2
+              ],
+              "denoise": 1.0
+            }
+          },
+          "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "7",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "8",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "qwen21_edit",
+          "width": null,
+          "height": null,
+          "seed": 0,
+          "steps": 25,
+          "cfg": 1.0,
+          "warnings": [],
+          "models": {
+            "dit": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+            "text_encoder": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+            "vae": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors"
+          },
+          "ref_resolution": 1024,
+          "requested_width": 1024,
+          "requested_height": 1024,
+          "size_mode": "first_reference",
+          "nodes": 9,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 2,
+          "reference_roles": [
+            "reference",
+            "reference"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "sdxl_full",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "sdxl",
+        "references": [
+          "first.png"
+        ],
+        "denoise": 0.6,
+        "negative": "blur",
+        "models": {
+          "sdxl_clip_l": "text_encoders/clip_l.safetensors",
+          "sdxl_clip_g": "text_encoders/clip_g.safetensors",
+          "vae": "vae/test_sdxl_vae.safetensors"
+        },
+        "loras": [
+          {
+            "name": "loras/turbo.safetensors",
+            "strength_model": 0.8,
+            "strength_clip": 0.4
+          },
+          {
+            "name": "loras/second.safetensors",
+            "strength_model": 0.3,
+            "strength_clip": 0
+          }
+        ],
+        "refine": {
+          "enabled": true,
+          "width": 2048,
+          "height": 1536,
+          "steps": 15,
+          "denoise": 0.25
+        }
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {
+              "ckpt_name": "checkpoints/studio_xl.safetensors"
+            }
+          },
+          "2": {
+            "class_type": "DualCLIPLoader",
+            "inputs": {
+              "clip_name1": "text_encoders/clip_l.safetensors",
+              "clip_name2": "text_encoders/clip_g.safetensors",
+              "type": "sdxl"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/test_sdxl_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoraLoader",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "clip": [
+                "2",
+                0
+              ],
+              "lora_name": "loras/turbo.safetensors",
+              "strength_model": 0.8,
+              "strength_clip": 0.4
+            }
+          },
+          "5": {
+            "class_type": "LoraLoader",
+            "inputs": {
+              "model": [
+                "4",
+                0
+              ],
+              "clip": [
+                "4",
+                1
+              ],
+              "lora_name": "loras/second.safetensors",
+              "strength_model": 0.3,
+              "strength_clip": 0.0
+            }
+          },
+          "6": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "7": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "5",
+                1
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "8": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "5",
+                1
+              ],
+              "text": "blur"
+            }
+          },
+          "9": {
+            "class_type": "ImageScale",
+            "inputs": {
+              "image": [
+                "6",
+                0
+              ],
+              "upscale_method": "lanczos",
+              "width": 1024,
+              "height": 1024,
+              "crop": "center"
+            }
+          },
+          "10": {
+            "class_type": "VAEEncode",
+            "inputs": {
+              "pixels": [
+                "9",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "5",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 7.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "7",
+                0
+              ],
+              "negative": [
+                "8",
+                0
+              ],
+              "latent_image": [
+                "10",
+                0
+              ],
+              "denoise": 0.6
+            }
+          },
+          "12": {
+            "class_type": "LatentUpscale",
+            "inputs": {
+              "samples": [
+                "11",
+                0
+              ],
+              "upscale_method": "bislerp",
+              "width": 2048,
+              "height": 1536,
+              "crop": "disabled"
+            }
+          },
+          "13": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "5",
+                0
+              ],
+              "seed": 0,
+              "steps": 15,
+              "cfg": 7.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "7",
+                0
+              ],
+              "negative": [
+                "8",
+                0
+              ],
+              "latent_image": [
+                "12",
+                0
+              ],
+              "denoise": 0.25
+            }
+          },
+          "14": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "13",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "15": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "14",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "sdxl",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 7.0,
+          "warnings": [
+            "LoRA 文件名与节点校验不能证明权重兼容；多 LoRA 组合的效果和显存需求需实际生成验证。",
+            "二次重绘超过约百万像素，显存与耗时会明显增加；实际可运行性取决于所选模型和后端。"
+          ],
+          "models": {
+            "checkpoint": "checkpoints/studio_xl.safetensors",
+            "sdxl_clip_l": "text_encoders/clip_l.safetensors",
+            "sdxl_clip_g": "text_encoders/clip_g.safetensors",
+            "vae": "vae/test_sdxl_vae.safetensors"
+          },
+          "refine": {
+            "enabled": true,
+            "width": 2048,
+            "height": 1536,
+            "steps": 15,
+            "denoise": 0.25,
+            "upscale_method": "bislerp"
+          },
+          "nodes": 15,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 1,
+          "reference_roles": [
+            "reference"
+          ],
+          "denoise": 0.6,
+          "loras": [
+            {
+              "name": "loras/turbo.safetensors",
+              "strength_model": 0.8,
+              "strength_clip": 0.4
+            },
+            {
+              "name": "loras/second.safetensors",
+              "strength_model": 0.3,
+              "strength_clip": 0.0
+            }
+          ]
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "sdxl_refine_disabled",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "sdxl",
+        "refine": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {
+              "ckpt_name": "checkpoints/studio_xl.safetensors"
+            }
+          },
+          "2": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "3": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "1",
+                1
+              ],
+              "text": ""
+            }
+          },
+          "4": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          "5": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 7.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "2",
+                0
+              ],
+              "negative": [
+                "3",
+                0
+              ],
+              "latent_image": [
+                "4",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "6": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "5",
+                0
+              ],
+              "vae": [
+                "1",
+                2
+              ]
+            }
+          },
+          "7": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "6",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "sdxl",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 7.0,
+          "warnings": [],
+          "models": {
+            "checkpoint": "checkpoints/studio_xl.safetensors"
+          },
+          "nodes": 7,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "h3_dualclock",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_t2v",
+        "sampler": "dual_clock_euler",
+        "lora": "loras/turbo.safetensors",
+        "steps": 4
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoraLoaderBypassModelOnly",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "lora_name": "loras/turbo.safetensors",
+              "strength_model": 1.0
+            }
+          },
+          "5": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "6": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124
+            }
+          },
+          "7": {
+            "class_type": "MiniMaxH3DualClockSamplerT8",
+            "inputs": {
+              "model": [
+                "4",
+                0
+              ],
+              "av_latent": [
+                "6",
+                1
+              ],
+              "steps": 4,
+              "shift_video": 12.0,
+              "shift_audio": 3.0,
+              "sampler_name": "dual_clock_euler",
+              "scheduler": "native_flow"
+            }
+          },
+          "8": {
+            "class_type": "RandomNoise",
+            "inputs": {
+              "noise_seed": 0
+            }
+          },
+          "9": {
+            "class_type": "BasicGuider",
+            "inputs": {
+              "model": [
+                "7",
+                0
+              ],
+              "conditioning": [
+                "6",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+              "noise": [
+                "8",
+                0
+              ],
+              "guider": [
+                "9",
+                0
+              ],
+              "sampler": [
+                "7",
+                1
+              ],
+              "sigmas": [
+                "7",
+                2
+              ],
+              "latent_image": [
+                "6",
+                1
+              ]
+            }
+          },
+          "11": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "10",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "11",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "11",
+                1
+              ],
+              "vae": [
+                "5",
+                0
+              ]
+            }
+          },
+          "14": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "12",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "13",
+                0
+              ]
+            }
+          },
+          "15": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "14",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_t2v",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 4,
+          "cfg": 1.0,
+          "warnings": [
+            "LoRA 文件名与节点校验不能证明权重兼容；多 LoRA 组合的效果和显存需求需实际生成验证。",
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "lora": "loras/turbo.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 15,
+          "sampler": "dual_clock_euler",
+          "scheduler": "native_flow",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": [
+            {
+              "name": "loras/turbo.safetensors",
+              "strength_model": 1.0,
+              "strength_clip": 0.0
+            }
+          ]
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "h3_native_negative",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_i2v",
+        "references": [
+          "last.png"
+        ],
+        "reference_roles": [
+          "end"
+        ],
+        "negative": "blur",
+        "cfg": 3,
+        "steps": 110,
+        "seconds": 6.1
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "last.png"
+            }
+          },
+          "5": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "6": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 158,
+              "last_frame": [
+                "4",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "8": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "text": "blur"
+            }
+          },
+          "9": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "7",
+                0
+              ],
+              "seed": 0,
+              "steps": 110,
+              "cfg": 3.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "6",
+                0
+              ],
+              "negative": [
+                "8",
+                0
+              ],
+              "latent_image": [
+                "6",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "10": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "9",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "10",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "10",
+                1
+              ],
+              "vae": [
+                "5",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "11",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "12",
+                0
+              ]
+            }
+          },
+          "14": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "13",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_i2v",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 110,
+          "cfg": 3.0,
+          "warnings": [
+            "较高步数将显著增加推理计算量，更多步数不保证生成质量更好。",
+            "H3 按 17n+5 对齐为 158 帧，实际 6.583 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 158,
+          "fps": 24,
+          "seconds": 6.583333333333333,
+          "requested_seconds": 6.1,
+          "nodes": 14,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 1,
+          "reference_roles": [
+            "end"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "h3_fallback_decoder",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_ref",
+        "references": [
+          "style.png"
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "style.png"
+            }
+          },
+          "5": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "6": {
+            "class_type": "MiniMaxH3ReferenceToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124,
+              "audio_vae": [
+                "5",
+                0
+              ],
+              "ref_image_size": "match",
+              "ref_images.ref_image_0": [
+                "4",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "8": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "6",
+                0
+              ]
+            }
+          },
+          "9": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "7",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "6",
+                0
+              ],
+              "negative": [
+                "8",
+                0
+              ],
+              "latent_image": [
+                "6",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "10": {
+            "class_type": "MiniMaxH3AVDecodeT8",
+            "inputs": {
+              "av_latent": [
+                "9",
+                0
+              ],
+              "video_vae": [
+                "3",
+                0
+              ],
+              "audio_vae": [
+                "5",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "10",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "10",
+                1
+              ]
+            }
+          },
+          "12": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "11",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_ref",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 1.0,
+          "warnings": [
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_ref2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 12,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 1,
+          "reference_roles": [
+            "reference"
+          ],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "f0fe98205d88"
+    },
+    {
+      "name": "quantized_native_lora",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "krea",
+        "lora": "loras/turbo.safetensors"
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/krea2_turbo_fp8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_4b.safetensors",
+              "type": "krea2"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/qwen_image_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "lora_name": "loras/turbo.safetensors",
+              "strength_model": 1.0
+            }
+          },
+          "5": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "text": "A blue paper bird."
+            }
+          },
+          "6": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "5",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          "8": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "4",
+                0
+              ],
+              "seed": 0,
+              "steps": 8,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "5",
+                0
+              ],
+              "negative": [
+                "6",
+                0
+              ],
+              "latent_image": [
+                "7",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "9": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "8",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "9",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "krea",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 8,
+          "cfg": 1.0,
+          "warnings": [
+            "量化基模使用后端原生 LoRA 加载器，具体权重组合需生成验证。",
+            "LoRA 文件名与节点校验不能证明权重兼容；多 LoRA 组合的效果和显存需求需实际生成验证。"
+          ],
+          "models": {
+            "dit": "diffusion_models/krea2_turbo_fp8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_4b.safetensors",
+            "vae": "vae/qwen_image_vae.safetensors",
+            "lora": "loras/turbo.safetensors"
+          },
+          "nodes": 10,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": [
+            {
+              "name": "loras/turbo.safetensors",
+              "strength_model": 1.0,
+              "strength_clip": 0.0
+            }
+          ]
+        }
+      },
+      "schema_id": "b81a3bdb5113"
+    },
+    {
+      "name": "krea_edit",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "krea",
+        "references": [
+          "first.png",
+          "style.png"
+        ],
+        "denoise": 0.7,
+        "negative": "blur"
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/krea2_turbo_fp8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_4b.safetensors",
+              "type": "krea2"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/qwen_image_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "5": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "style.png"
+            }
+          },
+          "6": {
+            "class_type": "Krea2OstrisEditModelPatch",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "TextEncodeKrea2OstrisEdit",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "vae": [
+                "3",
+                0
+              ],
+              "image1": [
+                "4",
+                0
+              ],
+              "image2": [
+                "5",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "text": "blur"
+            }
+          },
+          "9": {
+            "class_type": "ImageScale",
+            "inputs": {
+              "image": [
+                "4",
+                0
+              ],
+              "upscale_method": "lanczos",
+              "width": 1024,
+              "height": 1024,
+              "crop": "center"
+            }
+          },
+          "10": {
+            "class_type": "VAEEncode",
+            "inputs": {
+              "pixels": [
+                "9",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "6",
+                0
+              ],
+              "seed": 0,
+              "steps": 8,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "7",
+                0
+              ],
+              "negative": [
+                "8",
+                0
+              ],
+              "latent_image": [
+                "10",
+                0
+              ],
+              "denoise": 0.7
+            }
+          },
+          "12": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "11",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "12",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "krea",
+          "width": 1024,
+          "height": 1024,
+          "seed": 0,
+          "steps": 8,
+          "cfg": 1.0,
+          "warnings": [
+            "CFG=1 不启用额外负向引导；反向提示词不会参与标准 KSampler 的引导。"
+          ],
+          "models": {
+            "dit": "diffusion_models/krea2_turbo_fp8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_4b.safetensors",
+            "vae": "vae/qwen_image_vae.safetensors"
+          },
+          "nodes": 13,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 2,
+          "reference_roles": [
+            "reference",
+            "reference"
+          ],
+          "denoise": 0.7,
+          "loras": []
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "qwen_custom_size",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "qwen21_edit",
+        "references": [
+          "first.png"
+        ],
+        "custom_size": true,
+        "width": 768,
+        "height": 512,
+        "ref_resolution": 512,
+        "loras": [
+          {
+            "name": "loras/qwen_image_2.1_style.safetensors",
+            "strength_model": 0.6
+          }
+        ]
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+              "type": "qwen_image"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "LoraLoaderBypassModelOnly",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "lora_name": "loras/qwen_image_2.1_style.safetensors",
+              "strength_model": 0.6
+            }
+          },
+          "5": {
+            "class_type": "LoadImage",
+            "inputs": {
+              "image": "first.png"
+            }
+          },
+          "6": {
+            "class_type": "TextEncodeQwenImage21",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "negative_prompt": "",
+              "resolution": 512,
+              "vae": [
+                "3",
+                0
+              ],
+              "images.image_1": [
+                "5",
+                0
+              ]
+            }
+          },
+          "7": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {
+              "width": 768,
+              "height": 512,
+              "batch_size": 1
+            }
+          },
+          "8": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "4",
+                0
+              ],
+              "seed": 0,
+              "steps": 25,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "6",
+                0
+              ],
+              "negative": [
+                "6",
+                1
+              ],
+              "latent_image": [
+                "7",
+                0
+              ],
+              "denoise": 1.0
+            }
+          },
+          "9": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "8",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "SaveImage",
+            "inputs": {
+              "images": [
+                "9",
+                0
+              ],
+              "filename_prefix": "FrameWeave/image"
+            }
+          }
+        },
+        "summary": {
+          "kind": "qwen21_edit",
+          "width": 768,
+          "height": 512,
+          "seed": 0,
+          "steps": 25,
+          "cfg": 1.0,
+          "warnings": [
+            "LoRA 文件名与节点校验不能证明权重兼容；多 LoRA 组合的效果和显存需求需实际生成验证。"
+          ],
+          "models": {
+            "dit": "QwenImage21/qwen_image_2.1_int8_convrot.safetensors",
+            "text_encoder": "QwenImage21/qwen3vl_8b_int8_convrot.safetensors",
+            "vae": "QwenImage21/qwen_image_2.1_vae_bf16.safetensors",
+            "lora": "loras/qwen_image_2.1_style.safetensors"
+          },
+          "ref_resolution": 512,
+          "size_mode": "custom",
+          "nodes": 10,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 1,
+          "reference_roles": [
+            "reference"
+          ],
+          "denoise": 1.0,
+          "loras": [
+            {
+              "name": "loras/qwen_image_2.1_style.safetensors",
+              "strength_model": 0.6,
+              "strength_clip": 0.0
+            }
+          ]
+        }
+      },
+      "schema_id": "964d6f3ede9d"
+    },
+    {
+      "name": "savevideo_qualified_codec",
+      "request": {
+        "positive": "A blue paper bird.",
+        "kind": "h3_t2v"
+      },
+      "expected": {
+        "prompt": {
+          "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+              "unet_name": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+              "clip_name": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+              "type": "minimax"
+            }
+          },
+          "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_video_vae.safetensors"
+            }
+          },
+          "4": {
+            "class_type": "VAELoader",
+            "inputs": {
+              "vae_name": "vae/minimax_h3_audio_vae.safetensors"
+            }
+          },
+          "5": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+              "clip": [
+                "2",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ],
+              "prompt": "A blue paper bird.",
+              "width": 736,
+              "height": 416,
+              "length": 124
+            }
+          },
+          "6": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+              "model": [
+                "1",
+                0
+              ],
+              "shift_video": 12.0,
+              "shift_audio": 3.0
+            }
+          },
+          "7": {
+            "class_type": "ConditioningZeroOut",
+            "inputs": {
+              "conditioning": [
+                "5",
+                0
+              ]
+            }
+          },
+          "8": {
+            "class_type": "KSampler",
+            "inputs": {
+              "model": [
+                "6",
+                0
+              ],
+              "seed": 0,
+              "steps": 20,
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "positive": [
+                "5",
+                0
+              ],
+              "negative": [
+                "7",
+                0
+              ],
+              "latent_image": [
+                "5",
+                1
+              ],
+              "denoise": 1.0
+            }
+          },
+          "9": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {
+              "av_latent": [
+                "8",
+                0
+              ]
+            }
+          },
+          "10": {
+            "class_type": "VAEDecode",
+            "inputs": {
+              "samples": [
+                "9",
+                0
+              ],
+              "vae": [
+                "3",
+                0
+              ]
+            }
+          },
+          "11": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+              "samples": [
+                "9",
+                1
+              ],
+              "vae": [
+                "4",
+                0
+              ]
+            }
+          },
+          "12": {
+            "class_type": "CreateVideo",
+            "inputs": {
+              "images": [
+                "10",
+                0
+              ],
+              "fps": 24.0,
+              "audio": [
+                "11",
+                0
+              ]
+            }
+          },
+          "13": {
+            "class_type": "SaveVideo",
+            "inputs": {
+              "video": [
+                "12",
+                0
+              ],
+              "filename_prefix": "FrameWeave/video",
+              "format": "mp4",
+              "format.codec": "h264"
+            }
+          }
+        },
+        "summary": {
+          "kind": "h3_t2v",
+          "width": 736,
+          "height": 416,
+          "seed": 0,
+          "steps": 20,
+          "cfg": 1.0,
+          "warnings": [
+            "H3 按 17n+5 对齐为 124 帧，实际 5.167 秒。"
+          ],
+          "models": {
+            "dit": "diffusion_models/minimax_h3_fl2va_int8.safetensors",
+            "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3.safetensors",
+            "vae": "vae/minimax_h3_video_vae.safetensors",
+            "audio_vae": "vae/minimax_h3_audio_vae.safetensors"
+          },
+          "frames": 124,
+          "fps": 24,
+          "seconds": 5.166666666666667,
+          "requested_seconds": 5.0,
+          "nodes": 13,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "references": 0,
+          "reference_roles": [],
+          "denoise": 1.0,
+          "loras": []
+        }
+      },
+      "schema_id": "83ce1cd39475"
+    }
+  ]
+}

@@ -21,6 +21,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .configuration_recovery import preserve_config, read_config
+
 
 _MAX_CONFIG_BYTES = 256 * 1024
 _MAX_PROFILES = 32
@@ -35,6 +37,12 @@ _MAX_PROCESS_RECORD_BYTES = 128 * 1024
 
 class _ProcessRecordError(ValueError):
     pass
+
+
+class _EngineConfigProblem(ValueError):
+    def __init__(self, message, *, digest=None):
+        super().__init__(message)
+        self.digest = digest
 
 
 class _EngineFileLock:
@@ -248,32 +256,70 @@ class EngineManager:
         self.process_lock_path = self.data_dir / "engine-manager.lock"
         self.log_dir = self.data_dir / "engine-logs"
         self._lock = threading.RLock()
-        self._profiles = self._load()
+        self.load_error = ""
+        self.config_protected = False
+        try:
+            self._profiles = self._load()
+        except _EngineConfigProblem as exc:
+            self._profiles = []
+            self._recover_config(exc)
         self._processes = {}
         self._meta = {}
 
     def _load(self):
         try:
-            raw = self.config_path.read_bytes()
+            self.config_path.lstat()
         except FileNotFoundError:
             return []
-        if len(raw) > _MAX_CONFIG_BYTES:
-            raise ValueError("本地引擎配置文件过大")
+        except OSError:
+            raise _EngineConfigProblem("本地引擎配置文件无法安全读取") from None
+        try:
+            raw = read_config(self.config_path, _MAX_CONFIG_BYTES)
+        except ValueError:
+            raise _EngineConfigProblem("本地引擎配置文件超过大小限制") from None
+        except OSError:
+            raise _EngineConfigProblem("本地引擎配置文件无法安全读取") from None
+        digest = hashlib.sha256(raw).hexdigest()
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            raise ValueError("本地引擎配置文件无法读取") from None
-        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("profiles"), list):
-            raise ValueError("本地引擎配置文件格式无效")
-        if len(data["profiles"]) > _MAX_PROFILES:
-            raise ValueError("本地引擎配置数量超出上限")
-        profiles = [_profile(item) for item in data["profiles"]]
-        ids = [item["id"] for item in profiles]
-        if len(ids) != len(set(ids)):
-            raise ValueError("本地引擎配置包含重复标识")
-        return profiles
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            raise _EngineConfigProblem("本地引擎配置 JSON 已截断或格式损坏", digest=digest) from None
+        try:
+            if (not isinstance(data, dict) or type(data.get("version")) is not int
+                    or data.get("version") != 1 or not isinstance(data.get("profiles"), list)):
+                raise ValueError("本地引擎配置版本或结构无效")
+            if len(data["profiles"]) > _MAX_PROFILES:
+                raise ValueError("本地引擎配置数量超出上限")
+            profiles = [_profile(item) for item in data["profiles"]]
+            ids = [item["id"] for item in profiles]
+            if len(ids) != len(set(ids)):
+                raise ValueError("本地引擎配置包含重复标识")
+            return profiles
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError) as exc:
+            raise _EngineConfigProblem(str(exc), digest=digest) from None
+
+    def _recover_config(self, problem):
+        """Quarantine a damaged profile file before allowing an empty registry."""
+        try:
+            backup_name = preserve_config(self.config_path, expected_digest=problem.digest)
+        except (OSError, ValueError):
+            self.config_protected = True
+            self.load_error = (
+                f"engines.json 无法读取：{problem}。原件仍保留，但恢复备份未能建立或校验；"
+                "已暂停引擎配置写入和启动，请先手动备份原文件再恢复。"
+            )
+            return
+        self.load_error = (
+            f"engines.json 无法读取：{problem}。当前按空引擎配置启动；原始配置已保存为 "
+            f"{backup_name}，可回读恢复。请核对后重新登记引擎。"
+        )
+
+    def _ensure_config_writable(self):
+        if self.config_protected:
+            raise ValueError("引擎配置原件仍受保护，恢复备份失败；已暂停引擎配置写入和启动")
 
     def _save(self):
+        self._ensure_config_writable()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.config_path.with_name("engines.json.tmp")
         payload = json.dumps({"version": 1, "profiles": self._profiles},
@@ -450,6 +496,7 @@ class EngineManager:
             "arguments": ["--listen", "127.0.0.1", "--port", str(port), "--disable-auto-launch"],
         })
         with self._lock:
+            self._ensure_config_writable()
             existing = next((i for i, item in enumerate(self._profiles) if item["id"] == ident), None)
             if existing is None:
                 if len(self._profiles) >= _MAX_PROFILES:
@@ -544,6 +591,7 @@ class EngineManager:
     def start(self, ident):
         """Explicitly start/retry one profile, clearing its saved error state."""
         with self._lock:
+            self._ensure_config_writable()
             profile = next((item for item in self._profiles if item["id"] == ident), None)
             if profile is None:
                 raise KeyError("未找到指定的本地引擎配置")

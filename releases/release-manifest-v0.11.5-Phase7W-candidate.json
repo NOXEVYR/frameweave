@@ -1,0 +1,38 @@
+{
+  "application": "PrismCanvas",
+  "version": "0.11.5",
+  "candidate": "Phase7W",
+  "stable_release": false,
+  "source_archive_sha256": "7ae41a8e595d6e4b74e77ce1a7b790b66b50da2f61663a8e05a368bca7794ce1",
+  "exe_sha256": "345c28f27f5e288a92ddf93a44bdc69b868ae1ec4e8ccec8cb9e97053e1ddc5d",
+  "packages": [
+    {
+      "filename": "PrismCanvas-Phase7W-Source.zip",
+      "bytes": 1508206,
+      "sha256": "7ae41a8e595d6e4b74e77ce1a7b790b66b50da2f61663a8e05a368bca7794ce1"
+    },
+    {
+      "filename": "PrismCanvas-0.11.5-Phase7W-Windows-x64-candidate.zip",
+      "bytes": 11086711,
+      "sha256": "1f562b6928e5f844fd259458199063079b00a20549f6710d287a244edca4e040"
+    }
+  ],
+  "validation": {
+    "python_tests": 1188,
+    "python_passed": 1185,
+    "python_skipped": 3,
+    "node_passed": 1485,
+    "actual_exe_browser_assertions": 43,
+    "actual_exe_browser_unique_labels": 40,
+    "actual_exe_cpu_jobs": 1,
+    "actual_exe_cpu_pixel_check": "64x48 nearest-exact output matches input at 2x",
+    "existing_state_copy_compatibility": true,
+    "source_music_gpu_job": true,
+    "h3_ref2va_earlier_snapshot_technical_test": true,
+    "h3_motion_quality_passed": false,
+    "human_audio_acceptance": false
+  },
+  "stable_update_feed_changed": false,
+  "contains_model_weights": false,
+  "contains_user_data": false
+}

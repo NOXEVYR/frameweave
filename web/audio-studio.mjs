@@ -1,7 +1,46 @@
 import { defaultValues, fieldType, validateValues } from './packages.mjs';
+import { createMediaTransfers } from './media-transfers.mjs';
+import { validateMediaFile, mediaFileContentType } from './canvas-images.mjs';
+import { MAX_INTERFACE_FIELDS } from './interface-limits.mjs';
 
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
-const uploadSerialsByDraft = new WeakMap();
+const MEDIA_TYPES = new Set(['image', 'video', 'audio']);
+const VIDEO_MIMES = new Set(['video/mp4', 'video/webm', 'video/quicktime']);
+const previewURL = value => typeof value === 'string' && /^\/api\/(?:media\/[a-f0-9]{32}|assets\/media\/[a-f0-9]{64})$/.test(value) ? value : '';
+const mediaName = value => typeof value === 'string' && value.length > 0 && value.length <= 1024 &&
+  !/[\u0000-\u001f\u007f:]/.test(value) && !value.split(/[\\/]/).some(part => !part || part === '.' || part === '..');
+const plain = value => value && typeof value === 'object' && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+const safeKey = value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !['__proto__', 'prototype', 'constructor'].includes(value);
+function previewBackend(value) {
+  if (typeof value !== 'string' || value.length > 200) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/' &&
+      (url.hostname === 'localhost' || url.hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(url.hostname));
+  } catch { return false; }
+}
+
+/** Restore bounded preview metadata only; never treat it as upload authorization. */
+export function restoreAudioMediaPreviews(source) {
+  if (!plain(source) || Object.keys(source).length > 128) return {};
+  const result = {}; let count = 0, bytes = 0;
+  for (const [packageId, fields] of Object.entries(source)) {
+    if (!safeKey(packageId) || !plain(fields)) continue;
+    const restored = {};
+    for (const [fieldId, item] of Object.entries(fields)) {
+      if (++count > MAX_INTERFACE_FIELDS) return {};
+      if (!safeKey(fieldId) || !plain(item) || !mediaName(item.name) || !previewBackend(item.backend) ||
+          !MEDIA_TYPES.has(item.type) || !previewURL(item.url)) continue;
+      const entry = { name: item.name, backend: item.backend, type: item.type, url: item.url };
+      bytes += new TextEncoder().encode(JSON.stringify(entry)).length;
+      if (bytes > 2 * 1024 * 1024) return {};
+      restored[fieldId] = entry;
+    }
+    if (Object.keys(restored).length) result[packageId] = restored;
+  }
+  return result;
+}
+const transfersByDraft = new WeakMap();
 const node = (tag, className = '', text) => {
   const element = document.createElement(tag);
   element.className = className;
@@ -9,12 +48,14 @@ const node = (tag, className = '', text) => {
   return element;
 };
 
-function beginFieldUpload(draft, fieldId) {
-  let serials = uploadSerialsByDraft.get(draft);
-  if (!serials) { serials = new Map(); uploadSerialsByDraft.set(draft, serials); }
-  const serial = (serials.get(fieldId) || 0) + 1;
-  serials.set(fieldId, serial);
-  return () => serials.get(fieldId) === serial;
+function mediaTransfers(draft) {
+  if (!transfersByDraft.has(draft)) transfersByDraft.set(draft, createMediaTransfers());
+  return transfersByDraft.get(draft);
+}
+
+export function audioMediaIssue(draft) {
+  try { mediaTransfers(draft).assertReady([draft.package_id]); return ''; }
+  catch (error) { return error.message; }
 }
 
 /** Join local package documents with the live backend's AUDIO-schema result. */
@@ -33,14 +74,18 @@ export function buildAudioPackageRequest(pack, draft, backend) {
   if (!pack || typeof pack.id !== 'string') throw new Error('请选择本机已导入的音频工作流包');
   if (pack.eligible !== true || pack.available === false) throw new Error(pack.reason || '此工作流包尚未通过当前后端 AUDIO schema 检查');
   if (draft.package_id !== pack.id) throw new Error('工作流包已切换，请重新检查输入');
+  mediaTransfers(draft).assertReady([pack.id]);
   for (const [field, owner] of Object.entries(draft.mediaBackends || {})) {
-    if (draft.values?.[field] && owner && owner !== backend) throw new Error('音频或图片输入属于另一个推理引擎，请在当前引擎重新上传');
+    if (draft.values?.[field] && owner && owner !== backend) throw new Error('音频、视频或图片输入属于另一个推理引擎，请在当前引擎重新上传');
   }
   const values = validateValues((pack.fields || []).filter(field => field.type !== 'audio'), draft.values || {});
   for (const field of (pack.fields || []).filter(item => item.type === 'audio')) {
     const value = draft.values?.[field.id] ?? field.default ?? '';
     if (typeof value !== 'string' || value.length > 1024 || field.required && !value.trim()) throw new Error(`请填写「${field.label || field.id}」音频输入`);
     values[field.id] = value;
+  }
+  for (const field of (pack.fields || []).filter(item => typeOf(item) === 'video')) {
+    if (values[field.id] !== '' && !mediaName(values[field.id])) throw new Error(`「${field.label || field.id}」视频文件名无效，请重新上传`);
   }
   return { kind: 'package', package_id: pack.id, values };
 }
@@ -59,22 +104,58 @@ function typeOf(field) {
 }
 
 /** Render the data-only scalar/media bindings exposed by one imported workflow package. */
-export function renderAudioFields(container, { pack, draft, api, backend, currentBackend = () => backend, isCurrent = () => true, onChange, reportError }) {
+export function renderAudioFields(container, { pack, draft, api, storeMedia, backend, currentBackend = () => backend, isCurrent = () => true, onChange, reportError }) {
+  container.querySelectorAll?.('video,audio').forEach(media => media.pause());
   container.replaceChildren();
   for (const field of pack?.fields || []) {
     const type = typeOf(field), label = field.label || field.id;
     const wrap = node('label', 'studio-field audio-package-field');
     wrap.append(node('span', '', label));
     let input;
-    if (type === 'image' || type === 'audio') {
-      input = node('input'); input.type = 'file'; input.accept = type === 'audio' ? 'audio/wav,audio/mpeg,audio/flac,audio/ogg,.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp';
+    if (MEDIA_TYPES.has(type)) {
+      const renderedField = JSON.stringify(field);
+      input = node('input'); input.type = 'file'; input.accept = type === 'video' ? 'video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov' : type === 'audio' ? 'audio/wav,audio/mpeg,audio/flac,audio/ogg,.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp';
       input.setAttribute('aria-label', label);
-      const value = draft.values?.[field.id] || '';
-      const existing = node('small', 'audio-upload-name', value ? `已上传：${value}` : type === 'audio' ? '选择 WAV、MP3、FLAC 或 OGG 音频' : '选择 PNG、JPEG 或 WebP 图片');
+      const hint = type === 'video' ? '选择 MP4、WebM 或 MOV 视频，最多 200 MiB' : type === 'audio' ? '选择 WAV、MP3、FLAC 或 OGG 音频' : '选择 PNG、JPEG 或 WebP 图片';
+      const existing = node('small', 'audio-upload-name');
+      const requiredHint = field.required ? node('small', 'field-error', '必需输入') : null;
+      const media = node(type === 'image' ? 'img' : type, 'audio-input-preview');
+      media.hidden = true; media.setAttribute('aria-label', `${label}预览`);
+      if (type === 'image') media.alt = `${label}预览`;
+      else { media.controls = true; media.preload = 'metadata'; media.autoplay = false; if (type === 'video') { media.muted = true; media.playsInline = true; } }
+      if (media.style) { media.style.maxWidth = '100%'; media.style.maxHeight = '200px'; media.style.objectFit = 'contain'; }
+      const previewState = node('small', 'audio-input-preview-state');
+      let displayedURL = '';
+      const transfers = mediaTransfers(draft);
+      const recovery = node('button', 'button quiet audio-keep-media', '保留原值'); recovery.type = 'button';
+      const updateUploadState = () => {
+        const state = transfers.state(pack.id, field.id);
+        const retained = draft.values?.[field.id] || '';
+        const owner = draft.mediaBackends?.[field.id];
+        if (requiredHint) {
+          requiredHint.hidden = typeof retained === 'string' && !!retained.trim();
+          requiredHint.textContent = state?.status === 'pending' ? '必需输入 · 等待上传完成' : state?.status === 'failed' ? '必需输入 · 上传未完成' : '必需输入';
+        }
+        recovery.hidden = !state;
+        if (state) existing.textContent = `${state.status === 'pending' ? '正在上传新素材' : '新素材上传失败'}；原值${retained ? `「${retained}」` : '（空）'}已保留。请重新选择，或点击“保留原值”。`;
+        else existing.textContent = !retained ? hint : owner === backend ? `已上传到当前引擎：${retained}` : owner ? `已保存：${retained} · 属于另一个推理引擎，请重新上传` : `已保存文件名：${retained} · 上传归属尚未核对`;
+        const saved = draft.mediaPreviewsByPackage?.[pack.id]?.[field.id];
+        const savedURL = saved?.name === retained && saved.type === type && previewBackend(saved.backend) && saved.backend === owner ? previewURL(saved.url) : '';
+        const next = state?.status === 'pending' && state.previewURL || savedURL;
+        if (next !== displayedURL) { media.pause?.(); media.removeAttribute?.('src'); displayedURL = next; if (next) media.src = next; }
+        media.hidden = !next;
+        previewState.textContent = state?.status === 'pending' && next ? '新素材预览 · 尚未完成传入，原值仍保留' : next ? '输入素材预览 · 不会自动播放或生成' : retained ? '暂无可验证的预览地址；文件名已保留，可重新选择素材' : '';
+      };
+      media.addEventListener('error', () => { if (displayedURL) previewState.textContent = '此素材暂不能在浏览器中预览；输入文件名已保留，生成兼容性仍由后端校验'; });
+      recovery.addEventListener('click', () => { transfers.discard(pack.id, field.id); updateUploadState(); onChange(); });
+      updateUploadState();
       input.addEventListener('change', async () => {
         const file = input.files?.[0];
         if (!file) return;
-        const isLatestUpload = beginFieldUpload(draft, field.id);
+        const ticket = transfers.start(pack.id, field.id, label);
+        const isLatestUpload = () => transfers.current(ticket);
+        let objectURL;
+        updateUploadState(); onChange();
         try {
           const startedBackend = currentBackend();
           const valuesAtStart = draft.values;
@@ -83,25 +164,51 @@ export function renderAudioFields(container, { pack, draft, api, backend, curren
             && currentBackend() === startedBackend
             && startedBackend === backend
             && isLatestUpload()
+            && JSON.stringify(field) === renderedField
+            && (pack.fields || []).filter(item => item.id === field.id).length === 1
+            && pack.fields.find(item => item.id === field.id) === field
             && isCurrent({ pack, field, backend: startedBackend, draft }) !== false;
           const staleMessage = '工作流包、输入字段或推理引擎已切换；请在当前工作流重新选择并上传素材';
           if (!stillCurrent()) throw new Error(staleMessage);
-          if (file.size > MAX_AUDIO_BYTES) throw new Error('输入素材每个最多 20 MiB');
+          if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new Error('请选择非空的本地素材');
+          if (type !== 'video' && file.size > MAX_AUDIO_BYTES) throw new Error('输入素材每个最多 20 MiB');
           if (type === 'audio' && !/\.(wav|mp3|flac|ogg)$/i.test(file.name)) throw new Error('参考音频当前支持 WAV、MP3、FLAC、OGG');
           if (type === 'image' && !/^image\/(png|jpeg|webp)$/i.test(file.type)) throw new Error('图片输入支持 PNG、JPEG 或 WebP');
-          const data = await readBase64(file);
-          if (!stillCurrent()) throw new Error(staleMessage);
-          const uploaded = await api(type === 'audio' ? '/api/upload-audio' : '/api/upload', { name: file.name, data });
-          if (!uploaded?.name || !stillCurrent() || uploaded.backend && uploaded.backend !== startedBackend) throw new Error(staleMessage);
+          if (type === 'video' && (validateMediaFile(file) !== 'video' || !VIDEO_MIMES.has(mediaFileContentType(file)))) throw new Error('参考视频支持 MP4、WebM 或 MOV，文件类型须与内容一致');
+          if (typeof URL.createObjectURL === 'function') {
+            try { objectURL = URL.createObjectURL(file); ticket.previewURL = objectURL; updateUploadState(); }
+            catch { /* Older hosts still show the verified server preview after upload. */ }
+          }
+          let uploaded, verifiedPreview;
+          if (type === 'video') {
+            if (typeof storeMedia !== 'function') throw new Error('当前客户端没有提供本地视频存储能力，请更新客户端后重新选择');
+            const asset = await storeMedia(file);
+            if (!stillCurrent()) throw new Error(staleMessage);
+            if (!/^[a-f0-9]{64}$/.test(asset?.asset_id || '') || asset.media_type !== 'video' || asset.mime !== mediaFileContentType(file)) throw new Error('本地视频存储回执无效，尚未传入引擎');
+            verifiedPreview = `/api/assets/media/${asset.asset_id}`;
+            ticket.previewURL = verifiedPreview; updateUploadState();
+            uploaded = await api(`${verifiedPreview}/backend-input`, { package_id: pack.id, field_id: field.id });
+            if (!stillCurrent()) throw new Error(staleMessage);
+            if (uploaded?.asset_id !== asset.asset_id || uploaded?.media_type !== 'video' || uploaded?.backend !== startedBackend ||
+                uploaded?.package_id !== pack.id || uploaded?.field_id !== field.id || !previewURL(uploaded?.url)) throw new Error('视频输入回执与当前素材、字段或引擎不一致，原值已保留');
+          } else {
+            const data = await readBase64(file);
+            if (!stillCurrent()) throw new Error(staleMessage);
+            uploaded = await api(type === 'audio' ? '/api/upload-audio' : '/api/upload', { name: file.name, data });
+            verifiedPreview = previewURL(uploaded?.url);
+          }
+          if (!mediaName(uploaded?.name) || !stillCurrent() || uploaded.backend && uploaded.backend !== startedBackend) throw new Error(staleMessage);
           draft.values ||= {}; draft.mediaBackends ||= {};
           draft.values[field.id] = uploaded.name; draft.mediaBackends[field.id] = uploaded.backend || startedBackend;
-          existing.textContent = `已上传：${file.name}`;
+          draft.mediaPreviewsByPackage ||= {}; draft.mediaPreviewsByPackage[pack.id] ||= {};
+          draft.mediaPreviewsByPackage[pack.id][field.id] = { name: uploaded.name, backend: draft.mediaBackends[field.id], type, url: verifiedPreview || '' };
+          transfers.finish(ticket); updateUploadState();
           onChange();
-        } catch (error) { if (isLatestUpload()) reportError(error); }
-        finally { if (isLatestUpload()) input.value = ''; }
+        } catch (error) { if (isLatestUpload()) { transfers.fail(ticket, error); updateUploadState(); onChange(); reportError(error); } }
+        finally { if (objectURL) URL.revokeObjectURL(objectURL); if (!transfers.state(pack.id, field.id) || isLatestUpload()) input.value = ''; }
       });
-      wrap.append(input, existing);
-      if (field.required && !value) wrap.append(node('small', 'field-error', '必需输入'));
+      wrap.append(input, existing, recovery, media, previewState);
+      if (requiredHint) wrap.append(requiredHint);
     } else if (type === 'boolean') {
       wrap.classList.add('audio-package-toggle'); input = node('input'); input.type = 'checkbox'; input.checked = draft.values?.[field.id] ?? field.default ?? false;
       input.addEventListener('change', () => { draft.values ||= {}; draft.values[field.id] = input.checked; onChange(); }); wrap.append(input);
@@ -133,7 +240,9 @@ export function initialAudioValues(pack) {
 }
 
 /** Reject a delayed upload when its category, package, backend, or field schema changed. */
-export function audioUploadContextMatches(expected, current, fieldId) {
+export function audioUploadContextMatches(expected, current, fieldOrId) {
+  const fieldId = typeof fieldOrId === 'string' ? fieldOrId : fieldOrId?.id;
+  const matches = Array.isArray(current?.fields) ? current.fields.filter(field => field?.id === fieldId) : [];
   return current?.epoch === expected?.epoch
     && current?.category === expected?.category
     && current?.draft === expected?.draft
@@ -141,8 +250,8 @@ export function audioUploadContextMatches(expected, current, fieldId) {
     && current?.backend === expected?.backend
     && current?.capabilitiesBackend === expected?.backend
     && current?.stale !== true
-    && Array.isArray(current?.fields)
-    && current.fields.some(field => field?.id === fieldId);
+    && matches.length === 1
+    && (typeof fieldOrId === 'string' || JSON.stringify(matches[0]) === JSON.stringify(fieldOrId));
 }
 
 const SAFE_AUDIO_REASONS = new Map([

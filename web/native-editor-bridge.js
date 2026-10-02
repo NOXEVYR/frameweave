@@ -22,9 +22,18 @@ let media = noMedia, mediaBootstrapped = config?.mediaProtocol !== 1, mediaBoots
 function bootstrapMedia() {
   if (mediaBootstrapped) return Promise.resolve();
   return mediaBootstrap ||= Promise.all([import('/prism-editor-media.mjs'), import('/prism-editor-media-preview.mjs')])
-    .then(([module, preview]) => {
+    .then(async ([module, preview]) => {
+      let frontendCapability, createExposureIsolation;
+      if (config?.promotedAudioProtocol === 1) {
+        try {
+          const [capabilities, exposures] = await Promise.all([import('/prism-editor-frontend-capabilities.mjs'), import('/prism-editor-preview-exposures.mjs')]);
+          frontendCapability = await capabilities.discoverNativeFrontendCapabilities({ app, window, document,
+            location: window.location, fetch: window.fetch.bind(window) });
+          if (frontendCapability.supported) createExposureIsolation = exposures.createPreviewExposureIsolation;
+        } catch { /* Unknown frontend profiles keep the existing safe fallback. */ }
+      }
       const implementation = module.createNativeEditorMedia({ app, window, document: typeof document === 'undefined' ? null : document,
-        graph, findWidget, sameMappingProof, config, createPreview: preview.createEditorMediaPreview });
+        graph, findWidget, sameMappingProof, config, createPreview: preview.createEditorMediaPreview, frontendCapability, createExposureIsolation });
       if (implementation.arm() === false) { implementation.destroy?.(); return; }
       media = implementation;
     }).catch(() => { media = noMedia; }).finally(() => { mediaBootstrapped = true; });
@@ -1056,6 +1065,7 @@ async function handle(message) {
           const original = before.get(mappingKey(item.node_id, item.input)), current = findWidget(item.node_id, item.input, afterLookup);
           if (!original.reason && (current.reason || !sameMappingProof(original.mappingProof, current.mappingProof))) throw new Error('mapping-receipt-changed');
         }
+        await media.prepareCapture?.(message.bindings, compiled.output);
         result = media.capture(message.bindings, compiled.output);
       } else if (action === 'captureMappings') {
         // Compilation may run async extensions. Bind only the owners that were

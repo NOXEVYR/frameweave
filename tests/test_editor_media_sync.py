@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from frameweave.backend import Backend
-from frameweave.packages import validate_package_media_field
+from frameweave.packages import validate_package_media_field, _stored_package_document
 import test_local_assets as asset_fixture
 
 
@@ -84,4 +84,104 @@ class EditorMediaSyncHTTPTests(unittest.TestCase):
             with self.subTest(data=data), patch.object(self.app.backend, 'upload') as upload:
                 self.assertEqual(self.post(path, data)[0], 400)
                 upload.assert_not_called()
+        self.assert_no_generation()
+
+    def grouped_video(self):
+        path, body = self.video()
+        document = _stored_package_document(self.app.packages.get(body['package_id']))
+        document['prompt']['8'] = {'class_type': 'LoadVideo', 'inputs': {'file': ''}}
+        document['fields'].append({'id': 'motion', 'node_id': '8', 'input': 'file', 'type': 'video', 'label': 'motion', 'default': ''})
+        package = self.app.packages.save(document)
+        return path, {'package_id': package['id'], 'field_ids': ['clip', 'motion'], 'values': body['values'],
+                      'expected_backend': self.backend.url, 'refresh': True}
+
+    def test_grouped_refresh_validates_all_ports_then_uploads_once_and_bypasses_cache(self):
+        path, body = self.grouped_video()
+        events = []
+        def validate(*args, **kwargs):
+            events.append(('validate', args[1]))
+            return validate_package_media_field(*args, **kwargs)
+        def upload(*args):
+            events.append(('upload', args[0]))
+            return {'name': args[0], 'type': 'input'}
+        with patch('frameweave.server.validate_package_media_field', side_effect=validate), patch.object(self.app.backend, 'upload', side_effect=upload) as transfer:
+            first = self.post(path, body)
+            second = self.post(path, body)
+        self.assertEqual(first[0], 200, first[2])
+        self.assertEqual(second[0], 200, second[2])
+        self.assertEqual(transfer.call_count, 2)
+        self.assertNotEqual(first[2]['name'], second[2]['name'])
+        self.assertEqual(second[2]['field_ids'], ['clip', 'motion'])
+        self.assertEqual([item[0] for item in events], ['validate', 'validate', 'upload'] * 2)
+        self.assert_no_generation()
+
+    def test_invalid_second_port_blocks_whole_refresh_and_retains_old_cache(self):
+        path, body = self.grouped_video()
+        with patch.object(self.app.backend, 'upload', return_value={'name': 'previous.mp4', 'type': 'input'}):
+            self.assertEqual(self.post(path, body)[0], 200)
+        previous = dict(self.app.local_media_upload_cache)
+        for fields in (['clip', 'missing'], ['clip', 'mode']):
+            with patch.object(self.app.backend, 'upload') as upload:
+                self.assertEqual(self.post(path, {**body, 'field_ids': fields})[0], 400)
+                upload.assert_not_called()
+        self.assertEqual(self.app.local_media_upload_cache, previous)
+        self.assert_no_generation()
+
+    def test_grouped_contract_rejects_invalid_fields_refresh_and_unknown_keys(self):
+        path, body = self.grouped_video()
+        invalid = [{**body, 'field_ids': value} for value in (None, [], 'clip', ['clip', 'clip'], [1], [[]], ['x' * 81], ['clip'] * 4097)]
+        invalid += [{**body, 'refresh': value} for value in (None, 1, 0, 'true', {})]
+        invalid += [{**body, 'field_id': 'clip'}, {**body, 'extra': 1}, {**body, 'values': []}]
+        for item in invalid:
+            with self.subTest(item=str(item)[:120]), patch.object(self.app.backend, 'upload') as upload:
+                self.assertEqual(self.post(path, item)[0], 400)
+                upload.assert_not_called()
+
+    def test_refresh_failure_retains_previous_receipt_and_never_submits(self):
+        path, body = self.grouped_video()
+        with patch.object(self.app.backend, 'upload', return_value={'name': 'previous.mp4', 'type': 'input'}):
+            self.assertEqual(self.post(path, body)[0], 200)
+        previous = dict(self.app.local_media_upload_cache)
+        from frameweave.backend import BackendError
+        with patch.object(self.app.backend, 'upload', side_effect=BackendError('unavailable')):
+            self.assertEqual(self.post(path, body)[0], 502)
+        self.assertEqual(self.app.local_media_upload_cache, previous)
+        self.assert_no_generation()
+
+    def test_grouped_refresh_rejects_same_url_backend_replacement_during_upload(self):
+        path, body = self.grouped_video()
+        original = self.app.backend
+        def upload(*args):
+            self.app.backend = Backend(original.url)
+            return {'name': 'late.mp4', 'type': 'input'}
+        with patch.object(original, 'upload', side_effect=upload):
+            self.assertEqual(self.post(path, body)[0], 400)
+        self.assertFalse(self.app.local_media_upload_cache)
+        self.app.backend = original
+        self.assert_no_generation()
+
+    def test_disk_failure_preserves_previous_av_receipt_and_registry(self):
+        path, body = self.grouped_video()
+        with patch.object(self.app.backend, 'upload', return_value={'name': 'previous.mp4', 'type': 'input'}):
+            self.assertEqual(self.post(path, body)[0], 200)
+        cache, media, uploaded = dict(self.app.local_media_upload_cache), dict(self.app.media), set(self.app.uploaded)
+        stored = (self.app.data_dir / 'input-media.json').read_bytes()
+        for name in ('new-after-failure.mp4', 'previous.mp4'):
+            with patch.object(self.app.backend, 'upload', return_value={'name': name, 'type': 'input'}), \
+                    patch.object(self.app, 'persist_input_media', side_effect=OSError('disk full')):
+                self.assertEqual(self.post(path, body)[0], 502)
+            self.assertEqual(self.app.local_media_upload_cache, cache)
+            self.assertEqual(self.app.media, media)
+            self.assertEqual(self.app.uploaded, uploaded)
+            self.assertEqual((self.app.data_dir / 'input-media.json').read_bytes(), stored)
+        self.assert_no_generation()
+
+    def test_image_storage_failure_does_not_publish_a_new_receipt(self):
+        for path in self.image_paths():
+            media, uploaded = dict(self.app.media), set(self.app.uploaded)
+            with patch.object(self.app.backend, 'upload', return_value={'name': 'new-image.png', 'type': 'input'}), \
+                    patch.object(self.app, 'persist_input_media', side_effect=OSError('disk full')):
+                self.assertEqual(self.post(path, {'expected_backend': self.backend.url})[0], 502)
+            self.assertEqual(self.app.media, media)
+            self.assertEqual(self.app.uploaded, uploaded)
         self.assert_no_generation()

@@ -221,7 +221,7 @@ async function prepareNativeEditorSession(node, workflow) {
 function editorMediaSyncButton(node) {
   const control = button(editorMediaSyncs.has(node) ? '正在同步参考素材…' : '同步参考素材到引擎', 'button quiet sync-editor-media', () => syncEditorMedia(node));
   control.disabled = editorMediaSyncs.has(node); control.dataset.syncMediaNode = node.id;
-  control.title = '仅同步此工作流直接连接的图片、视频和音频，之后可进入内部查看；不开始生成';
+  control.title = '从本地副本重新同步直连图片、视频和音频，可恢复引擎已丢失的素材；同一文件只传一份，会新增引擎输入文件，保留旧文件，不开始生成';
   return control;
 }
 async function syncEditorMedia(node) {
@@ -257,7 +257,8 @@ async function syncEditorMedia(node) {
     const reasons = { upstream_not_run: '上游尚未生成', mapping_unavailable: '尚未建立对应媒体接口',
       ambiguous_connection: '同一端口存在多条连接', import_pending: '素材正在导入', import_failed: '素材导入失败',
       media_type_mismatch: '素材类型与端口不一致', local_only: '本地素材不可用', other_backend: '缺少可重新同步的本地素材',
-      owner_unknown: '缺少可重新同步的本地素材', media_missing: '尚未选择素材' };
+      owner_unknown: '缺少可重新同步的本地素材', media_missing: '尚未选择素材',
+      local_copy_unavailable: '缺少本地副本，无法重新同步；请重新导入素材' };
     const pending = [...new Set(result.pending.map(item => reasons[item.reason] || '请检查素材和端口映射'))];
     toast(`${result.updates.length ? `已同步 ${result.updates.length} 份参考素材，可进入工作流查看` : '没有需要同步的直接本地素材'}${pending.length ? `；待处理：${pending.join('、')}` : ''}。尚未开始生成`, !!pending.length);
   })();

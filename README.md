@@ -12,7 +12,8 @@
 | --- | --- | --- |
 | Windows 稳定成品 0.11.1 | 已公开，自动更新通道仍指向此版 | [下载便携包](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip) |
 | 0.11.4 源码预览 | 已公开；新增素材拖放、命名端口、预设内部编辑和实时预览 | [下载源码](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.4-source.zip) |
-| 本工作树 0.11.5 候选 | 配置恢复和进度显示修复；构建与隔离验收记录不代表正式安装或公开发布 | [开发记录](docs/DEVELOPMENT_LOG.md) |
+| Windows 0.11.5 Phase7Y 候选 | 已构建并完成隔离成品验收；草稿候选分支公开，稳定更新源未提升 | [候选下载与验证](https://github.com/NOXEVYR/frameweave/blob/codex/phase7w-unified-workflows/releases/PrismCanvas-0.11.5-Phase7Y.md) |
+| 本工作树 Phase8A 源码候选 | 保留素材恢复修复，并支持已验证的共享音频预览隔离；尚未构建新的成品 | [开发记录](docs/DEVELOPMENT_LOG.md) |
 
 品牌兼容标识仍为 FrameWeave，Python 包、API、数据路径和已有画布格式保持兼容。版本与验证范围见[验证记录](docs/VALIDATION.md)，历史功能变化见[开发日志](docs/DEVELOPMENT_LOG.md)。
 

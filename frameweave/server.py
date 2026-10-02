@@ -800,6 +800,26 @@ class App:
         if sum(query['type'] == 'input' for _, query in self.media.values()) >= 10000:
             raise ValueError('输入素材登记已达上限，未上传；请先备份工作区后整理素材')
 
+    def register_input_media(self, filename, subfolder="", *, backend=None):
+        """Publish an input receipt only after its durable registration succeeds."""
+        with self.lock:
+            backend = local_url(backend or self.backend.url)
+            prior_keys = set(self.media)
+            url = self.register_media(filename, subfolder, "input", backend=backend)
+            key = url.rsplit("/", 1)[-1]
+            try:
+                self.persist_input_media()
+            except (OSError, ValueError):
+                # Only undo this call's new registration. Existing inputs,
+                # outputs and registrations made before acquiring the lock stay.
+                if key not in prior_keys:
+                    self.media.pop(key, None)
+                raise
+            if self.backend.url == backend:
+                self.uploaded.add("/".join(filter(None, [subfolder, filename])))
+                self.info_at = 0
+            return url
+
     def _upload(self, data):
         if not isinstance(data.get("data"), str):
             raise ValueError("请上传图片内容")
@@ -836,10 +856,17 @@ class App:
         return {**saved, "url": f"/api/assets/media/{saved['asset_id']}"}
 
     def sync_local_media_asset(self, asset_id, package_id=None, field_id=None, *, schema=None,
-                               expected_backend=None, source=None, values=None):
+                               expected_backend=None, source=None, values=None, field_ids=None, refresh=False):
+        if not isinstance(refresh, bool):
+            raise ValueError("媒体同步 refresh 必须是布尔值")
+        if field_ids is not None and (field_id is not None or not isinstance(field_ids, list)
+                or not 1 <= len(field_ids) <= 4096
+                or any(not isinstance(item, str) or not item or len(item) > 80 for item in field_ids)
+                or len(set(field_ids)) != len(field_ids)):
+            raise ValueError("媒体同步 field_ids 必须是非空、不重复的字段列表，不能与 field_id 同时使用")
         content, mime, media_type = self.local_media_assets.read(asset_id)
         if media_type == "image":
-            if package_id is not None or field_id is not None or values is not None:
+            if package_id is not None or field_id is not None or field_ids is not None or values is not None:
                 raise ValueError("图片同步只接受空对象")
             with self.lock:
                 if expected_backend is not None and self.backend is not expected_backend:
@@ -847,7 +874,7 @@ class App:
                 result = self._upload_content(content, complete=True)
                 return {**result, "asset_id": asset_id, "media_type": media_type}
 
-        if media_type not in {"video", "audio"} or package_id is None or field_id is None:
+        if media_type not in {"video", "audio"} or package_id is None or field_id is None and field_ids is None:
             raise ValueError("音视频同步必须绑定工作流包字段")
         with self.lock:
             backend = self.backend
@@ -855,7 +882,10 @@ class App:
                 raise ValueError("同步期间后端已变化，请重新选择输入素材")
         package = self.packages.get(package_id)
         live_schema = schema if schema is not None else self._object_info_for_backend(backend)
-        validate_package_media_field(_stored_package_document(package), field_id, live_schema, media_type, values=values)
+        requested_fields = field_ids if field_ids is not None else [field_id]
+        for requested_field in requested_fields:
+            validate_package_media_field(_stored_package_document(package), requested_field, live_schema, media_type, values=values)
+        binding_receipt = {"package_id": package_id, **({"field_ids": list(field_ids)} if field_ids is not None else {"field_id": field_id})}
         cache_key = (asset_id, backend)
 
         with self._transfer_lock(("local-media-upload", asset_id, backend.url)):
@@ -865,18 +895,18 @@ class App:
                 if source is not None:
                     self._check_media_source_locked(*source)
                 cached = self.local_media_upload_cache.get(cache_key)
-                if cached is not None:
+                if cached is not None and not refresh:
                     media_key = cached.get("url", "").rsplit("/", 1)[-1]
                     registered = self.media.get(media_key)
                     if (registered and registered[0] == backend.url
                             and registered[1].get("type") == "input"
                             and "/".join(filter(None, [registered[1].get("subfolder", ""),
                                                       registered[1].get("filename", "")])) == cached["name"]):
+                        self.persist_input_media()
                         self.uploaded.add(cached["name"])
                         self.info_at = 0
-                        self.persist_input_media()
                         return {**cached, "asset_id": asset_id, "media_type": media_type,
-                                "package_id": package_id, "field_id": field_id}
+                                **binding_receipt}
                     self.local_media_upload_cache.pop(cache_key, None)
                 self.check_input_storage()
 
@@ -901,15 +931,11 @@ class App:
                     raise ValueError("同步期间后端已变化，请重新选择输入素材")
                 if source is not None:
                     self._check_media_source_locked(*source)
-                url = self.register_media(returned_name, subfolder, "input", backend=backend.url)
-                if self.backend is backend:
-                    self.uploaded.add(relative)
-                    self.info_at = 0
+                url = self.register_input_media(returned_name, subfolder, backend=backend.url)
                 result = {"name": relative, "url": url, "backend": backend.url}
                 self.local_media_upload_cache[cache_key] = result
-                self.persist_input_media()
             return {**result, "asset_id": asset_id, "media_type": media_type,
-                    "package_id": package_id, "field_id": field_id}
+                    **binding_receipt}
 
     def _check_media_source_locked(self, job_id, media_type, index, output_id, expected_backend,
                                    expected_output, expected_query):
@@ -1079,10 +1105,7 @@ class App:
                 raise BackendError('后端未确认音频上传')
             relative = '/'.join(filter(None, [result.get('subfolder', ''), result['name']]))
             safe_relative(relative)
-            url = self.register_media(result['name'], result.get('subfolder', ''), 'input')
-            self.uploaded.add(relative)
-            self.persist_input_media()
-            self.info_at = 0
+            url = self.register_input_media(result['name'], result.get('subfolder', ''))
             return {'name': relative, 'url': url, 'backend': self.backend.url}
 
     def output_location(self, job_id, data):
@@ -1123,11 +1146,8 @@ class App:
             raise BackendError("后端没有返回有效的图片输入登记，无法交给下游节点")
         returned_name = result.get("name", name)
         subfolder = result.get("subfolder", "")
-        url = self.register_media(returned_name, subfolder, "input")
+        url = self.register_input_media(returned_name, subfolder)
         backend_name = f"{subfolder}/{returned_name}" if subfolder else returned_name
-        self.uploaded.add(backend_name)
-        self.persist_input_media()
-        self.info_at = 0
         return {"name": backend_name, "url": url, "backend": self.backend.url}
 
     def image_input(self, job_id, data):
@@ -1218,10 +1238,7 @@ class App:
             with self.lock:
                 self._check_media_source_locked(*source)
                 self.check_input_storage()
-                url = self.register_media(returned_name, returned_folder, "input", backend=backend.url)
-                self.uploaded.add(relative)
-                self.persist_input_media()
-                self.info_at = 0
+                url = self.register_input_media(returned_name, returned_folder, backend=backend.url)
             return {"name": relative, "url": url, "backend": backend.url, "source_job": job_id,
                     "output_index": index, "media_type": "image", "output_id": identity}
 
@@ -2085,17 +2102,19 @@ def make_server(app, port=0):
                         self.respond({"error": "本地图片不存在"}, 404)
                         return
                 elif re.fullmatch(r'/api/assets/media/[0-9a-f]{64}/backend-input', path):
-                    binding_keys = set(data) - {"expected_backend", "values"}
-                    if binding_keys and (binding_keys != {"package_id", "field_id"}
-                                         or any(not isinstance(data[key], str) or not data[key] for key in binding_keys)):
-                        raise ValueError('媒体同步只接受可选 expected_backend 和成对的 package_id、field_id')
-                    if "values" in data and (binding_keys != {"package_id", "field_id"} or not isinstance(data["values"], dict)):
+                    binding_keys = set(data) - {"expected_backend", "values", "refresh"}
+                    if binding_keys and (binding_keys not in ({"package_id", "field_id"}, {"package_id", "field_ids"})
+                                         or not isinstance(data.get("package_id"), str) or not data["package_id"]
+                                         or "field_id" in data and (not isinstance(data["field_id"], str) or not data["field_id"])):
+                        raise ValueError('媒体同步必须绑定 package_id 与 field_id 或 field_ids')
+                    if "values" in data and (not binding_keys or not isinstance(data["values"], dict)):
                         raise ValueError('媒体同步 values 必须是绑定工作流的参数对象')
                     backend = app.media_sync_backend(data)
                     asset_id = path.split('/')[4]
                     try:
                         result = app.sync_local_media_asset(
-                            asset_id, data.get("package_id"), data.get("field_id"), expected_backend=backend, values=data.get("values"))
+                            asset_id, data.get("package_id"), data.get("field_id"), expected_backend=backend,
+                            values=data.get("values"), field_ids=data.get("field_ids"), refresh=data.get("refresh", False))
                     except FileNotFoundError:
                         self.respond({"error": "本地媒体不存在"}, 404)
                         return

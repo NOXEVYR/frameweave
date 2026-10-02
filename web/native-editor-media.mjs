@@ -36,11 +36,13 @@ export function nativeMediaContract(node, input, type, registry) {
   return { class_type: classType, input, type, specification: JSON.stringify(spec) };
 }
 
-export function createNativeEditorMedia({ app, window, document, graph, findWidget, sameMappingProof, config, createPreview }) {
+export function createNativeEditorMedia({ app, window, document, graph, findWidget, sameMappingProof, config, createPreview, createExposureIsolation, frontendCapability }) {
   const receipts = new Map(), byBinding = new Map(), isolated = new WeakMap(), wrapped = new WeakSet(), liveIsolations = new Map();
   const viewHooks = new Map(), scopeHooks = new Map();
   let panel, preview, previewOwner = null, previewWidget = null, previewValue, previewEntry = null, refreshing = false, serial = 0, observerChecked = false, observerProbe, probeHandler, unavailable = false;
   let activeTrail = null, pendingTrail = null;
+  const exposureIsolation = createExposureIsolation?.({ capability: frontendCapability, app, window, document, graph,
+    onInvalidate(node) { revokeNode(node); if (previewEntry?.node === node) clearPreview('子图预览设置已变化；请重新应用外层素材后预览。'); } });
   const registry = () => window.LiteGraph?.registered_node_types;
   const canvas = () => app.canvasOrUndefined || app.canvas;
   function clearPreview(message) { previewOwner = null; previewWidget = null; previewValue = undefined; previewEntry = null; preview?.clear(message); }
@@ -145,7 +147,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       try { exposed = host.serialize?.()?.properties?.previewExposures; }
       catch { return 'nested_preview_exposure_unproven'; }
       if (!Array.isArray(exposed)) return 'nested_preview_exposure_unproven';
-      if (exposed.length) return 'promoted_preview_not_isolated';
+      if (exposed.length && !exposureIsolation?.allows(target)) return 'promoted_preview_not_isolated';
     }
     return null;
   }
@@ -446,6 +448,32 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       label: entry?.label || node.title || widget.name });
     } finally { refreshing = false; }
   }
+  async function prepareCapture(bindings, output) {
+    if (!exposureIsolation || !Array.isArray(bindings) || bindings.length > MAX_FIELDS ||
+        new TextEncoder().encode(JSON.stringify(bindings)).length > 2 * 1024 * 1024) return;
+    const counts = new Map(), fields = new Map();
+    for (const item of bindings) { const key = keyOf(item || {}); counts.set(key, (counts.get(key) || 0) + 1); fields.set(item?.field_id, (fields.get(item?.field_id) || 0) + 1); }
+    for (const binding of bindings) {
+      if (!record(binding) || binding.type !== 'audio' || typeof binding.node_id !== 'string' || !binding.node_id.includes(':') ||
+          counts.get(keyOf(binding)) !== 1 || fields.get(binding.field_id) !== 1 || !safeEditorMediaFilename(binding.value) ||
+          binding.media_owner?.name !== binding.value || binding.media_owner?.media_type !== 'audio' || binding.media_owner?.backend !== config.backendUrl) continue;
+      const target = findWidget(binding.node_id, binding.input), originalProof = target.mappingProof;
+      if (target.reason || !nativeMediaContract(target.node, binding.input, 'audio', registry()) ||
+          (target.node.comfyClass || target.node.type) !== binding.class_type || output?.[binding.node_id]?.class_type !== binding.class_type ||
+          output?.[binding.node_id]?.inputs?.[binding.input] !== target.widget.value) continue;
+      const surfaces = (target.node.widgets || []).filter(widget => widget.name === 'audioUI');
+      if (surfaces.length !== 1 || !surfaces[0].element?.style) continue;
+      await exposureIsolation.acquire(target, () => {
+        const marker = isolated.get(target.node), leafProof = originalProof?.nodes?.find(item => item.node === target.node);
+        // Isolation installs our own removal guard immediately after capture.
+        // Accept that one proven wrapper transition, never an extension's edit.
+        const ours = marker?.removalWrapper && marker.removalDescriptor?.value === leafProof?.onRemoved && target.node.onRemoved === marker.removalWrapper;
+        const expected = ours ? { ...originalProof, nodes: originalProof.nodes.map(item =>
+          item.node === target.node ? { ...item, onRemoved: marker.removalWrapper } : item) } : originalProof;
+        return sameMappingProof(expected, findWidget(binding.node_id, binding.input).mappingProof);
+      });
+    }
+  }
   function capture(bindings, output) {
     if (!Array.isArray(bindings) || bindings.length > MAX_FIELDS || new TextEncoder().encode(JSON.stringify(bindings)).length > 2 * 1024 * 1024) throw new Error('invalid-media-bindings');
     const captured = [], unsupported = [], counts = new Map(), fieldCounts = new Map();
@@ -553,7 +581,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       } else if (!current.has(node)) retireIsolation(node, marker);
     }
   }
-  function reset() { receipts.clear(); byBinding.clear(); activeTrail = pendingTrail = null; clearPreview(); }
+  function reset() { receipts.clear(); byBinding.clear(); exposureIsolation?.reset(); activeTrail = pendingTrail = null; clearPreview(); }
   let refreshQueued = false;
   function schedulePreview(event) {
     // Closing/folding/playing the independent panel must not immediately reopen it.
@@ -568,6 +596,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   document?.addEventListener?.('subgraph-opened', subgraphOpened);
   function destroy() {
     reset(); preview?.destroy(); panel?.remove(); observerProbe?.disconnect?.();
+    exposureIsolation?.destroy();
     for (const marker of liveIsolations.values()) { marker.observer?.disconnect?.(); marker.retired = true; }
     liveIsolations.clear();
     for (const hooks of [...viewHooks.values(), ...scopeHooks.values()]) for (const item of hooks) item.active = false;
@@ -581,6 +610,6 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     unavailable = true;
   }
   window.addEventListener?.('pagehide', destroy);
-  return { arm, isolateNode, capture, observe, authorize, reset, refreshPreview, destroy,
+  return { arm, isolateNode, prepareCapture, capture, observe, authorize, reset, refreshPreview, destroy,
     get supportsNestedCapture() { return Boolean(nestedAvailable()); } };
 }

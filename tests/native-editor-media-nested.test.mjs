@@ -6,6 +6,7 @@ import { webcrypto } from 'node:crypto';
 import { createNativeEditorMedia } from '../web/native-editor-media.mjs';
 import { createEditorMediaPreview } from '../web/editor-media-preview.mjs';
 import { createEditorSessionProjection } from '../web/editor-session-projection.mjs';
+import { createPreviewExposureIsolation } from '../web/native-editor-preview-exposures.mjs';
 
 const bridge=(await readFile(new URL('../web/native-editor-bridge.js',import.meta.url),'utf8')).replace(/^import .*;$/gm,'')
   .replace("import('/prism-editor-media.mjs')",'Promise.resolve({createNativeEditorMedia:mediaFactory})')
@@ -24,11 +25,13 @@ class Element {
   pause(){this.operations.push('pause');} load(){this.operations.push('load');}
   set src(value){this._src=value;} get src(){return this._src||'';}
 }
-async function fixture({type='image',mask=false,shared=false,promoted=false,deep=false,navigation=false,exposures=[],exposureProof=true,noComparator=false,noCanvasHook=false}={}){
+async function fixture({type='image',mask=false,shared=false,promoted=false,deep=false,navigation=false,exposures=[],exposureProof=true,exposureCapability=false,noComparator=false,noCanvasHook=false}={}){
   const input=type==='video'?'file':type,classType=mask?'LoadImageMask':{image:'LoadImage',video:'LoadVideo',audio:'LoadAudio'}[type];
   const ext={image:'png',video:'mp4',audio:'wav'}[type],native=`native/N.${ext}`,connected=`refs/C.${ext}`;
   const resources=[],handlers=new Map(),replies=[],waiters=new Map(),frames=[];let implementation,preview,sequence=0,extension;
-  const body=new Element('body'),document={body,querySelector:()=>null,addEventListener:(k,v)=>handlers.set(`doc:${k}`,v),removeEventListener:(k)=>handlers.delete(`doc:${k}`),
+  const exposureTables=new Map(),actionHandlers=new Set(),exposureStore={$id:'previewExposure',getExposures:(_root,id)=>exposureTables.get(id)||[],
+    $onAction(fn){actionHandlers.add(fn);return()=>actionHandlers.delete(fn);},setExposures(root,id,value){for(const fn of [...actionHandlers])fn({name:'setExposures',args:[root,id,value]});exposureTables.set(id,copy(value));}};
+  const body=new Element('body'),document={body,querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(k,v)=>handlers.set(`doc:${k}`,v),removeEventListener:(k)=>handlers.delete(`doc:${k}`),
     createElement(tag){const item=new Element(tag);if(['img','video','audio'].includes(tag))resources.push(item);return item;}};
   class MediaNode {
     constructor(id=4){Object.assign(this,{id,type:classType,comfyClass:classType,mode:0,title:'唯一子图素材',inputs:[{name:input,widget:{name:input},link:null}],
@@ -45,10 +48,11 @@ async function fixture({type='image',mask=false,shared=false,promoted=false,deep
     beforeChange(){},afterChange(){this.onAfterChange?.(this);},change(){}});
   const inside=scope('child-definition',[leaf,other]);leaf.graph=other.graph=inside;
   const host=(id,subgraph)=>({id,type:subgraph.id,mode:0,subgraph,inputs:[],widgets:[],properties:{},isSubgraphNode:()=>true,
-    serialize(){return{id:this.id,type:this.type,mode:0,widgets_values:this.widgets.map(widget=>widget.value),properties:exposureProof?{previewExposures:copy(exposures)}:{}};}});
+    serialize(){return{id:this.id,type:this.type,mode:0,widgets_values:this.widgets.map(widget=>widget.value),properties:exposureProof?{previewExposures:copy(exposureCapability?exposureStore.getExposures('root',String(id)):exposures)}:{}};}});
   const middle=deep?host(2,inside):null,outerScope=deep?scope('middle-definition',[middle]):inside;
   if(middle)middle.graph=outerScope;
   const first=host(6,outerScope),second=host(7,outerScope),root=scope('root',shared?[first,second]:[first]);first.graph=second.graph=root;
+  if(exposureCapability){exposureStore.setExposures('root','6',exposures);exposureStore.setExposures('root','7',[]);}
   if(promoted){leaf.inputs[0].link=1;inside.links.set(1,{originIsIoNode:true,origin_slot:0,origin_id:-10,target_id:4,target_slot:0});
     for(const item of [first,second]) {
       item.inputs=[{name:'instance-media',widget:{name:'instance-media'},link:null}];
@@ -74,8 +78,10 @@ async function fixture({type='image',mask=false,shared=false,promoted=false,deep
   const timers=[],window={parent,app,__PRISM_EDITOR__:{parentOrigin:'http://127.0.0.1:8874',bridgeNonce:'nested-media',backendUrl:'http://127.0.0.1:8188',mediaProtocol:1},
     LiteGraph:{registered_node_types:{[classType]:MediaNode}},crypto:webcrypto,addEventListener:(k,v)=>handlers.set(k,v),removeEventListener:k=>handlers.delete(k),
     requestAnimationFrame:callback=>frames.push(callback),setTimeout:callback=>timers.push(callback)};
+  if(exposureCapability){window.LiteGraph.vueNodesMode=false;window.MutationObserver=class{observe(){}disconnect(){}};}
   vm.runInNewContext(bridge,{app,window,document,TextEncoder,setTimeout,
-    mediaFactory(args){if(noComparator)delete args.sameMappingProof;return implementation=createNativeEditorMedia(args);},
+    mediaFactory(args){if(noComparator)delete args.sameMappingProof;if(exposureCapability)Object.assign(args,{createExposureIsolation:createPreviewExposureIsolation,
+      frontendCapability:{supported:true,isCurrent:()=>true,exposureStore,nextTick:()=>Promise.resolve()}});return implementation=createNativeEditorMedia(args);},
     previewFactory(args){return preview=createEditorMediaPreview(args);}});
   extension.setup();while(timers.length)timers.shift()();
   for(let i=0;i<20&&!replies.some(item=>item.action==='ready');i++)await new Promise(setImmediate);
@@ -87,9 +93,25 @@ async function fixture({type='image',mask=false,shared=false,promoted=false,deep
   const select=(node=leaf)=>{canvas.setGraph(inside);canvas.selected_nodes={[node.id]:node};canvas.onSelectionChange?.(canvas.selected_nodes);implementation.refreshPreview();};
   const selectOnly=node=>{canvas.selected_nodes={[node.id]:node};canvas.onSelectionChange?.(canvas.selected_nodes);implementation.refreshPreview();};
   const enter=host=>{canvas.setGraph(root);canvas.openSubgraph(host.subgraph,host);selectOnly(leaf);};
-  return {type,input,classType,native,connected,nodeId,binding,request,capture,select,selectOnly,enter,app,canvas,root,inside,outerScope,first,second,middle,leaf,other,exposures,MediaNode,resources,frames,handlers,replies,
+  return {type,input,classType,native,connected,nodeId,binding,request,capture,select,selectOnly,enter,app,canvas,root,inside,outerScope,first,second,middle,leaf,other,exposures,exposureStore,MediaNode,resources,frames,handlers,replies,
     media:()=>implementation,preview:()=>preview,currentMedia:()=>resources.at(-1)};
 }
+
+test('fresh shared audio bridge captures automatic exposure and preserves A/B ownership through its own lifecycle wrapper',async()=>{
+  const exposures=[{name:'audioUI',sourceNodeId:'4',sourcePreviewName:'audioUI'}];
+  const h=await fixture({type:'audio',shared:true,promoted:true,navigation:true,exposureCapability:true,exposures});
+  const second={...h.binding,field_id:'reference-b',node_id:'7:4',value:'refs/B.wav',media_owner:{...h.binding.media_owner,name:'refs/B.wav'}};
+  const result=await h.request('captureMedia',{bindings:[h.binding,second]});assert.equal(result.error,undefined);assert.equal(result.result.captured.length,2);assert.deepEqual(result.result.unsupported,[]);
+  assert.deepEqual(h.exposureStore.getExposures('root','6'),[]);assert.deepEqual(h.first.serialize().properties.previewExposures,exposures);
+  for(const [binding,host] of [[h.binding,h.first],[second,h.second]]){
+    const receipt=result.result.captured.find(item=>item.field_id===binding.field_id).receipt;
+    const response=await h.request('patch',{patches:[{node_id:binding.node_id,widget_name:'audio',class_type:'LoadAudio',media_receipt:receipt,value:binding.value,expected_value:host.widgets[0].value}]});
+    assert.equal(response.error,undefined);h.enter(host);assert.equal(h.preview().getState().filename,binding.value);
+  }
+  assert.equal(h.leaf.widgets[0].value,h.native);assert.equal(h.first.widgets[0].value,h.connected);assert.equal(h.second.widgets[0].value,second.value);
+  const snapshot=await h.request('snapshot');assert.equal(snapshot.error,undefined);assert.deepEqual(snapshot.result.workflow.nodes[0].properties.previewExposures,exposures);
+  h.media().reset();assert.deepEqual(h.exposureStore.getExposures('root','6'),exposures);h.media().destroy();
+});
 
 for(const type of ['image','video','audio'])test(`unique nested ${type}: isolate only captured leaf, C/N roundtrip uses real bridge and active child preview`,async()=>{
   const h=await fixture({type}),before=copy(h.root.serialize());await h.request('compile');

@@ -34,6 +34,8 @@ BRIDGE_EXTENSION = BRIDGE_PATH
 MEDIA_MODULES = {
     "/prism-editor-media.mjs": "native-editor-media.mjs",
     "/prism-editor-media-preview.mjs": "editor-media-preview.mjs",
+    "/prism-editor-frontend-capabilities.mjs": "native-editor-frontend-capabilities.mjs",
+    "/prism-editor-preview-exposures.mjs": "native-editor-preview-exposures.mjs",
 }
 
 _HOP_BY_HOP = {
@@ -441,7 +443,7 @@ class EditorProxy:
             document = body.decode("utf-8", "replace")
             charset = "utf-8"
         config = {"parentOrigin": self.parent_origin, "bridgeNonce": self.bridge_nonce,
-                  "backendUrl": self.backend_url, "mediaProtocol": 1}
+                  "backendUrl": self.backend_url, "mediaProtocol": 1, "promotedAudioProtocol": 1}
         injected = _inject_config(document, config).encode("utf-8")
         content_type = re.sub(r";\s*charset\s*=\s*[^;]+", "", content_type, flags=re.IGNORECASE)
         return injected, content_type + "; charset=utf-8"

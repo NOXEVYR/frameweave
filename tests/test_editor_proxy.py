@@ -203,7 +203,7 @@ class EditorProxyTests(unittest.TestCase):
         self.assertIsNotNone(match)
         config = json.loads(match.group(1))
         self.assertEqual(config, {"parentOrigin": PARENT_ORIGIN, "bridgeNonce": self.info["bridgeNonce"],
-                                  "backendUrl": self.backend_url, "mediaProtocol": 1})
+                                  "backendUrl": self.backend_url, "mediaProtocol": 1, "promotedAudioProtocol": 1})
         self.assertNotIn(bootstrap_secret, text)
         self.assertNotIn("session", config)
 

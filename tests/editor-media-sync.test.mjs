@@ -18,7 +18,7 @@ function fixture(type = 'image') {
   const api = async (path, body) => {
     calls.push({ path, body });
     return { asset_id: path.split('/')[4], name: `refs/${path.split('/')[4]}.${type === 'image' ? 'png' : type === 'video' ? 'mp4' : 'wav'}`,
-      backend, media_type: type, ...(type === 'image' ? {} : { package_id: body.package_id, field_id: body.field_id }) };
+      backend, media_type: type, ...(type === 'image' ? {} : { package_id: body.package_id, field_ids: body.field_ids }) };
   };
   const guard = captureEditorPreparationTarget(graph, target.id, options);
   const check = () => assertEditorPreparationTarget(guard, graph, options);
@@ -30,7 +30,8 @@ for (const type of ['image', 'video', 'audio']) test(`${type}: explicit transfer
   assert.equal(result.updates.length, 1); assert.equal(result.pending.length, 0);
   assert.deepEqual(f.graph, before); assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].body.expected_backend, backend);
-  assert.equal(f.calls[0].body.field_id, type === 'image' ? undefined : 'scene');
+  assert.deepEqual(f.calls[0].body.field_ids, type === 'image' ? undefined : ['scene']);
+  assert.equal(f.calls[0].body.refresh, type === 'image' ? undefined : true);
   assert.ok(f.calls.every(call => call.path.endsWith('/backend-input')));
 });
 test('two images with distinct SHA retain role association and a shared image uploads once', async () => {
@@ -48,7 +49,7 @@ test('video validates each port even when one source connects to both', async ()
   const f = fixture('video'); f.options.fields.push({ ...f.options.fields[0], id: 'motion', node_id: '5' });
   f.graph.edges.push({ id: 'e2', source: 'source', target: 'target', targetField: 'motion' });
   const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
-  assert.deepEqual(f.calls.map(call => call.body.field_id), ['scene', 'motion']); assert.equal(result.updates.length, 1);
+  assert.equal(f.calls.length, 1); assert.deepEqual(f.calls[0].body.field_ids, ['scene', 'motion']); assert.equal(result.updates.length, 1);
 });
 test('current outer scalar values and connected values reach the live media contract', async () => {
   const f = fixture('video');
@@ -96,7 +97,7 @@ for (const bad of ['asset', 'backend', 'type', 'path', 'field']) test(`invalid $
   const f = fixture(bad === 'field' ? 'video' : 'image');
   const api = async (...args) => ({ ...await f.api(...args), ...{
     asset: { asset_id: 'c'.repeat(64) }, backend: { backend: 'http://127.0.0.1:8189' },
-    type: { media_type: 'audio' }, path: { name: '../escape.png' }, field: { field_id: 'other' },
+    type: { media_type: 'audio' }, path: { name: '../escape.png' }, field: { field_ids: ['other'] },
   }[bad] });
   await assert.rejects(stageEditorMediaSync(f.graph, 'target', f.options, api), /未改写画布/);
   assert.equal(f.source.data.name, '');
@@ -116,4 +117,44 @@ test('legacy image store uses its own endpoint and a foreign asset is reuploaded
   f.source.data.name = 'old.png'; f.source.data.uploadBackend = 'http://127.0.0.1:8189';
   const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
   assert.match(f.calls[0].path, /\/assets\/images\//); assert.equal(result.updates[0].uploadBackend, backend);
+});
+
+for (const type of ['image', 'video', 'audio']) test(`${type}: explicit sync refreshes a registered same-backend name`, async () => {
+  const f = fixture(type); f.source.data.name = 'old-name'; f.source.data.uploadBackend = backend;
+  const before = structuredClone(f.graph);
+  for (let i = 0; i < 2; i++) {
+    const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
+    assert.equal(result.updates.length, 1); assert.equal(result.pending.length, 0);
+  }
+  assert.equal(f.calls.length, 2); assert.deepEqual(f.graph, before);
+});
+test('two source nodes holding one audio file refresh once and receive the same name', async () => {
+  const f = fixture('audio'); f.options.fields.push({ ...f.options.fields[0], id: 'voice', node_id: '8' });
+  f.graph.nodes.push({ ...structuredClone(f.source), id: 'copy' });
+  f.graph.edges.push({ id: 'other', source: 'copy', target: 'target', targetField: 'voice' });
+  const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
+  assert.equal(f.calls.length, 1); assert.deepEqual(f.calls[0].body.field_ids, ['scene', 'voice']);
+  assert.equal(result.updates.length, 2); assert.equal(result.updates[0].name, result.updates[1].name);
+});
+for (const issue of ['importing', 'failed', 'transaction', 'wrong-type', 'duplicate']) test(`one bad use blocks other nodes of the same asset: ${issue}`, async () => {
+  const f = fixture('video'); f.options.fields.push({ ...f.options.fields[0], id: 'motion', node_id: '8' });
+  f.graph.nodes.push({ ...structuredClone(f.source), id: 'copy' });
+  f.graph.edges.push({ id: 'other', source: 'copy', target: 'target', targetField: 'motion' });
+  if (issue === 'importing') f.options.referenceImports.set('copy', { ticket: {} });
+  if (issue === 'failed') f.options.referenceImports.set('copy', { error: 'bad' });
+  if (issue === 'transaction') f.options.mediaTransfers.start('canvas:target', 'motion');
+  if (issue === 'wrong-type') f.options.fields[1].type = 'image';
+  if (issue === 'duplicate') f.graph.edges.push({ ...f.graph.edges[1], id: 'duplicate' });
+  const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
+  assert.equal(f.calls.length, 0); assert.equal(result.updates.length, 0); assert.ok(result.pending.length);
+});
+for (const fields of [undefined, [], ['scene', 'scene'], ['scene', 'extra']]) test(`incomplete or extra grouped receipts are rejected: ${JSON.stringify(fields)}`, async () => {
+  const f = fixture('audio');
+  await assert.rejects(stageEditorMediaSync(f.graph, 'target', f.options,
+    async (...args) => ({ ...await f.api(...args), field_ids: fields })), /未改写画布/);
+});
+test('a registered remote name without a local copy reports recovery unavailable', async () => {
+  const f = fixture(); f.source.data.name = 'old.png'; f.source.data.uploadBackend = backend; delete f.source.data.localAssetId;
+  const result = await stageEditorMediaSync(f.graph, 'target', f.options, f.api);
+  assert.equal(f.calls.length, 0); assert.equal(result.pending[0].reason, 'local_copy_unavailable');
 });

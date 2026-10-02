@@ -33,6 +33,7 @@ _MAX_LOG_BYTES = 10 * 1024 * 1024
 _DEFAULT_STARTUP_TIMEOUT = 600
 _DEFAULT_MAX_RETRIES = 1
 _MAX_PROCESS_RECORD_BYTES = 128 * 1024
+_MAX_VOICE_IDENTITY_BYTES = 1024
 
 
 class _ProcessRecordError(ValueError):
@@ -225,7 +226,7 @@ def _profile(value):
     auto_start = value.get("auto_start", True)
     if type(auto_start) is not bool:
         raise ValueError("引擎自动启动设置须为布尔值")
-    return {
+    result = {
         "id": ident,
         "name": name.strip(),
         "base_url": base_url,
@@ -237,6 +238,14 @@ def _profile(value):
         "max_retries": max_retries,
         "auto_start": auto_start,
     }
+    if "environment_id" in value or "environment_fingerprint" in value:
+        if (not isinstance(value.get("environment_id"), str) or
+                not re.fullmatch(r"voice-[a-f0-9]{24}", value["environment_id"]) or
+                not isinstance(value.get("environment_fingerprint"), str) or
+                not re.fullmatch(r"[a-f0-9]{64}", value["environment_fingerprint"])):
+            raise ValueError("本地适配环境身份无效")
+        result.update(environment_id=value["environment_id"], environment_fingerprint=value["environment_fingerprint"])
+    return result
 
 
 class EngineManager:
@@ -335,6 +344,9 @@ class EngineManager:
         command = {key: profile[key] for key in (
             "id", "base_url", "python_executable", "main_script", "working_directory", "arguments",
         )}
+        for key in ("environment_id", "environment_fingerprint"):
+            if key in profile:
+                command[key] = profile[key]
         raw = json.dumps(command, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
@@ -438,7 +450,9 @@ class EngineManager:
                        else "上次启动记录对应的 PID 已被系统复用，旧记录已安全清理；请手动启动以重试")
             return self._status_item(profile, False, False, "error", message)
         if result == "alive":
-            online = self._probe_comfy(profile["base_url"])
+            online, identity_unverified = self._probe_profile(profile)
+            if identity_unverified:
+                return self._voice_identity_status(profile, False, recorded=True)
             message = ("上次启动的 ComfyUI 仍在运行，已复用且未重复启动" if online
                        else "上次启动的引擎进程仍在运行，正在等待 ComfyUI 就绪；未重复启动")
             return self._status_item(profile, online, False, "online" if online else "starting", message)
@@ -507,11 +521,56 @@ class EngineManager:
             self._save()
             return self._public_status(profile)
 
+    def register_environment(self, profile, prepare=None):
+        """Register a product-created immutable adapter profile; not an HTTP argv API."""
+        profile = _profile(profile)
+        if "environment_id" not in profile or profile["id"] != profile["environment_id"]:
+            raise ValueError("适配环境身份与引擎不一致")
+        with self._lock:
+            self._ensure_config_writable()
+            process_lock = _EngineFileLock(self.process_lock_path)
+            if not process_lock.acquire(timeout=1):
+                raise ValueError("另一项引擎操作正在进行，请稍后重试登记")
+            try:
+                current = self._load()
+                existing = next((item for item in current if item["id"] == profile["id"]), None)
+                if existing:
+                    if self._profile_signature(existing) != self._profile_signature(profile):
+                        raise ValueError("已有环境的启动配置不同，已保留原配置")
+                    if prepare:
+                        prepare(existing)
+                    self._profiles = current
+                    return self._public_status(existing)
+                if any(item["base_url"] == profile["base_url"] for item in current):
+                    raise ValueError("该端口已登记给其他引擎，请为独立声音环境选择另一个端口")
+                if len(current) >= _MAX_PROFILES:
+                    raise ValueError("本地引擎配置数量已达上限")
+                if prepare:
+                    prepare(profile)
+                before = self._profiles
+                self._profiles = [*current, profile]
+                try:
+                    self._save()
+                except BaseException:
+                    self._profiles = before
+                    raise
+                return self._public_status(profile)
+            finally:
+                process_lock.release()
+
     def registered_endpoints(self):
         """List validated public identities without network or lifecycle probes."""
         with self._lock:
             return [{key: profile[key] for key in ('id', 'name', 'base_url')}
                     for profile in self._profiles]
+
+    def verify_environment_endpoint(self, base_url):
+        """Fresh submission guard for owned environments; never start a service."""
+        with self._lock:
+            profile = next((dict(item) for item in self._profiles
+                            if item['base_url'] == base_url and item.get('environment_id')), None)
+        if profile and not self._probe_profile(profile)[0]:
+            raise ValueError('所选声音环境离线或身份不匹配，未提交生成；请在软件设置中核对引擎')
 
     def status(self):
         """Read health without changing state or managing any process."""
@@ -608,13 +667,25 @@ class EngineManager:
                     guarded = self._persisted_guard(profile, manual_start=True)
                     if guarded is not None:
                         return guarded
+                environment_health = self._probe_profile(profile) if profile.get("environment_id") else None
+                if environment_health is not None and environment_health[1]:
+                    entry = self._processes.get(profile["id"])
+                    managed = False
+                    if entry:
+                        try:
+                            managed = entry[0].poll() is None
+                        except (OSError, ValueError):
+                            managed = True
+                    return self._voice_identity_status(profile, managed)
                 process = self._alive_process(profile["id"])
                 if had_process and process is None:
                     try:
                         self._remove_process_record(profile["id"])
                     except _ProcessRecordError as exc:
                         return self._status_item(profile, False, False, "error", f"引擎已退出，但启动记录无法清理：{exc}")
-                online = self._probe_comfy(profile["base_url"])
+                online, identity_unverified = environment_health or self._probe_profile(profile)
+                if identity_unverified:
+                    return self._voice_identity_status(profile, process is not None)
                 meta = self._meta.setdefault(profile["id"], {})
                 meta.pop("error", None)
                 meta["stop_retry"] = False
@@ -662,7 +733,10 @@ class EngineManager:
         """Start one registered profile with its fixed argv, logging to App_Data."""
         # Re-check immediately before Popen. Auto-retries must never claim a
         # port that became occupied after the earlier health probe.
-        if self._probe_comfy(profile["base_url"]):
+        online, identity_unverified = self._probe_profile(profile)
+        if identity_unverified:
+            return self._voice_identity_status(profile, False)
+        if online:
             return self._status_item(profile, online=True, managed=False,
                                      state="online", message="已复用运行中的 ComfyUI")
         if self._port_in_use(profile["base_url"]):
@@ -728,6 +802,9 @@ class EngineManager:
                 return "引擎安装文件缺失，请重新选择本地 ComfyUI 目录"
         except OSError:
             return "无法访问引擎安装目录"
+        if profile.get("environment_id"):
+            from .voice_environments import validate_start
+            return validate_start(profile)
         return None
 
     def _alive_process(self, ident):
@@ -760,6 +837,51 @@ class EngineManager:
             self._remove_process_record(ident)
         except _ProcessRecordError:
             pass
+
+    @staticmethod
+    def _probe_voice_identity(base_url, environment_id):
+        """Bounded, non-redirecting handshake; ordinary ComfyUI is insufficient."""
+        def unique_pairs(pairs):
+            payload = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ValueError("Duplicate identity key")
+                payload[key] = value
+            return payload
+
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+            request = urllib.request.Request(base_url + "/prismcanvas/voice-identity", headers={
+                "Accept": "application/json", "Connection": "close",
+            })
+            with opener.open(request, timeout=_PROBE_TIMEOUT) as response:
+                if response.status != 200:
+                    return False
+                length = response.headers.get("Content-Length")
+                if length and (not length.isdigit() or int(length) > _MAX_VOICE_IDENTITY_BYTES):
+                    return False
+                body = response.read(_MAX_VOICE_IDENTITY_BYTES + 1)
+                if len(body) > _MAX_VOICE_IDENTITY_BYTES:
+                    return False
+            payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_pairs)
+            return payload == {"adapter": "qwen3_tts_voice_design", "environment_id": environment_id}
+        except (http.client.HTTPException, OSError, ValueError, TypeError, TimeoutError,
+                urllib.error.URLError, urllib.error.HTTPError, UnicodeError, RecursionError):
+            return False
+
+    def _probe_profile(self, profile):
+        """Return (online, wrong_or_unverified_identity) without lifecycle changes."""
+        healthy = self._probe_comfy(profile["base_url"])
+        if not healthy or not profile.get("environment_id"):
+            return healthy, False
+        verified = self._probe_voice_identity(profile["base_url"], profile["environment_id"])
+        return verified, not verified
+
+    @staticmethod
+    def _voice_identity_status(profile, managed, *, recorded=False):
+        return EngineManager._status_item(profile, False, managed,
+            "unverified" if managed or recorded else "occupied",
+            "端口上的 ComfyUI 未通过声音环境身份核验；未复用或重启，请检查所选环境")
 
     @staticmethod
     def _probe_comfy(base_url):
@@ -809,8 +931,10 @@ class EngineManager:
                 # Keep an uncertain child represented as managed. A later
                 # supervisor pass can check again without risking a duplicate.
                 alive = True
-        online = self._probe_comfy(profile["base_url"])
+        online, identity_unverified = self._probe_profile(profile)
         managed = process is not None and alive
+        if identity_unverified:
+            return self._voice_identity_status(profile, managed)
         if meta.get("error"):
             return self._status_item(profile, online, managed, "error", meta["error"])
         if online:
@@ -849,7 +973,9 @@ class EngineManager:
                 alive = True
                 process_status_uncertain = True
 
-        online = self._probe_comfy(profile["base_url"])
+        online, identity_unverified = self._probe_profile(profile)
+        if identity_unverified:
+            return self._voice_identity_status(profile, alive)
         if meta.get("error"):
             if process is not None and not alive:
                 self._forget_exited_process(ident)

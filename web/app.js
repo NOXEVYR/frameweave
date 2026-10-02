@@ -2858,7 +2858,7 @@ async function initialize() {
   setInterval(() => { api('/api/heartbeat').catch(() => {}); }, 30000);
 }
 const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { if (hasActiveJobs() || workflowCanvas.isRunning() || studio.hasPending()) throw new Error('请等待生成与画布调度完成，并查询待确认提交后再退出。'); if (!save(true)) throw new Error('浏览器草稿保存失败，本次退出已取消。请先导出或保存本地画布版本，确认后再手动关闭窗口。'); } });
-const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
+const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError, loadPackages });
 const hubCenter = createHubCenter({ api, reportError, downloadJSON, toast,
   selectedRequest: () => selectedHubRequest({ graph: () => graph, selectedIds: () => [...selected],
     backend: () => settings.backend_url, canvasIdentity: currentCanvasIdentity, ensurePackageDefinition }) });

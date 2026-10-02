@@ -33,6 +33,7 @@ from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
 from .engines import EngineManager
+from .voice_environments import VoiceEnvironments
 from .hub_connection import HubConnection
 from .hub_profiles import prepare_offer
 from .h3_reference import prepare_h3_reference_package
@@ -129,6 +130,7 @@ class App:
         self.media = {}
         self.uploaded = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
+        self.voice_environments = VoiceEnvironments(self.data_dir, self.engines, self.packages)
         self.canvases = CanvasStore(self.data_dir / "canvases")
         self.local_assets = LocalImageAssets(self.data_dir)
         self.local_media_assets = LocalMediaAssets(self.data_dir)
@@ -1313,6 +1315,7 @@ class App:
         """Called under lock. Prepare storage before any inference side effect."""
         if self.exit_pending or self.closed.is_set():
             raise ValueError("棱光正在退出，未提交生成任务")
+        self.engines.verify_environment_endpoint(self.backend.url)
         if 'jobs.json' in self.recovery_protected_files:
             raise ValueError('任务记录无法安全保存，未提交生成；请先备份本地工作区、修复磁盘问题并重启客户端')
         if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
@@ -1836,6 +1839,8 @@ def make_server(app, port=0):
                     self.respond({**audio_capabilities(app.object_info(), [app.packages.get(p['id']) for p in app.packages.list()]), 'backend_url': app.backend.url})
                 elif path == "/api/engines":
                     self.respond(app.engines.status())
+                elif path == "/api/voice-environments":
+                    self.respond(app.voice_environments.list())
                 elif path == "/api/updates":
                     self.respond(app.update_status())
                 elif path == "/api/heartbeat":
@@ -2147,6 +2152,14 @@ def make_server(app, port=0):
                     result = app.output_location(path.split('/')[3], data)
                 elif path == "/api/engines/start":
                     result = app.engines.start(data.get("id"))
+                elif path == "/api/voice-environments/inspect":
+                    result = app.voice_environments.inspect(data)
+                elif path == "/api/voice-environments/register":
+                    result = app.voice_environments.prepare(data)
+                elif path == "/api/voice-environments/recheck":
+                    if set(data) != {"id"}:
+                        raise ValueError("只接受已登记的声音环境标识")
+                    result = app.voice_environments.recheck(data["id"])
                 elif path == "/api/engines/register":
                     if set(data) - {"root", "port", "name"}:
                         raise ValueError("仅支持登记已有安装目录、名称和端口")

@@ -1,0 +1,48 @@
+{
+  "application": "PrismCanvas",
+  "version": "0.11.5",
+  "candidate": "Phase8D",
+  "stable_release": false,
+  "source_archive_sha256": "0fcf2737ce687a6b479bb7fe4f794b7203dc47b96479ea3c1cffa0aa14ffa179",
+  "exe_sha256": "290ee0a8eec35a00dc3ae11fd64c8eddbb6b059c21d5ce8e2c6302e64f741a59",
+  "packages": [
+    {
+      "filename": "PrismCanvas-Phase8D-Source.zip",
+      "bytes": 1635830,
+      "sha256": "0fcf2737ce687a6b479bb7fe4f794b7203dc47b96479ea3c1cffa0aa14ffa179"
+    },
+    {
+      "filename": "PrismCanvas-0.11.5-Phase8D-Windows-x64-candidate.zip",
+      "bytes": 11169449,
+      "sha256": "de00459e119c5420ae662cae9191dad438a98b8569efe8f1e2d6d25c78a303a4"
+    }
+  ],
+  "validation": {
+    "python_pass": 1286,
+    "python_skipped": 3,
+    "node_pass": 1671,
+    "final_voice_tests": 55,
+    "source_ui_checks": 34,
+    "actual_exe_ui_checks": 33,
+    "source_gpu_completed": 1,
+    "actual_exe_gpu_completed": 1,
+    "source_cancelled": 1,
+    "actual_exe_cancelled": 1,
+    "audio_seconds": 3.36,
+    "sample_rate": 24000,
+    "channels": 1,
+    "human_listening": false,
+    "unpacked_exe_two_starts": true
+  },
+  "stable_update_feed_changed": false,
+  "contains_model_weights": false,
+  "contains_tts_dependencies": false,
+  "contains_user_data": false,
+  "archive_manifests_are_packaging_checkpoints": true,
+  "postseal_documentation_paths": [
+    "README.md",
+    "docs/DEVELOPMENT_LOG.md",
+    "docs/VALIDATION.md",
+    "docs/UNIFIED_OPTIMIZATION.md"
+  ]
+}

@@ -12,7 +12,8 @@
 | --- | --- | --- |
 | Windows 稳定成品 0.11.1 | 已公开，自动更新通道仍指向此版 | [下载便携包](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip) |
 | 0.11.4 源码预览 | 已公开；新增素材拖放、命名端口、预设内部编辑和实时预览 | [下载源码](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.4-source.zip) |
-| Windows 0.11.5 Phase8D 候选 | 应用内离线声音环境接入、工作流内外调参；实际 EXE 生成与取消验收通过，稳定更新源未提升 | [候选下载与验证](https://github.com/NOXEVYR/frameweave/blob/codex/phase7w-unified-workflows/releases/PrismCanvas-0.11.5-Phase8D.md) |
+| Windows 0.11.5 Phase8F 候选 | 修复预设空图提示、文档归属和缩放动画导致的保存失败；实际 EXE 编辑保存与刷新重入通过，稳定更新源未提升 | [候选下载与验证](https://github.com/NOXEVYR/frameweave/blob/codex/phase7w-unified-workflows/releases/PrismCanvas-0.11.5-Phase8F.md) |
+| 历史 Phase8D 候选 | 应用内离线声音环境接入及当时的生成/取消验收记录保留 | [Phase8D](releases/PrismCanvas-0.11.5-Phase8D.md) |
 | 历史 Phase8C3 / Phase8A 候选 | 原候选与校验值保留 | [Phase8C3](releases/PrismCanvas-0.11.5-Phase8C3.md) · [Phase8A](releases/PrismCanvas-0.11.5-Phase8A.md) |
 | 历史 Phase7Y 候选 | 原候选与校验值保留 | [历史候选](releases/PrismCanvas-0.11.5-Phase7Y.md) |
 

@@ -161,7 +161,19 @@ export function createNativeWorkflowEditor(host) {
       back.disabled = state.busy;
       reviewAdditions.disabled = state.busy || state.persistenceUnknown || state.bindingFailed || !state.additionReview || state.presetBound;
       switchEngine.disabled = state.busy || state.persistenceUnknown || state.bindingFailed;
-      fitView.disabled = !state.ready || state.busy || !state.fitView;
+      fitView.disabled = !state.ready || state.busy || !state.fitView || presetUnbound;
+      const waiting = Boolean(presetPrompt) && !state.presetBound;
+      stage.setAttribute('data-preset-pending', String(waiting));
+      pendingPanel.hidden = !waiting;
+      frame.setAttribute('aria-hidden', String(waiting));
+      if (waiting) frame.setAttribute('inert', ''); else frame.removeAttribute?.('inert');
+      pendingTitle.textContent = state.additionReview ? `确认 ${state.additionReview.added_inputs.length} 项新增参数后显示工作流` :
+        state.busy || !state.ready ? '正在准备内部工作流…' : '工作流尚未完成转换';
+      pendingMessage.textContent = state.additionReview ?
+        '当前 ComfyUI 为这套工作流补充了参数。确认前暂不展示空白编辑画布；原始工作流、外部参数与连线均保留。请复核后继续，或返回外层。此过程不会生成。' : status.textContent;
+      pendingReview.hidden = !state.additionReview;
+      pendingReview.disabled = state.busy;
+      pendingBack.disabled = state.busy;
     }
     async function action(callback) {
       if (state.busy || state.closed) return;
@@ -369,7 +381,20 @@ export function createNativeWorkflowEditor(host) {
     }
     header.append(sources);
     showSources();
-    dialog.append(header, note, frame); document.body.append(dialog);
+    const stage = element('div'); stage.className = 'native-editor-stage';
+    const pendingPanel = element('section'); pendingPanel.className = 'native-editor-pending';
+    pendingPanel.setAttribute('aria-label', '工作流转换状态');
+    const pendingTitle = element('h2'), pendingMessage = element('p');
+    pendingMessage.setAttribute('role', 'status');
+    const pendingActions = element('div'); pendingActions.className = 'native-editor-actions';
+    const pendingReview = element('button', '查看新增参数并继续'); pendingReview.className = 'button primary';
+    pendingReview.onclick = () => reviewAdditions.click();
+    const pendingBack = element('button', `返回${targetLabel}`); pendingBack.className = 'button quiet';
+    pendingBack.onclick = () => back.click();
+    pendingActions.append(pendingReview, pendingBack);
+    pendingPanel.append(pendingTitle, pendingMessage, pendingActions);
+    stage.append(frame, pendingPanel);
+    dialog.append(header, note, stage); document.body.append(dialog);
     dialog.addEventListener('cancel', event => { event.preventDefault(); if (!state.busy) back.click(); });
     async function initializeEditor(review = null) {
         state.loading = true; state.busy = true; refresh(); clearTimeout(startup);

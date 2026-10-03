@@ -555,3 +555,29 @@ test('capture unavailable cannot make a simultaneous scalar edit restore an old 
   await f.session.initialize(); await f.session.persist(f.store);
   assert.equal(f.saves[0].output['2'].inputs.text, 'new own N');
 });
+
+test('animated root viewport may move between compile and snapshot while the saved graph retains its viewport', async () => {
+  const f = fixture(); f.graph.extra = {ds: {scale: 1, offset: [0,0]}, extensionData: 'keep'};
+  await f.session.initialize(); let frame = 0;
+  f.hooks.before = action => {if (['compile','snapshot'].includes(action)) f.graph.extra.ds = {scale: 1 + ++frame / 100, offset: [frame, -frame]};};
+  await f.session.persist(f.store);
+  assert.equal(f.saves.length, 1);assert.equal(f.saves[0].workflow.extra.extensionData,'keep');
+  assert.ok(f.saves[0].workflow.extra.ds.scale > 1);assert.equal(f.saves[0].output['1'].inputs.text,'draft N');
+  assert.equal(f.value(),'source C');
+});
+for (const [name, change] of [
+  ['unknown viewport key', w => {w.extra.ds.other = 1;}],
+  ['missing viewport', w => {delete w.extra.ds;}],
+  ['nonpositive scale', w => {w.extra.ds.scale = 0;}],
+  ['string offset', w => {w.extra.ds.offset[0] = '1';}],
+  ['extra offset', w => {w.extra.ds.offset.push(2);}],
+  ['node position', w => {w.nodes[0].pos = [20,40];}],
+  ['node viewport metadata', w => {w.nodes[0].extra = {ds:{scale:2,offset:[1,2]}};}],
+  ['sibling metadata', w => {w.extra.execution = 'changed';}],
+]) test(`viewport exemption still blocks ${name}`, async () => {
+  const f = fixture(); f.graph.extra = {ds: {scale: 1, offset: [0,0]}};
+  await f.session.initialize();
+  f.hooks.after = (action, args, count, result) => {if (action === 'snapshot' && count === 2) change(result.workflow); return result;};
+  await assert.rejects(f.session.persist(f.store), error => error.code === 'snapshot_changed');
+  assert.equal(f.saves.length,0);
+});

@@ -239,7 +239,68 @@ function send(message) {
   window.parent.postMessage(clone({ source: 'prism-editor', nonce: config.bridgeNonce, ...message }), config.parentOrigin);
 }
 
+function documentOwnershipNotice() {
+  send({ action: 'notice', result: { message: '此编辑器已绑定当前工作流；新建、导入、切换和关闭工作流请返回外层画布。保存请使用上方“保存内部草稿”或“应用参数并返回”。' } });
+}
+
+// Use the frontend's public extension API, never private Pinia internals. A
+// rollback must restore the same native document as well as the same graph.
+function nativeDocumentOwner() {
+  const store = app.extensionManager?.workflow, workflow = store?.activeWorkflow;
+  if (store?.$id === 'workflow' && workflow && typeof store.getWorkflowByPath === 'function' &&
+      store.getWorkflowByPath(workflow.path) === workflow) return { store, workflow };
+  return null;
+}
+async function restoreDocument(document, owner) {
+  if (owner && (app.extensionManager?.workflow !== owner.store ||
+      owner.store.getWorkflowByPath(owner.workflow.path) !== owner.workflow)) throw new Error('document-owner-changed');
+  authorizedLoads.add(document);
+  await app.loadGraphData(document, false, false, ...(owner ? [owner.workflow] : []));
+}
+
+function installNativeDocumentControls() {
+  const command = app.extensionManager?.command;
+  const blocked = new Set(['Comfy.NewBlankWorkflow', 'Comfy.OpenWorkflow', 'Comfy.LoadDefaultWorkflow',
+    'Comfy.SaveWorkflow', 'Comfy.SaveWorkflowAs', 'Comfy.RenameWorkflow', 'Comfy.DuplicateWorkflow',
+    'Workspace.NextOpenedWorkflow', 'Workspace.PreviousOpenedWorkflow', 'Workspace.CloseWorkflow']);
+  if (command?.$id === 'command' && typeof command.execute === 'function') {
+    const execute = command.execute;
+    command.execute = function (id, ...args) {
+      if (state.claimed && blocked.has(id)) { documentOwnershipNotice(); return Promise.resolve(); }
+      return execute.call(this, id, ...args);
+    };
+  }
+  // Tab context menus and the workflow sidebar also call these actions directly.
+  // Keep the active document registered, even if a native service already tried
+  // to close it after its graph replacement was refused by loadGraphData.
+  const workflow = app.extensionManager?.workflow;
+  if (workflow?.$id === 'workflow') for (const name of ['closeWorkflow', 'deleteWorkflow', 'renameWorkflow']) {
+    if (typeof workflow[name] !== 'function') continue;
+    const native = workflow[name];
+    workflow[name] = function (...args) {
+      if (state.claimed) { documentOwnershipNotice(); return Promise.resolve(); }
+      return native.apply(this, args);
+    };
+  }
+}
+
 function installDocumentGate() {
+  // API JSON and A1111/embedded-file imports can clear the root graph without
+  // going through loadGraphData. The authenticated bridge imports through the
+  // awaited prototype implementation below, not these user-facing entry points.
+  for (const name of ['loadApiJson', 'handleFile', 'handleFileList']) {
+    if (typeof app[name] !== 'function') continue;
+    const native = app[name];
+    app[name] = function (...args) {
+      if (state.claimed) { documentOwnershipNotice(); return Promise.resolve(); }
+      return native.apply(this, args);
+    };
+  }
+  if (typeof document !== 'undefined' && document.head && document.createElement) {
+    const style = document.createElement('style');
+    style.textContent = 'html[data-prism-bound-document] .workflow-tabs-container { display: none !important; }';
+    document.head.append(style);
+  }
   const nativeLoad = app.loadGraphData;
   app.loadGraphData = function (document, ...args) {
     const authorized = document && typeof document === 'object' && authorizedLoads.delete(document);
@@ -251,7 +312,7 @@ function installDocumentGate() {
       // boundary. Parent loads claim this editor until it closes. Native undo
       // and redo use clean=false and continue to work through the same queue.
       if (!authorized && state.claimed && replacesDocument) {
-        send({ action: 'notice', result: { message: '此编辑器已绑定当前工作流；新建、打开或切换完整工作流请返回外层画布。' } });
+        documentOwnershipNotice();
         return;
       }
       return nativeLoad.call(receiver, document, ...args);
@@ -838,7 +899,7 @@ async function patchWidgets(patches, requestedMappings) {
     }
   }
   const root = graph();
-  let wrote = false, before = null;
+  let wrote = false, before = null, documentOwner = null;
   try {
     root.beforeChange?.();
     verifyRequestedMappings(requestedMappings);
@@ -857,6 +918,7 @@ async function patchWidgets(patches, requestedMappings) {
     // beforeChange may have completed an identical edit. Capture the
     // rollback document only after confirming that current transaction base.
     before = clone(root.serialize());
+    documentOwner = nativeDocumentOwner();
     // Serialization is an extension hook too. If it changed a target, the
     // saved document may predate that edit, even when it now equals the request.
     verifyRequestedMappings(requestedMappings);
@@ -931,8 +993,7 @@ async function patchWidgets(patches, requestedMappings) {
     }
     try {
       if (graph() !== root) throw new Error('root_changed');
-      authorizedLoads.add(before);
-      await app.loadGraphData(before, false, false);
+      await restoreDocument(before, documentOwner);
       root.afterChange?.();
       rolledBack = true;
     } catch { state.loaded = false; }
@@ -948,6 +1009,7 @@ async function importApiPrompt(value, acceptance = {}) {
   const prompt = validateApiPrompt(value);
   await state.nativeTail;
   const before = clone(graph().serialize());
+  const documentOwner = nativeDocumentOwner();
   resetMappings(); media.reset(); media.arm();
   try {
     // Invoke ComfyUI's awaited implementation directly. Some extension
@@ -997,8 +1059,7 @@ async function importApiPrompt(value, acceptance = {}) {
       ...(acceptedAdditions ? { accepted_added_inputs: acceptedAdditions } : {}) };
   } catch (cause) {
     try {
-      authorizedLoads.add(before);
-      await app.loadGraphData(before, false, false);
+      await restoreDocument(before, documentOwner);
       await state.nativeTail;
       state.source = before;
       state.lostOnLoad = [];
@@ -1030,6 +1091,7 @@ async function handle(message) {
       const document = clone(message.document);
       if (!document || !Array.isArray(document.nodes)) throw new Error('invalid-document');
       state.claimed = true;
+      if (typeof globalThis.document !== 'undefined') globalThis.document.documentElement?.setAttribute('data-prism-bound-document', '');
       state.source = clone(document);
       resetMappings(); media.reset(); media.arm();
       authorizedLoads.add(document);
@@ -1152,6 +1214,7 @@ if (config && typeof config.parentOrigin === 'string' && typeof config.bridgeNon
           return;
         }
         app.queuePrompt = blockedQueue;
+        installNativeDocumentControls();
         state.ready = true;
         send({ action: 'ready', capabilities: { media_capture: media === noMedia ? 0 : 1, mapping_capture: 1,
           media_nested_capture: media.supportsNestedCapture === true ? 1 : 0,

@@ -140,6 +140,9 @@ function assertUnbound(h) {
   for (const label of ['应用参数并返回', '保存内部草稿', '导出完整工作流']) assert.equal(buttons(h, label).disabled, true);
   assert.equal(h.calls.some(call => call.kind === 'applyInterface' || call.kind === 'applied'), false);
   assert.equal(h.calls.some(call => /\/jobs|\/generate|\/prompt/.test(call.path || '')), false);
+  assert.equal(buttons(h, '适应当前工作流').disabled, true, 'empty bootstrap is not an editable workflow');
+  const panel = elements(h.document.body).find(item => item.className === 'native-editor-pending');
+  assert.equal(panel.hidden, false, 'pending conversion explains the empty bootstrap');
 }
 
 test('unreviewed frontend additions fail closed without saving, binding, or retrying', async () => {
@@ -154,6 +157,8 @@ test('unreviewed frontend additions fail closed without saving, binding, or retr
     assertUnbound(h);
     assert.equal(buttons(h, '复核新增参数').hidden, false);
     assert.equal(reviewDialog(h), undefined);
+    assert(elements(h.document.body).some(item => item.textContent === '确认 2 项新增参数后显示工作流'));
+    assert.equal(buttons(h, '查看新增参数并继续').hidden, false);
     assert.equal(commands(h, 'importApi').length, 1);
     assert.deepEqual(prompt, before);
   } finally { await h.restore(); }
@@ -189,6 +194,7 @@ test('explicit review displays exact additions then sends the frozen review ID a
     assert.deepEqual(drafts(h)[0].payload, { document: converted.workflow, base_revision: 7 });
     assert.equal(buttons(h, '应用参数并返回').disabled, false);
     assert.equal(buttons(h, '复核新增参数').hidden, true);
+    assert.equal(elements(h.document.body).find(item => item.className === 'native-editor-pending').hidden, true);
     assert(elements(h.document.body).some(item => /按确认补充 2 项/.test(item.textContent)));
     assert.deepEqual(prompt, original);
   } finally { await h.restore(); }

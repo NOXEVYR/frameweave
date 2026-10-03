@@ -30,6 +30,18 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 const equal = (left, right) => canonical(left) === canonical(right);
+function equalDocument(left, right) {
+  // ComfyUI's animated fit/pan updates the root viewport between requests.
+  // This is not an edit. Exempt only its known finite transform on BOTH sides;
+  // retain every node, position, unknown metadata field and saved viewport.
+  const viewport = value => record(value) && Object.keys(value).length === 2 &&
+    own(value, 'scale') && typeof value.scale === 'number' && Number.isFinite(value.scale) && value.scale > 0 &&
+    own(value, 'offset') && Array.isArray(value.offset) && value.offset.length === 2 &&
+    value.offset.every(item => typeof item === 'number' && Number.isFinite(item));
+  if (!record(left) || !record(right) || !record(left.extra) || !record(right.extra) ||
+      !viewport(left.extra.ds) || !viewport(right.extra.ds)) return equal(left, right);
+  return equal({ ...left, extra: { ...left.extra, ds: null } }, { ...right, extra: { ...right.extra, ds: null } });
+}
 const bindingKey = item => JSON.stringify([item.node_id, item.input]);
 function validScalar(type, value) {
   return scalar(value) && (type === 'text' ? typeof value === 'string' && value.length <= 64000 :
@@ -173,8 +185,8 @@ export function createEditorSessionProjection({ request, provenance = [], assert
     // Official graphToPrompt removes localized slot labels, compresses widget
     // input slots and adds frontendVersion to its workflow. Compare each
     // serialization to its own fresh counterpart, never drop arbitrary fields.
-    if (!record(snapshot.workflow) || !record(lastSnapshot.workflow) || !equal(snapshot.workflow, lastSnapshot.workflow) ||
-        !equal(after.workflow, current.workflow) || !equal(after.output, current.output)) {
+    if (!record(snapshot.workflow) || !record(lastSnapshot.workflow) || !equalDocument(snapshot.workflow, lastSnapshot.workflow) ||
+        !equalDocument(after.workflow, current.workflow) || !equal(after.output, current.output)) {
       throw fail('snapshot_changed', '快照与编译图不一致，未保存临时连线覆盖');
     }
     return after;

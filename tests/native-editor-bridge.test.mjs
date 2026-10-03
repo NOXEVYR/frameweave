@@ -18,9 +18,12 @@ function harness(options = {}) {
   const app = Object.assign(Object.create(appPrototype), {
     graph: rootGraph,
     registerExtension: value => { extension = value; },
-    async loadGraphData(value) { calls.push('load'); if (options.load) await options.load(value); current = value; },
+    async loadGraphData(value, ...args) { calls.push('load'); if (options.load) await options.load(value, ...args); current = value; },
     async graphToPrompt() { calls.push('compile'); return { workflow: current, output: { 1: { class_type: 'Known', inputs: {} } } }; },
   });
+  if (options.extensionManager) app.extensionManager = options.extensionManager;
+  if (options.handleFile) app.handleFile = options.handleFile;
+  if (options.handleFileList) app.handleFileList = options.handleFileList;
   Object.defineProperties(app, {
     rootGraphOrUndefined: { get: () => app.rootGraph || rootGraph },
     canvasOrUndefined: { get: () => {
@@ -1543,4 +1546,48 @@ test('serialization cannot create a stale rollback baseline for a changed target
     assert.equal(h.leaf.widgets[0].value, duringSnapshot);
     assert.equal(h.calls.filter(x => x === 'load').length, loads);
   }
+});
+
+test('claimed editor blocks native file and API import before graph mutation, while parent import remains usable', async () => {
+  const files = [], api = [];
+  const h = harness({handleFile: async file => files.push(file), handleFileList: async files => files.push('list'),
+    loadApiJson: async prompt => api.push(prompt)}); h.start();
+  await h.app.handleFile('startup'); await h.app.loadApiJson({startup: true});
+  assert.deepEqual(files, ['startup']); assert.equal(api.length, 1);
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  const before = copy(h.current());
+  await h.app.handleFile('other.json'); await h.app.handleFileList(['other.png']); await h.app.loadApiJson({other: true});
+  assert.deepEqual(files, ['startup']); assert.equal(api.length, 1); assert.deepEqual(copy(h.current()), before);
+  h.emit('importApi', 'trusted', {prompt: {1: {class_type: 'Known', inputs: {}}}}); await h.flush();
+  assert.equal(api.length, 2); assert.ok(h.replies.at(-1).message.result.output);
+});
+
+test('native document controls block tab lifecycle commands and direct close without blocking node editing commands', async () => {
+  const calls = [], command = {$id: 'command', execute(id, ...args) {calls.push([this, id, args]); return Promise.resolve();}},
+    workflow = {$id: 'workflow', closeWorkflow() {calls.push('close');}, deleteWorkflow() {calls.push('delete');}, renameWorkflow() {calls.push('rename');}};
+  const h = harness({extensionManager: {command, workflow}}); h.start();
+  await command.execute('Comfy.NewBlankWorkflow'); assert.equal(calls.length, 1);
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  for (const id of ['Comfy.NewBlankWorkflow','Comfy.OpenWorkflow','Comfy.LoadDefaultWorkflow','Comfy.SaveWorkflow',
+    'Comfy.SaveWorkflowAs','Comfy.RenameWorkflow','Comfy.DuplicateWorkflow','Workspace.NextOpenedWorkflow',
+    'Workspace.PreviousOpenedWorkflow','Workspace.CloseWorkflow']) await command.execute(id);
+  await workflow.closeWorkflow({}); await workflow.deleteWorkflow({}); await workflow.renameWorkflow({});
+  assert.equal(calls.length, 1);
+  const metadata = {metadata: {node: 2}};
+  for (const id of ['Comfy.Undo','Comfy.Redo','Comfy.Canvas.FitView','Comfy.ExportWorkflow','Comfy.ClearWorkflow']) await command.execute(id, metadata);
+  assert.equal(calls.length, 6); assert.equal(calls[1][0], command); assert.deepEqual(calls[1][2], [metadata]);
+});
+
+for (const loseOwner of [false, true]) test(`failed API import restores native tab identity; owner missing=${loseOwner}`, async () => {
+  const original = {path: 'owned'}, imported = {path: 'imported'}, loads = [];
+  let registered = original;
+  const workflow = {$id: 'workflow', activeWorkflow: original, getWorkflowByPath: path => path === 'owned' ? registered : imported};
+  const h = harness({extensionManager: {workflow}, load: (_document, ...args) => loads.push(args),
+    loadApiJson: async (_prompt, {set}) => {workflow.activeWorkflow = imported; if (loseOwner) registered = null;
+      set({nodes: [{id: 7, type: 'Absent'}], links: []});}}); h.start();
+  h.emit('load','owned',{document:document()}); await h.flush();
+  h.emit('importApi','rejected',{prompt:{1:{class_type:'Known',inputs:{}}}}); await h.flush();
+  assert.ok(h.replies.at(-1).message.error);
+  if (loseOwner) {assert.equal(loads.length,1); h.emit('compile','not-loaded'); await h.flush(); assert.ok(h.replies.at(-1).message.error);}
+  else {assert.equal(loads.length,2); assert.equal(loads[1][2],original); assert.deepEqual(copy(h.current()),document());}
 });

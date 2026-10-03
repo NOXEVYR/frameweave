@@ -45,6 +45,12 @@ _HOP_BY_HOP = {
 }
 _REQUEST_HEADERS = ("Accept", "Accept-Language", "If-None-Match", "If-Modified-Since",
                     "If-Range", "Range")
+_CONDITIONAL_RANGE_HEADERS = {"If-None-Match", "If-Modified-Since", "If-Range", "Range"}
+_SESSION_RESPONSE_HEADERS = {
+    "etag", "last-modified", "cache-control", "expires", "age",
+    "accept-ranges", "content-range", "content-md5", "digest", "content-digest", "repr-digest",
+}
+_SESSION_CACHE_HEADERS = (("Cache-Control", "no-store"),)
 _SAFE_STATIC_EXACT = {
     "/favicon.ico", "/index.js", "/index.css", "/manifest.json", "/robots.txt",
     "/index.html", "/scripts", "/assets", "/locales", "/fonts", "/templates",
@@ -56,8 +62,6 @@ _TASK_CONTROL_PATHS = {"/prompt", "/queue", "/interrupt", "/api/prompt", "/api/q
                       "/api/interrupt"}
 _ALWAYS_BLOCKED_PATHS = {"/interrupt", "/api/interrupt", "/upload/image", "/api/upload/image"}
 _SAFE_READ_ONLY_POST_PATHS = {"/manager/component/loads", "/api/manager/component/loads"}
-_EDITOR_SETTINGS_PATHS = {"/settings", "/api/settings", "/settings/Comfy.TutorialCompleted",
-                          "/api/settings/Comfy.TutorialCompleted"}
 _ENCODED_SEPARATOR = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
 _WEBSOCKET_KEY = re.compile(r"^[A-Za-z0-9+/]{22}==$|^[A-Za-z0-9+/]{23}=$")
 
@@ -380,24 +384,46 @@ class EditorProxy:
     def _proxy_http(self, handler, method, target):
         connection = None
         upstream_socket = None
-        editor_settings = urllib.parse.urlsplit(target).path in _EDITOR_SETTINGS_PATHS
         try:
+            # Use the same validated path as routing, including encoded aliases.
+            # Upstream validators/ranges describe upstream bytes, never injected
+            # HTML, extension lists or a settings/userdata session overlay.
+            _, path = _safe_target(target)
+            session_response = self._session_response(path)
+            upstream_method = "GET" if method == "HEAD" and session_response else method
             connection, upstream_socket = self._backend_connection()
-            connection.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+            connection.putrequest(upstream_method, target, skip_host=True, skip_accept_encoding=True)
             connection.putheader("Host", self._backend.netloc)
             connection.putheader("Accept-Encoding", "identity")
             connection.putheader("Connection", "close")
             for name in _REQUEST_HEADERS:
-                if editor_settings and name in {"If-None-Match", "If-Modified-Since", "If-Range", "Range"}:
+                if (name in _CONDITIONAL_RANGE_HEADERS and
+                        (session_response or method not in {"GET", "HEAD"})):
+                    continue
+                if name in {"Range", "If-Range"} and upstream_method != "GET":
                     continue
                 value = handler.headers.get(name)
                 if value and "\r" not in value and "\n" not in value:
                     connection.putheader(name, value)
             connection.endheaders()
             response = connection.getresponse()
-            if 300 <= response.status < 400:
-                response.read(65536)
+            if 300 <= response.status < 400 and response.status != 304:
                 self._send_error(handler, 502, "后端重定向已拒绝")
+                return
+            if ((session_response and response.status in {206, 304}) or
+                    (method not in {"GET", "HEAD"} and response.status == 304)):
+                self._send_error(handler, 502, "后端未返回完整的会话响应")
+                return
+            content_type = response.getheader("Content-Type", "application/octet-stream")
+            headers = response.getheaders()
+            if session_response:
+                headers = [(key, value) for key, value in headers
+                           if key.lower() not in _SESSION_RESPONSE_HEADERS]
+                headers.extend(_SESSION_CACHE_HEADERS)
+            if response.status == 304:
+                # 304 has no wire body. Omit Content-Length instead of claiming
+                # the cached representation is empty (RFC 9110, 8.6/15.4.5).
+                self._send_response(handler, 304, b"", content_type, headers)
                 return
             encoding = response.getheader("Content-Encoding", "identity").lower()
             if encoding not in {"", "identity"}:
@@ -407,23 +433,22 @@ class EditorProxy:
             if len(body) > MAX_RESPONSE_BYTES:
                 self._send_error(handler, 502, "后端响应超过 64 MiB 上限")
                 return
-            content_type = response.getheader("Content-Type", "application/octet-stream")
-            if self._needs_css_type(target):
+            if self._needs_css_type(path):
                 content_type = "text/css; charset=utf-8"
-            if method == "GET" and target.split("?", 1)[0] in {"/", "/index.html"}:
-                body, content_type = self._inject_html(body, content_type)
-            elif method == "GET" and urllib.parse.urlsplit(target).path in {"/extensions", "/api/extensions"}:
-                body, content_type = self._append_extension(body, content_type)
-            if method == "GET" and response.status == 200:
-                body, content_type = self._merge_session_settings(target, body, content_type)
-                body, content_type = self._editor_settings(target, body, content_type)
-            headers = response.getheaders()
-            if editor_settings:
-                headers = [(key, value) for key, value in headers
-                           if key.lower() not in {"etag", "last-modified", "cache-control", "expires"}]
-                headers.append(("Cache-Control", "no-store"))
+            if upstream_method == "GET" and response.status == 200:
+                if path in {"/", "/index.html"}:
+                    body, content_type = self._inject_html(body, content_type)
+                elif path in {"/extensions", "/api/extensions"}:
+                    body, content_type = self._append_extension(body, content_type)
+                body, content_type = self._merge_session_settings(path, body, content_type)
+                body, content_type = self._editor_settings(path, body, content_type)
+            # An upstream HEAD has no body to measure. Preserve its optional
+            # representation length; transformed HEAD uses the measured GET.
+            length = response.getheader("Content-Length") if upstream_method == "HEAD" else str(len(body))
+            if length is not None and not re.fullmatch(r"[0-9]+", length):
+                length = None
             self._send_response(handler, response.status, body, content_type,
-                                headers, head=(method == "HEAD"))
+                                headers, head=(method == "HEAD"), content_length=length)
         except (OSError, http.client.HTTPException, TimeoutError, ValueError) as exc:
             self._send_error(handler, 502, f"无法读取本机 ComfyUI：{str(exc)[:200]}")
         finally:
@@ -431,6 +456,12 @@ class EditorProxy:
                 connection.close()
             if upstream_socket is not None:
                 self._unregister_socket(upstream_socket)
+
+    @staticmethod
+    def _session_response(path):
+        return (path in {"/", "/index.html", "/extensions", "/api/extensions",
+                         "/settings", "/api/settings", "/userdata", "/api/userdata"} or
+                path.startswith(("/settings/", "/api/settings/", "/userdata/", "/api/userdata/")))
 
     def _inject_html(self, body, content_type):
         charset = "utf-8"
@@ -838,8 +869,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 return
             self.proxy._send_response(self, 200, body, "application/javascript; charset=utf-8", ())
             return
-        if method == "GET" and decoded_path in {"/userdata", "/userdata/", "/api/userdata", "/api/userdata/"}:
-            self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
+        if method in {"GET", "HEAD"} and decoded_path in {"/userdata", "/userdata/", "/api/userdata", "/api/userdata/"}:
+            self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", _SESSION_CACHE_HEADERS)
             return
         if method == "GET" and decoded_path == "/api/global_subgraphs":
             self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
@@ -847,16 +878,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if method in {"POST", "PUT"} and self._is_session_write(decoded_path):
             self._session_write(decoded_path)
             return
-        if method == "GET" and self._is_session_read(decoded_path):
+        if method in {"GET", "HEAD"} and self._is_session_read(decoded_path):
             category, key = self._session_location(decoded_path)
             saved = self.proxy._session_read(category, key)
             if saved is not None:
                 body, content_type = saved
                 body, content_type = self.proxy._editor_settings(decoded_path, body, content_type)
-                if self.proxy._needs_css_type(self.path):
+                if self.proxy._needs_css_type(decoded_path):
                     content_type = "text/css; charset=utf-8"
-                cache_headers = (("Cache-Control", "no-store"),) if decoded_path in _EDITOR_SETTINGS_PATHS else ()
-                self.proxy._send_response(self, 200, body, content_type, cache_headers)
+                self.proxy._send_response(self, 200, body, content_type, _SESSION_CACHE_HEADERS)
                 return
         if method == "POST" and decoded_path in _SAFE_READ_ONLY_POST_PATHS:
             content_lengths = self.headers.get_all("Content-Length", [])
@@ -936,7 +966,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         return body
 
 
-def _send_response(handler, status, body, content_type, upstream_headers=(), *, head=False):
+def _send_response(handler, status, body, content_type, upstream_headers=(), *, head=False,
+                   content_length="auto"):
     if handler.wfile.closed:
         return
     try:
@@ -956,10 +987,12 @@ def _send_response(handler, status, body, content_type, upstream_headers=(), *, 
             handler.send_header("Cache-Control", "no-store")
             handler.send_header("Referrer-Policy", "no-referrer")
             del handler._editor_bootstrap_cookie
-        handler.send_header("Content-Length", str(len(body)))
+        bodyless_status = status < 200 or status in {204, 304}
+        if not bodyless_status and content_length is not None:
+            handler.send_header("Content-Length", str(len(body)) if content_length == "auto" else content_length)
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.end_headers()
-        if not head and body:
+        if not head and handler.command != "HEAD" and not bodyless_status and body:
             handler.wfile.write(body)
     except (BrokenPipeError, ConnectionResetError, OSError):
         handler.close_connection = True

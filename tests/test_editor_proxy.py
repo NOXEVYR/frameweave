@@ -211,11 +211,17 @@ class EditorProxyTests(unittest.TestCase):
         cookie = self._bootstrap()
         before = len(self.backend_server.records)
         for path, export in [("/prism-editor-media.mjs", b"createNativeEditorMedia"),
+                             ("/native-editor-vhs-preview.mjs", b"export "),
                              ("/prism-editor-media-preview.mjs", b"createEditorMediaPreview")]:
             status, headers, body = self._get(path, cookie)
             self.assertEqual(status, 200)
             self.assertIn(export, body)
             self.assertTrue(any(name.lower() == "content-type" and "javascript" in value for name, value in headers))
+            status, _, _ = self._raw_request("GET", path)
+            self.assertEqual(status, 403)
+            status, _, _ = self._raw_request("POST", path, cookie=cookie,
+                                            headers={"Origin": self.origin}, body=b"{}")
+            self.assertEqual(status, 403)
         self.assertEqual(len(self.backend_server.records), before)
         status, _, _ = self._raw_request("GET", "/prism-editor-media.mjs")
         self.assertEqual(status, 403)
@@ -227,6 +233,8 @@ class EditorProxyTests(unittest.TestCase):
         cookie = self._bootstrap()
         before = len(self.backend_server.records)
         for path in ["/vhs/viewvideo?filename=x.mp4&type=input", "/vhs/queryvideo?filename=x.mp4",
+                     "/api/vhs/queryvideo?filename=x.mp4", "/native-editor-vhs-preview.mjs/other.mjs",
+                     "/native-editor-vhs-preview.mjs.bak",
                      "/prism-editor-media.mjs/other.mjs", "/prism-editor-media-preview.mjs.bak",
                      "/prism-editor-media.mjs%2f..%2fsettings"]:
             status, _, _ = self._get(path, cookie)

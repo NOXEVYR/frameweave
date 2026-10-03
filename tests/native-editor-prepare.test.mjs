@@ -35,6 +35,7 @@ class MockElement {
   }
 
   setAttribute(name, value) { this.attributes[name] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
 
   addEventListener(name, callback, options = {}) {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
@@ -511,6 +512,78 @@ test('automatic compile failure stays in the editor and can return without apply
   } finally {
     h.browser.restore();
   }
+});
+
+test('missing native types show a central repair entry and revealing keeps the same loaded frame', async () => {
+  const h = harness();
+  try {
+    const before = structuredClone(h.node.data);
+    await h.editor.prepare(h.node);
+    const elements = allElements(h.browser.document.body);
+    const frame = elements.find(item => item.tagName === 'iframe');
+    const panel = elements.find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false, 'preparation has visible progress before the native ready event');
+    assert.equal(frame.attributes['aria-hidden'], 'true');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 196, missing: ['MissingText'] });
+    await handling;
+    assert.equal(panel.hidden, false);
+    assert.match(panel.children.find(item => item.tagName === 'h2').textContent, /缺少 1 种节点/);
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /MissingText/);
+    await allElements(panel).find(item => item.textContent === '复制当前问题给 AI').click();
+    assert.match(h.calls.find(call => call.kind === 'copyText').args[0], /MissingText/);
+    assert.equal(findCommand(h, 'compile'), undefined);
+    allElements(panel).find(item => item.textContent === '查看工作流并修复').click();
+    assert.equal(panel.hidden, true);
+    assert.equal(frame.attributes['aria-hidden'], 'false');
+    assert.equal(Object.hasOwn(frame.attributes, 'inert'), false);
+    assert.equal(allElements(h.browser.document.body).filter(item => item.tagName === 'iframe')[0], frame);
+    assert.equal(h.browser.messages.filter(item => item.message.action === 'load').length, 1);
+    assert.equal(elements.find(item => item.textContent === '应用参数并返回').disabled, true);
+    assert.deepEqual(h.node.data, before);
+    await elements.find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
+});
+
+test('central return after a compiler error discards only the session without snapshot or draft writes', async () => {
+  const h = harness();
+  try {
+    const before = structuredClone(h.node.data);
+    await h.editor.prepare(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 196, missing: [] });
+    await respond(h, frame, await waitFor(() => findCommand(h, 'compile'), 'compile'), null, 'Dynamic input contract changed');
+    await handling;
+    const panel = allElements(h.browser.document.body).find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false);
+    assert.equal(panel.children.find(item => item.tagName === 'h2').textContent, '外部接口尚未准备好');
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /Dynamic input contract changed/);
+    await allElements(panel).find(item => item.textContent === '保留原稿并返回').click();
+    assert.equal(h.editor.isOpen(), false);
+    assert.equal(h.calls.some(call => call.path?.endsWith('/draft') || call.kind === 'applyInterface'), false);
+    assert.equal(h.browser.messages.some(item => item.message.action === 'snapshot'), false);
+    assert.deepEqual(h.node.data, before);
+  } finally { h.browser.restore(); }
+});
+
+test('loading timeout updates the central status instead of leaving an indefinite loading message', async () => {
+  const h = harness(), originalTimer = globalThis.setTimeout; let timeout;
+  try {
+    globalThis.setTimeout = (callback, duration, ...args) => {
+      if (duration === 60000) { timeout = callback; return null; }
+      return originalTimer(callback, duration, ...args);
+    };
+    await h.editor.prepare(h.node);
+    assert.equal(typeof timeout, 'function'); timeout();
+    const panel = allElements(h.browser.document.body).find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false);
+    assert.equal(panel.children.find(item => item.tagName === 'h2').textContent, '内部工作流未能加载');
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /加载超时/);
+    assert.equal(allElements(panel).find(item => item.textContent === '选择其他工作流引擎').hidden, false);
+    await allElements(panel).find(item => item.textContent === '保留原稿并返回').click();
+    assert.equal(h.editor.isOpen(), false); assert.equal(h.browser.messages.length, 0);
+  } finally { globalThis.setTimeout = originalTimer; h.browser.restore(); }
 });
 
 test('repair instructions include the current compiler error even without missing node types and redact local paths', async () => {

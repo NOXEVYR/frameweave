@@ -460,7 +460,13 @@ const sidebarPackageLoads = new WeakMap();
 const sidebarRefreshGuards = new WeakMap();
 const packageNodeAdds = new Map();
 let activeSidebarPackage = null;
-function ensurePackageDefinition(id) { return packageCatalog.ensure(id); }
+async function ensurePackageDefinition(id) {
+  const previous = packages.find(item => item.id === id);
+  const full = await packageCatalog.ensure(id);
+  packages = packageCatalog.summaries();
+  if (packages.find(item => item.id === id) !== previous) renderNodes();
+  return full;
+}
 function rememberPackageDefinition(pack) { const full = packageCatalog.remember(pack); packages = packageCatalog.summaries(); return full; }
 let editorLibrary = [];
 let packagesLoaded = false;

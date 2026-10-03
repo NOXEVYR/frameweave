@@ -33,6 +33,7 @@ BRIDGE_PATH = "/prism-editor-bridge.js"
 BRIDGE_EXTENSION = BRIDGE_PATH
 MEDIA_MODULES = {
     "/prism-editor-media.mjs": "native-editor-media.mjs",
+    "/native-editor-vhs-preview.mjs": "native-editor-vhs-preview.mjs",
     "/prism-editor-media-preview.mjs": "editor-media-preview.mjs",
     "/prism-editor-frontend-capabilities.mjs": "native-editor-frontend-capabilities.mjs",
     "/prism-editor-preview-exposures.mjs": "native-editor-preview-exposures.mjs",

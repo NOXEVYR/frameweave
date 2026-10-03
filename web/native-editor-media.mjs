@@ -1,6 +1,8 @@
 /** Capabilities for isolated standard ComfyUI filename widgets. No uploads/jobs. */
+import { vhsPreviewProfile, isolateVhsPreviewSurface } from './native-editor-vhs-preview.mjs';
 const TYPES = new Set(['image', 'video', 'audio']);
 const CORE = new Set(['LoadImage', 'LoadImageMask', 'LoadAudio', 'LoadVideo']);
+const LEGACY = new Map([['LoadImage:image', 'image'], ['LoadImageMask:image', 'image'], ['LoadAudio:audio', 'audio'], ['VHS_LoadVideo:video', 'video']]);
 const MAX_FIELDS = 4096;
 const own = (value, key) => Object.hasOwn(value, key);
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -16,29 +18,34 @@ export function safeEditorMediaFilename(value, allowEmpty = false) {
 /** Proves the registered standard upload spec; a combo alone is insufficient. */
 export function nativeMediaContract(node, input, type, registry) {
   const classType = node?.comfyClass || node?.type, constructor = node?.constructor;
-  if (!TYPES.has(type) || !CORE.has(classType) || !registry || !own(registry, classType)) return null;
+  if (!TYPES.has(type) || !registry || !own(registry, classType)) return null;
   const registered = registry[classType], data = constructor?.nodeData;
-  if (!registered || registered !== constructor && registered.nodeData !== data || !record(data?.input)) return null;
+  if (typeof registered !== 'function' || registered !== constructor || !record(data?.input)) return null;
   const matches = ['required', 'optional'].filter(group => own(data.input[group] || {}, input));
   if (matches.length !== 1 || own(data.input.hidden || {}, input)) return null;
   const spec = data.input[matches[0]][input];
-  if (!Array.isArray(spec) || !record(spec[1])) return null;
-  const [kind, meta] = spec;
+  if (!Array.isArray(spec) || spec.length < 1 || spec.length > 2 || spec.length === 2 && !record(spec[1])) return null;
+  const [kind, meta = {}] = spec;
   if (['image', 'video', 'audio'].some(media => own(meta, `${media}_upload`) && typeof meta[`${media}_upload`] !== 'boolean')) return null;
   const flags = ['image', 'video', 'audio'].filter(media => meta[`${media}_upload`] === true);
-  if (flags.length !== 1 || flags[0] !== type || meta.multiselect || meta.allow_batch || meta.forceInput ||
-      meta.remote || Object.keys(meta).some(key => /(?:url|endpoint|route|upload_path|upload_folder|custom_upload)/i.test(key))) return null;
+  let legacy = false;
+  if (!flags.length && LEGACY.get(`${classType}:${input}`) === type && Array.isArray(kind) && kind.every(value => typeof value === 'string') && !own(meta, `${type}_upload`)) legacy = true;
+  else if (flags.length !== 1 || flags[0] !== type) return null;
+  if (meta.multiselect || meta.remote != null || ['upload_route', 'upload_endpoint', 'upload_url', 'custom_upload', 'upload'].some(key => own(meta, key))) return null;
   for (const field of ['image_folder', 'video_folder', 'audio_folder', 'folder', 'storage_type']) {
     if (own(meta, field) && meta[field] !== 'input') return null;
   }
-  const options = Array.isArray(kind) ? kind : kind === 'COMBO' ? meta.options : null;
-  if (!Array.isArray(options) || options.some(value => typeof value !== 'string')) return null;
-  return { class_type: classType, input, type, specification: JSON.stringify(spec) };
+  if (kind === 'STRING' && type === 'audio') legacy = true;
+  else if (!Array.isArray(kind) && kind !== 'COMBO') return null;
+  const options = Array.isArray(kind) ? kind : meta.options;
+  if (options != null && (!Array.isArray(options) || options.some(value => typeof value !== 'string'))) return null;
+  return { class_type: classType, input, type, legacy, transport: 'comfy_input_filename', storage_type: 'input', cardinality: 'single', specification: JSON.stringify(spec) };
 }
 
 export function createNativeEditorMedia({ app, window, document, graph, findWidget, sameMappingProof, config, createPreview, createExposureIsolation, frontendCapability }) {
   const receipts = new Map(), byBinding = new Map(), isolated = new WeakMap(), wrapped = new WeakSet(), liveIsolations = new Map();
   const viewHooks = new Map(), scopeHooks = new Map();
+  const adapters = new Set(), pluginMarkers = new Map();
   let panel, preview, previewOwner = null, previewWidget = null, previewValue, previewEntry = null, refreshing = false, serial = 0, observerChecked = false, observerProbe, probeHandler, unavailable = false;
   let activeTrail = null, pendingTrail = null;
   const exposureIsolation = createExposureIsolation?.({ capability: frontendCapability, app, window, document, graph,
@@ -187,10 +194,11 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     marker.observer?.disconnect?.(); marker.retired = true; liveIsolations.delete(node); revokeNode(node);
     if (previewOwner === node) clearPreview();
   }
-  function releaseIsolation(node, marker) {
+  function releaseIsolation(node, marker, readding = false) {
     // Keep a removed node guarded against late promises until it is actually
     // added again. At that boundary restore native presentation, not graph data.
     retireIsolation(node, marker);
+    if (marker.adapter) { marker.adapter.release(readding); adapters.delete(marker.adapter); pluginMarkers.delete(node); }
     for (const [name, saved] of marker.saved) {
       const current = Object.getOwnPropertyDescriptor(node, name), proof = marker.proof[name];
       if (current?.get !== proof?.get || current?.set !== proof?.set) continue;
@@ -215,6 +223,12 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     if (unavailable || !node || !graph() || standardBindings(node).length !== 1 ||
         (nested ? nestedReason(nested.node_id, nested.target) : node.graph !== graph())) return false;
     if (isolated.has(node)) return verifyIsolation(node);
+    const classType = node.comfyClass || node.type, pluginProfile = classType === 'VHS_LoadVideo' ? vhsPreviewProfile(node) : null;
+    // A media schema describes transport, not arbitrary plugin preview code.
+    if (!CORE.has(classType) && !pluginProfile) return false;
+    const contract = standardBindings(node)[0];
+    const meta = node.constructor.nodeData.input.required?.[contract.input]?.[1] || node.constructor.nodeData.input.optional?.[contract.input]?.[1] || {};
+    if (meta.allow_batch || meta.forceInput || Object.keys(meta).some(key => /(?:url|endpoint|route|upload_path|upload_folder|custom_upload)/i.test(key))) return false;
     if (nested && !sameMappingProof(nested.target.mappingProof, findWidget(nested.node_id, nested.input).mappingProof)) return false;
     if (!Object.isExtensible(node)) return false;
     const saved = new Map();
@@ -233,6 +247,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
         scopes: [...new Set(nested.target.mappingProof.nodes.map(item => item.graph))] } : {}) };
     if (nested && marker.scopes.some(scope => !installHooks(scope, ['onNodeAdded', 'onNodeRemoved', 'onAfterChange'], scopeHooks, true))) return false;
     let container = saved.get('videoContainer')?.value;
+    if (pluginProfile) marker.elements.add(pluginProfile.element);
     for (const widget of node.widgets || []) if (['audioUI', 'video-preview'].includes(widget.name) && widget.element) marker.elements.add(widget.element);
     if (container) marker.elements.add(container);
     // Establish the observer before changing any presentation descriptors or DOM.
@@ -267,6 +282,11 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       if (!hideElement(element)) marker.failed = true;
     }
     try {
+      if (pluginProfile) {
+        marker.adapter = isolateVhsPreviewSurface(pluginProfile, window);
+        if (!marker.adapter) throw new Error('unsupported_vhs_profile');
+        adapters.add(marker.adapter); pluginMarkers.set(node, marker);
+      }
       const descriptors = {
         imgs: { configurable: true, enumerable: false, get: () => undefined,
           set: value => { marker.values.set('imgs', value); marker.written.add('imgs'); } },
@@ -280,7 +300,8 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       if (typeof marker.originalAdd === 'function') {
         const wrapper = function (name, ...args) {
           const widget = marker.originalAdd.call(this, name, ...args);
-          if (['audioUI', 'video-preview'].includes(name) && widget?.element) protect(widget.element);
+          if (['audioUI', 'video-preview', ...(marker.adapter ? ['videopreview'] : [])].includes(name) && widget?.element) protect(widget.element);
+          if (marker.adapter && name === 'videopreview') marker.failed = true;
           return widget;
         };
         node.addDOMWidget = wrapper; marker.wrapper = wrapper;
@@ -310,6 +331,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       if (nested && !verified) throw new Error('nested_isolation_changed');
       return verified;
     } catch {
+      if (marker.adapter) { marker.adapter.release(true); adapters.delete(marker.adapter); pluginMarkers.delete(node); }
       marker.observer?.disconnect?.();
       for (const [name, descriptor] of saved) {
         if (descriptor) Object.defineProperty(node, name, descriptor); else delete node[name];
@@ -327,7 +349,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   }
   function verifyIsolation(node) {
     const marker = isolated.get(node);
-    if (!marker || marker.failed || marker.retired || marker.quarantined || marker.graph !== graph() || node.graph !== marker.scope ||
+    if (!marker || marker.failed || marker.retired || marker.quarantined || marker.adapter && !marker.adapter.verify() || marker.graph !== graph() || node.graph !== marker.scope ||
         !(marker.scope?._nodes || marker.scope?.nodes || []).includes(node) || standardBindings(node).length !== 1 ||
         marker.nested && !currentNested(marker)) return false;
     for (const [name, proof] of Object.entries(marker.proof)) {
@@ -350,7 +372,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     }
     // Installed before every parent load/import; node construction is synchronous.
     for (const [classType, constructor] of Object.entries(registry() || {})) {
-      if (!CORE.has(classType) || typeof constructor !== 'function' || wrapped.has(constructor)) continue;
+      if ((!CORE.has(classType) && classType !== 'VHS_LoadVideo') || typeof constructor !== 'function' || wrapped.has(constructor)) continue;
       const original = constructor.prototype.onAdded;
       const descriptor = Object.getOwnPropertyDescriptor(constructor.prototype, 'onAdded');
       if (!Object.isExtensible(constructor.prototype) || descriptor && (!own(descriptor, 'value') || !descriptor.writable)) continue;
@@ -359,7 +381,7 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
         // Isolate before any onAdded callback can enqueue media work. Constructor
         // onNodeCreated and child-graph additions retain their native previews.
         const marker = isolated.get(this);
-        if (marker && (marker.retired || this.graph !== marker.graph)) releaseIsolation(this, marker);
+        if (marker && (marker.retired || this.graph !== marker.graph)) releaseIsolation(this, marker, true);
         if (args[0] === graph() && this.graph === graph()) isolateNode(this);
         const result = original?.apply(this, args);
         return result;
@@ -508,11 +530,15 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
             fail('native_preview_not_isolated'); continue;
           }
         }
-        if (!isolateNode(target.node, { node_id: binding.node_id, input: binding.input, target })) { fail('native_preview_not_isolated'); continue; }
+        if (!isolateNode(target.node, { node_id: binding.node_id, input: binding.input, target })) {
+          fail(binding.class_type === 'VHS_LoadVideo' ? 'vhs_preview_adapter_unsupported' : !CORE.has(binding.class_type) ? 'preview_adapter_unsupported' : 'native_preview_not_isolated'); continue;
+        }
         target = findWidget(binding.node_id, binding.input);
         if (nestedReason(binding.node_id, target)) { fail('media_mapping_unproven'); continue; }
       }
-      if (!safeEditorMediaFilename(target.widget.value, true) || !verifyIsolation(target.node)) { fail('native_preview_not_isolated'); continue; }
+      if (!safeEditorMediaFilename(target.widget.value, true) || !verifyIsolation(target.node)) {
+        fail(binding.class_type === 'VHS_LoadVideo' ? 'vhs_preview_adapter_unsupported' : !CORE.has(binding.class_type) ? 'preview_adapter_unsupported' : 'native_preview_not_isolated'); continue;
+      }
       if (binding.type === 'audio') {
         const surfaces = (target.node.widgets || []).filter(widget => widget.name === 'audioUI');
         if (surfaces.length !== 1 || !surfaces[0].element || !isolated.get(target.node)?.elements.has(surfaces[0].element)) {
@@ -597,6 +623,9 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
   function destroy() {
     reset(); preview?.destroy(); panel?.remove(); observerProbe?.disconnect?.();
     exposureIsolation?.destroy();
+    for (const [node, marker] of pluginMarkers) releaseIsolation(node, marker);
+    for (const adapter of adapters) adapter.release();
+    adapters.clear();
     for (const marker of liveIsolations.values()) { marker.observer?.disconnect?.(); marker.retired = true; }
     liveIsolations.clear();
     for (const hooks of [...viewHooks.values(), ...scopeHooks.values()]) for (const item of hooks) item.active = false;

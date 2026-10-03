@@ -59,12 +59,18 @@ test('filename contract rejects unsafe paths, annotations and encoded traversal 
   assert.equal(safeEditorMediaFilename('', true), true);
   assert.equal(safeEditorMediaFilename('a'.repeat(1024)), true);
 });
-test('live contract requires actual registered official class and exactly one standard upload flag', () => {
+test('live contract recognizes registered upload schemas separately from supported preview adapters', () => {
   const h = fixture(); assert(nativeMediaContract(h.node, h.input, 'image', h.window.LiteGraph.registered_node_types));
-  for (const meta of [{ image_upload: false }, { image_upload: 'yes' }, { audio_upload: true }, { multiselect: true }, { image_folder: 'output' }, { upload_url: '/custom' }, { allow_batch: true }]) {
+  for (const meta of [{ image_upload: false }, { image_upload: 'yes' }, { audio_upload: true }, { multiselect: true }, { image_folder: 'output' }, { upload_url: '/custom' }]) {
     const bad = fixture({ meta }); assert.equal(nativeMediaContract(bad.node, bad.input, 'image', bad.window.LiteGraph.registered_node_types), null);
   }
-  const other = fixture({ classType: 'ThirdParty' }); other.media.arm(); assert.equal(other.media.capture([other.binding()], other.output()).captured.length, 0);
+  const other = fixture({ classType: 'ThirdParty' });
+  assert(nativeMediaContract(other.node, other.input, 'image', other.window.LiteGraph.registered_node_types));
+  other.media.arm(); const result = other.media.capture([other.binding()], other.output());
+  assert.equal(result.captured.length, 0); assert.equal(result.unsupported[0].reason, 'preview_adapter_unsupported');
+  const batch = fixture({ meta: { allow_batch: true } });
+  assert(nativeMediaContract(batch.node, batch.input, 'image', batch.window.LiteGraph.registered_node_types));
+  batch.media.arm(); assert.equal(batch.media.capture([batch.binding()], batch.output()).captured.length, 0);
 });
 test('isolation before import suppresses both late Canvas imgs and Vue output flag without changing serialized values', async () => {
   const h = fixture({ native: 'N.png' }), before = h.node.serialize();

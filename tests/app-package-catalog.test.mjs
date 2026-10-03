@@ -34,7 +34,7 @@ function harness({budget,api: customApi}={}){
     section(){},field:(label)=>new Element('label','field',label),defaultValues:items=>Object.fromEntries(items.map(item=>[item.id,item.default])),fieldType:item=>item.type,
     packageMediaOwner:()=> 'canvas:node',packageMediaTransfers:{state(){},discard(){}},workflowCanvas:{describeInput(){return null;}},workflowConfigurations:{},
     coerceFieldValue:(_item,value)=>value,mutate:fn=>fn(),mediaURL:()=>null,outputMedia(){},toast(){},openPackages(){},openNodeWorkflow(){state.actions++;},nativeEditor:{},
-    renderPackageLibrary(){},renderNodes(){},renderInspector(){state.rendered++;state.wrap.replaceChildren();if(state.selection?.data.kind==='package')sandbox.renderPackageInputs(state.wrap,state.selection);},
+    renderPackageLibrary(){},renderNodes(){state.nodeRenders=(state.nodeRenders||0)+1;},renderInspector(){state.rendered++;state.wrap.replaceChildren();if(state.selection?.data.kind==='package')sandbox.renderPackageInputs(state.wrap,state.selection);},
     studio:{open(){}},bounds:()=>({maxX:0}),addNode:(type,data)=>{const item={id:`created-${state.created.length}`,type,data,x:10,y:20};state.created.push(item);sandbox.graph.nodes.push(item);return item;},
     applyViewport(){},save(){state.saved++;},switchTab(){},
   };
@@ -53,6 +53,8 @@ test('actual package refresh uses summaries, leaves canvas cached mappings and u
 test('actual sidebar shows loading, then complete custom-ID parameters without overwriting cached ports or outer values',async()=>{
   const gate=defer(),h=harness({api:path=>path==='/api/packages/p0'?gate.promise:undefined});h.render();assert.match(h.text(),/按需读取/);
   gate.resolve({package:full('p0')});await tick();assert(flatten(h.state.wrap).some(item=>item.dataset.packageField==='custom-id'));
+  assert.equal(h.summaries().find(item=>item.id==='p0')?.name,'Package p0');assert.equal(h.state.nodeRenders,1);
+  await h.sandbox.ensurePackageDefinition('p0');assert.equal(h.state.nodeRenders,1);assert.equal(h.state.calls.length,1);
   assert.equal(h.node.data.packageFields[0].id,'old-custom');assert.equal(h.node.data.inputLabels['custom-id'],'场景参考');assert.equal(h.node.data.packageValues['custom-id'],'用户外层值');assert.equal(h.state.saved,0);
 });
 

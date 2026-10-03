@@ -2418,14 +2418,15 @@ kbd {
 .native-editor-sources ul { max-height: 18vh; overflow: auto; margin: 6px 0; padding-left: 22px; overflow-wrap: anywhere; }
 .native-workflow-dialog iframe { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #202127; }
 .native-editor-stage { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
-.native-editor-stage[data-preset-pending="true"] > iframe { visibility: hidden; pointer-events: none; }
+.native-editor-stage[data-editor-pending="true"] > iframe { visibility: hidden; pointer-events: none; }
 .native-editor-pending { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: safe center; align-items: center; gap: 18px; padding: 28px; overflow: auto; background: #f5f7fc; color: #20324e; text-align: center; }
 .native-editor-pending[hidden] { display: none; }
 .native-editor-pending h2 { margin: 0; font-size: 22px; line-height: 1.5; }
 .native-editor-pending p { max-width: 660px; margin: 0; font-size: 16px; line-height: 1.8; overflow-wrap: anywhere; }
 .native-editor-pending .native-editor-actions { justify-content: center; }
 .enter-workflow { width: 100%; margin-bottom: 10px; color: #384fc1; border: 1px solid #abb9ee; background: #f1f4ff; }
-.native-workflow-dialog.native-prepare-dialog { width: min(760px, calc(100vw - 32px)); height: auto; min-height: 210px; overflow: visible; }
+.native-workflow-dialog.native-prepare-dialog { width: min(820px, calc(100vw - 32px)); height: min(760px, calc(100dvh - 32px)); min-height: 0; overflow: hidden; }
+.native-prepare-dialog > header { max-height: 40%; overflow: auto; }
 .native-prepare-dialog iframe { position: fixed; left: -12000px; top: 0; width: 1200px; height: 800px; pointer-events: none; }
 .prepare-workflow, .reuse-workflow { width: 100%; margin-bottom: 10px; }
 .workflow-configurations-dialog { width: min(820px, calc(100vw - 32px)); }

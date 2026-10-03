@@ -1,7 +1,9 @@
 // One persistent workspace controls existing local engines; no model copies.
+import { createVoiceEnvironmentCenter } from './voice-environment-center.mjs';
 export function createEngineCenter(host) {
   const root = document.querySelector('#managed-engines');
   let pending = false;
+  const voices = createVoiceEnvironmentCenter({ ...host, refreshEngines: refresh }, document.querySelector('#voice-environments'));
   const text = (tag, value, cls = '') => { const n = document.createElement(tag); n.textContent = value; n.className = cls; return n; };
   async function refresh() {
     if (pending) return;
@@ -30,6 +32,7 @@ export function createEngineCenter(host) {
         row.append(body, action); root.append(row);
       }
       if (!result.profiles?.length) root.append(text('p', '尚未登记引擎。在下方接入已有 ComfyUI，一次配置后即可复用。', 'form-note'));
+      await voices.refresh();
     } catch (error) { root.replaceChildren(text('p', error.message, 'form-note')); }
     finally { pending = false; }
   }

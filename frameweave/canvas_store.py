@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 LIMIT = 24 * 1024 * 1024
+MAX_CANVAS_ITEMS = 500000
 
 
 class CanvasStore:
@@ -103,8 +104,10 @@ class CanvasStore:
         while pending:
             value, depth = pending.pop()
             items += 1
-            if depth > 64 or items > 100000:
-                raise ValueError("画布集合的 JSON 结构过深或项目过多")
+            if depth > 64:
+                raise ValueError("画布集合的 JSON 结构超过 64 层，请拆分画布后保存")
+            if items > MAX_CANVAS_ITEMS:
+                raise ValueError(f"画布集合超过 {MAX_CANVAS_ITEMS} 个 JSON 数据项，请拆分画布后保存")
             if isinstance(value, dict):
                 identity = id(value)
                 if identity in seen or any(not isinstance(key, str) for key in value):

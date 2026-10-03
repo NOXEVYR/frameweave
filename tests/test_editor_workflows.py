@@ -173,6 +173,29 @@ class EditorWorkflowStoreTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 self.store.create("bad source", {}, source)
 
+    def test_source_parser_keeps_specific_diagnostics_and_never_stores_invalid_graphs(self):
+        cases = (
+            ('{"version":0.4,"version":0.4,"nodes":[],"links":[]}', '重复键'),
+            ('{"version":0.4,"nodes":[],"links":[],"x":NaN}', '数字必须有限'),
+            ('{"version":0.4,"nodes":[],"links":[],"x":1e999}', '数字必须有限'),
+            ('{"version":0.4,"nodes":[],"links":[],"x":9007199254740992}', '浏览器的精确范围'),
+            ('{"version":0.4,"nodes":[],"links":[],"x":' + '9' * 5000 + '}', '整数'),
+        )
+        for source, reason in cases:
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason) as failure:
+                self.store.create('Invalid graph', {}, source)
+            self.assertIn('原文件未修改', str(failure.exception))
+        self.assertFalse(self.directory.exists())
+
+    def test_syntax_diagnostic_has_location_without_echoing_source(self):
+        source = '{\n "version":0.4,\n "private-text":"DO_NOT_ECHO" \n "nodes":[],"links":[]}'
+        with self.assertRaises(ValueError) as failure:
+            self.store.create('Invalid graph', {}, source)
+        self.assertIn('第 4 行', str(failure.exception))
+        self.assertNotIn('DO_NOT_ECHO', str(failure.exception))
+        self.assertNotIn('private-text', str(failure.exception))
+        self.assertFalse(self.directory.exists())
+
     def test_bad_or_escaped_ids_and_symlink_records_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "ID 无效"):
             self.store.get("../../outside")

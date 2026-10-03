@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { packageValues, fieldType, defaultValues, coerceFieldValue, validateValues, parsePackageDocument, publicChecksReport, redactLocalText } from '../web/packages.mjs';
+import { packageValues, fieldType, defaultValues, coerceFieldValue, validateValues, parsePackageDocument, apiPromptFromDocument, publicChecksReport, redactLocalText } from '../web/packages.mjs';
 import { createNode, createDemo, connect, generationPayload, serializeGraph, parseGraph, canConnect } from '../web/graph.mjs';
 
 test('workflow package nodes round-trip typed values and retain package identity', () => {
@@ -57,6 +57,7 @@ test('package import accepts API JSON and versioned packages but explains ordina
   const prompt = { '1': { class_type: 'CLIPTextEncode', inputs: { text: 'a flower' } } };
   assert.deepEqual(parsePackageDocument(JSON.stringify(prompt)), prompt);
   assert.deepEqual(parsePackageDocument(JSON.stringify({ prompt })), { prompt });
+  assert.deepEqual(parsePackageDocument(JSON.stringify({ workflow: prompt, name: 'Workflow export' })), { workflow: prompt, name: 'Workflow export' });
   const pack = { format: 'frameweave-workflow', version: 1, prompt, fields: [] };
   assert.deepEqual(parsePackageDocument(JSON.stringify(pack)), pack);
   assert.throws(() => parsePackageDocument('{"nodes":[],"links":[]}'), /导出 API/);
@@ -64,6 +65,19 @@ test('package import accepts API JSON and versioned packages but explains ordina
   assert.throws(() => parsePackageDocument(JSON.stringify({ prompt: 'not a workflow' })), /API/);
   assert.throws(() => parsePackageDocument('{"1":{"class_type":"KSampler","inputs":{"seed":18446744073709551615}}}'), /随机种子/);
   assert.throws(() => parsePackageDocument(' '.repeat(2 * 1024 * 1024 + 1)), /2 MiB/);
+});
+
+test('API carrier extraction consistently accepts bare prompt and workflow wrappers without rewriting originals', () => {
+  const prompt = { 1: { class_type: 'ExtensionNode', inputs: { unknown: { keep: true } } } };
+  for (const document of [prompt, { prompt }, { workflow: prompt, extra: { keep: true } }]) {
+    const before = JSON.stringify(document);
+    assert.equal(apiPromptFromDocument(document), prompt);
+    assert.equal(JSON.stringify(document), before);
+  }
+  for (const document of [{ workflow: { nodes: [], links: [] } }, { workflow: null },
+    { workflow: [] }, { prompt: null, workflow: prompt }, { 1: { class_type: 'ExtensionNode', inputs: [] } }]) {
+    assert.throws(() => apiPromptFromDocument(document), /API/);
+  }
 });
 
 test('public diagnostics retain unknown states and drop machine paths and unexpected fields', () => {
@@ -102,7 +116,7 @@ test('package ports preserve safe metadata and reject invalid, duplicate or rese
   const valid = { id: 'a'.repeat(80), label: 'l'.repeat(120), type: 'text' };
   node.data.packageFields = [valid];
   assert.deepEqual(parseGraph(serializeGraph(graph)).nodes[2].data.packageFields, [valid]);
-  const invalid = [null, {}, Array.from({ length: 65 }, (_, n) => ({ id: `f${n}`, label: 'field', type: 'text' })),
+  const invalid = [null, {}, Array.from({ length: 4097 }, (_, n) => ({ id: `f${n}`, label: 'field', type: 'text' })),
     [{ ...valid, id: 'a'.repeat(81) }], [{ ...valid, id: '中文' }], [{ ...valid, id: '__proto__' }],
     [{ ...valid, id: 'constructor' }], [{ ...valid, id: 'prototype' }], [{ ...valid, id: 'space id' }],
     [{ ...valid, label: 'l'.repeat(121) }], [{ ...valid, label: '' }], [{ ...valid, label: null }],

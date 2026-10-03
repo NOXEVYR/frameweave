@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateImageFile, importPosition, prepareLocalImages } from '../web/canvas-images.mjs';
+import { validateImageFile, validateMediaFile, mediaFileContentType, importPosition, prepareLocalImages } from '../web/canvas-images.mjs';
 import { createNode, serializeGraph, parseGraph, validateExecutionMediaBackends } from '../web/graph.mjs';
 
 const asset = 'a'.repeat(64), backend = 'http://127.0.0.1:8189';
@@ -12,6 +12,32 @@ test('Windows image drops without MIME are accepted by extension, unsupported an
 test('multiple files keep their drop origin and use distinct grid positions', () => {
   assert.deepEqual(importPosition({x:-100,y:250},0),{x:-100,y:250});
   assert.deepEqual(importPosition({x:-100,y:250},3),{x:-100,y:630});
+});
+
+test('audio drops accept supported files with bounded size and canonical browser MIME aliases', () => {
+  for (const [name, type, expected] of [['VOICE.WAV','','audio/wav'], ['v.flac','audio/x-flac','audio/flac'], ['v','audio/mpeg','audio/mpeg'], ['v.ogg','','audio/ogg']]) {
+    const file = {name,type,size:100};
+    assert.equal(validateMediaFile(file),'audio');
+    assert.equal(mediaFileContentType(file),expected);
+  }
+  assert.throws(()=>validateMediaFile({name:'large.wav',size:20*1024*1024+1}),/20 MiB/);
+  assert.throws(()=>validateMediaFile({name:'empty.mp3',size:0}));
+  assert.throws(()=>validateMediaFile({name:'unsupported.m4a',type:'audio/mp4',size:100}));
+});
+
+test('audio assets validate every target binding even if already uploaded to the same engine', async () => {
+  const ref=createNode('reference',0,0,{mediaType:'audio',localMedia:true,localAssetId:asset,name:'old.wav',uploadBackend:backend});
+  const first=createNode('generation',400,0,{kind:'package',package_id:'p1'});
+  const second=createNode('generation',400,400,{kind:'package',package_id:'p2'});
+  const value={nodes:[ref,first,second],edges:[{source:ref.id,target:first.id,targetField:'voice'},{source:ref.id,target:second.id,targetField:'music'}]};
+  const calls=[];
+  const updates=await prepareLocalImages(value,[first.id,second.id],backend,async(path,body)=>{
+    calls.push({path,body});return {asset_id:asset,name:'new.wav',backend};
+  });
+  assert.deepEqual(calls.map(c=>c.body),[{package_id:'p1',field_id:'voice'},{package_id:'p2',field_id:'music'}]);
+  assert.ok(calls.every(c=>c.path===`/api/assets/media/${asset}/backend-input`));
+  assert.equal(updates[0].name,'new.wav');
+  assert.equal(ref.data.name,'old.wav');
 });
 function graph() {
   const ref=createNode('reference',0,0,{localAssetId:asset,localFilename:'图.png',url:`/api/assets/images/${asset}`});

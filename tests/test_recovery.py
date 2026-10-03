@@ -46,7 +46,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_backup_failure_prevents_later_overwrite(self):
         original = self.write_jobs([self.good, None])
-        with patch('frameweave.recovery.shutil.copy2', side_effect=OSError('disk full')):
+        with patch('frameweave.recovery.preserve_config', side_effect=OSError('disk full')):
             app = self.app()
         with self.assertRaises(OSError):
             app.persist_jobs()
@@ -60,7 +60,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_protected_jobs_prevents_inference_before_backend_side_effect(self):
         original = self.write_jobs([self.good, None])
-        with patch('frameweave.recovery.shutil.copy2', side_effect=OSError('disk full')):
+        with patch('frameweave.recovery.preserve_config', side_effect=OSError('disk full')):
             app = self.app()
         with patch.object(app.backend, 'request') as request:
             with self.assertRaisesRegex(ValueError, '未提交生成'):
@@ -72,7 +72,7 @@ class RecoveryTests(unittest.TestCase):
     def test_protected_inputs_prevents_both_media_uploads(self):
         original = '[null]'
         (self.root/'input-media.json').write_text(original, encoding='utf8')
-        with patch('frameweave.recovery.shutil.copy2', side_effect=OSError('disk full')):
+        with patch('frameweave.recovery.preserve_config', side_effect=OSError('disk full')):
             app = self.app()
         with patch.object(app.backend, 'upload') as upload:
             for method in (app.upload, app.upload_audio):
@@ -106,6 +106,24 @@ class RecoveryTests(unittest.TestCase):
         app = self.app()
         self.assertEqual(app.job_list()['jobs'], [])
         self.assertTrue(app.recovery_warnings)
+
+    def test_oversized_records_are_bounded_and_original_is_write_protected(self):
+        original = self.write_jobs([self.good])
+        with patch('frameweave.recovery.MAX_RECORD_BYTES', 2), patch('frameweave.configuration_recovery.MAX_BACKUP_BYTES', 2):
+            app = self.app()
+        self.assertIn('jobs.json', app.recovery_protected_files)
+        self.assertEqual(app.job_list()['jobs'], [])
+        with self.assertRaises(OSError):
+            app.persist_jobs()
+        self.assertEqual((self.root / 'jobs.json').read_text(), original)
+        self.assertEqual(list(self.root.glob('jobs.recovery-*')), [])
+
+    def test_repeated_corrupt_records_reuse_verified_backup(self):
+        original = self.write_jobs([None, self.good])
+        self.app()
+        self.app()
+        backup, = self.root.glob('jobs.recovery-*')
+        self.assertEqual(backup.read_text(), original)
 
 
 if __name__ == '__main__':

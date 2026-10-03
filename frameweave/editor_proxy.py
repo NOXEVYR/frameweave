@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .backend import local_url
@@ -30,6 +31,13 @@ WEBSOCKET_IDLE_TIMEOUT = 120
 WEBSOCKET_FRAME_BUFFER = 64 * 1024
 BRIDGE_PATH = "/prism-editor-bridge.js"
 BRIDGE_EXTENSION = BRIDGE_PATH
+MEDIA_MODULES = {
+    "/prism-editor-media.mjs": "native-editor-media.mjs",
+    "/native-editor-vhs-preview.mjs": "native-editor-vhs-preview.mjs",
+    "/prism-editor-media-preview.mjs": "editor-media-preview.mjs",
+    "/prism-editor-frontend-capabilities.mjs": "native-editor-frontend-capabilities.mjs",
+    "/prism-editor-preview-exposures.mjs": "native-editor-preview-exposures.mjs",
+}
 
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -38,6 +46,12 @@ _HOP_BY_HOP = {
 }
 _REQUEST_HEADERS = ("Accept", "Accept-Language", "If-None-Match", "If-Modified-Since",
                     "If-Range", "Range")
+_CONDITIONAL_RANGE_HEADERS = {"If-None-Match", "If-Modified-Since", "If-Range", "Range"}
+_SESSION_RESPONSE_HEADERS = {
+    "etag", "last-modified", "cache-control", "expires", "age",
+    "accept-ranges", "content-range", "content-md5", "digest", "content-digest", "repr-digest",
+}
+_SESSION_CACHE_HEADERS = (("Cache-Control", "no-store"),)
 _SAFE_STATIC_EXACT = {
     "/favicon.ico", "/index.js", "/index.css", "/manifest.json", "/robots.txt",
     "/index.html", "/scripts", "/assets", "/locales", "/fonts", "/templates",
@@ -101,17 +115,54 @@ def _inject_config(document, config):
     return "<head>" + snippet + "</head>" + document
 
 
+def _validate_query(parsed, decoded_path):
+    try:
+        fields = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("请求路径无效") from None
+    for name, value in fields:
+        for part in (name, value):
+            if (any(ord(ch) < 32 or ord(ch) == 127 for ch in part) or "\\" in part or
+                    re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|25|2e|2f|3a|5c|7f)", part, re.IGNORECASE)):
+                raise ValueError("请求路径无效")
+        if decoded_path in {"/view", "/api/view"} and name in {"filename", "subfolder"}:
+            # Current ComfyUI LoadImage also uses content-addressed assets.
+            # This is an identifier, not a drive path or an arbitrary scheme.
+            asset_hash = name == "filename" and re.fullmatch(r"blake3:[0-9a-f]{64}", value)
+            if (value.startswith("/") or (":" in value and not asset_hash) or
+                    any(segment.endswith((" ", ".")) for segment in value.split("/"))):
+                raise ValueError("请求路径无效")
+
+
 def _safe_target(target):
     if not isinstance(target, str) or len(target) > MAX_TARGET_LENGTH:
         raise ValueError("请求路径无效")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in target) or "\\" in target:
         raise ValueError("请求路径无效")
-    if _ENCODED_SEPARATOR.search(target):
-        raise ValueError("请求路径无效")
     parsed = urllib.parse.urlsplit(target)
     if parsed.scheme or parsed.netloc or parsed.fragment or not parsed.path.startswith("/"):
         raise ValueError("请求路径无效")
     if parsed.path.startswith("//"):
+        raise ValueError("请求路径无效")
+    for prefix in ("/userdata/", "/api/userdata/"):
+        if parsed.path.startswith(prefix):
+            if parsed.path == prefix:
+                _validate_query(parsed, prefix)
+                return parsed, prefix
+            try:
+                leaf = urllib.parse.unquote(parsed.path[len(prefix):], errors="strict")
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("请求路径无效") from None
+            # Frontend encodes the whole relative file, including directory slashes.
+            # Decode this leaf once only; it never changes the routing prefix.
+            if (not leaf or "%" in leaf or any(ch in leaf for ch in '\\:*?"<>|#') or
+                    any(ord(ch) < 32 or ord(ch) == 127 for ch in leaf) or
+                    any(part in {"", ".", ".."} or part.endswith((" ", "."))
+                        for part in leaf.split("/"))):
+                raise ValueError("请求路径无效")
+            _validate_query(parsed, prefix + leaf)
+            return parsed, prefix + leaf
+    if _ENCODED_SEPARATOR.search(parsed.path):
         raise ValueError("请求路径无效")
     decoded = parsed.path
     for _ in range(3):
@@ -121,10 +172,12 @@ def _safe_target(target):
             raise ValueError("请求路径无效") from None
         if (_ENCODED_SEPARATOR.search(decoded) or re.search(r"%2e", decoded, re.IGNORECASE) or
                 "\\" in decoded or decoded.startswith("//") or
-                any(part in {".", ".."} for part in decoded.split("/")) or "\x00" in decoded):
+                any(part in {".", ".."} for part in decoded.split("/")) or
+                any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded)):
             raise ValueError("请求路径无效")
         if "%" not in decoded:
             break
+    _validate_query(parsed, decoded)
     return parsed, decoded
 
 
@@ -333,20 +386,45 @@ class EditorProxy:
         connection = None
         upstream_socket = None
         try:
+            # Use the same validated path as routing, including encoded aliases.
+            # Upstream validators/ranges describe upstream bytes, never injected
+            # HTML, extension lists or a settings/userdata session overlay.
+            _, path = _safe_target(target)
+            session_response = self._session_response(path)
+            upstream_method = "GET" if method == "HEAD" and session_response else method
             connection, upstream_socket = self._backend_connection()
-            connection.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+            connection.putrequest(upstream_method, target, skip_host=True, skip_accept_encoding=True)
             connection.putheader("Host", self._backend.netloc)
             connection.putheader("Accept-Encoding", "identity")
             connection.putheader("Connection", "close")
             for name in _REQUEST_HEADERS:
+                if (name in _CONDITIONAL_RANGE_HEADERS and
+                        (session_response or method not in {"GET", "HEAD"})):
+                    continue
+                if name in {"Range", "If-Range"} and upstream_method != "GET":
+                    continue
                 value = handler.headers.get(name)
                 if value and "\r" not in value and "\n" not in value:
                     connection.putheader(name, value)
             connection.endheaders()
             response = connection.getresponse()
-            if 300 <= response.status < 400:
-                response.read(65536)
+            if 300 <= response.status < 400 and response.status != 304:
                 self._send_error(handler, 502, "后端重定向已拒绝")
+                return
+            if ((session_response and response.status in {206, 304}) or
+                    (method not in {"GET", "HEAD"} and response.status == 304)):
+                self._send_error(handler, 502, "后端未返回完整的会话响应")
+                return
+            content_type = response.getheader("Content-Type", "application/octet-stream")
+            headers = response.getheaders()
+            if session_response:
+                headers = [(key, value) for key, value in headers
+                           if key.lower() not in _SESSION_RESPONSE_HEADERS]
+                headers.extend(_SESSION_CACHE_HEADERS)
+            if response.status == 304:
+                # 304 has no wire body. Omit Content-Length instead of claiming
+                # the cached representation is empty (RFC 9110, 8.6/15.4.5).
+                self._send_response(handler, 304, b"", content_type, headers)
                 return
             encoding = response.getheader("Content-Encoding", "identity").lower()
             if encoding not in {"", "identity"}:
@@ -356,15 +434,22 @@ class EditorProxy:
             if len(body) > MAX_RESPONSE_BYTES:
                 self._send_error(handler, 502, "后端响应超过 64 MiB 上限")
                 return
-            content_type = response.getheader("Content-Type", "application/octet-stream")
-            if self._needs_css_type(target):
+            if self._needs_css_type(path):
                 content_type = "text/css; charset=utf-8"
-            if method == "GET" and target.split("?", 1)[0] in {"/", "/index.html"}:
-                body, content_type = self._inject_html(body, content_type)
-            elif method == "GET" and urllib.parse.urlsplit(target).path in {"/extensions", "/api/extensions"}:
-                body, content_type = self._append_extension(body, content_type)
+            if upstream_method == "GET" and response.status == 200:
+                if path in {"/", "/index.html"}:
+                    body, content_type = self._inject_html(body, content_type)
+                elif path in {"/extensions", "/api/extensions"}:
+                    body, content_type = self._append_extension(body, content_type)
+                body, content_type = self._merge_session_settings(path, body, content_type)
+                body, content_type = self._editor_settings(path, body, content_type)
+            # An upstream HEAD has no body to measure. Preserve its optional
+            # representation length; transformed HEAD uses the measured GET.
+            length = response.getheader("Content-Length") if upstream_method == "HEAD" else str(len(body))
+            if length is not None and not re.fullmatch(r"[0-9]+", length):
+                length = None
             self._send_response(handler, response.status, body, content_type,
-                                response.getheaders(), head=(method == "HEAD"))
+                                headers, head=(method == "HEAD"), content_length=length)
         except (OSError, http.client.HTTPException, TimeoutError, ValueError) as exc:
             self._send_error(handler, 502, f"无法读取本机 ComfyUI：{str(exc)[:200]}")
         finally:
@@ -372,6 +457,12 @@ class EditorProxy:
                 connection.close()
             if upstream_socket is not None:
                 self._unregister_socket(upstream_socket)
+
+    @staticmethod
+    def _session_response(path):
+        return (path in {"/", "/index.html", "/extensions", "/api/extensions",
+                         "/settings", "/api/settings", "/userdata", "/api/userdata"} or
+                path.startswith(("/settings/", "/api/settings/", "/userdata/", "/api/userdata/")))
 
     def _inject_html(self, body, content_type):
         charset = "utf-8"
@@ -383,7 +474,8 @@ class EditorProxy:
         except (LookupError, UnicodeDecodeError):
             document = body.decode("utf-8", "replace")
             charset = "utf-8"
-        config = {"parentOrigin": self.parent_origin, "bridgeNonce": self.bridge_nonce}
+        config = {"parentOrigin": self.parent_origin, "bridgeNonce": self.bridge_nonce,
+                  "backendUrl": self.backend_url, "mediaProtocol": 1, "promotedAudioProtocol": 1}
         injected = _inject_config(document, config).encode("utf-8")
         content_type = re.sub(r";\s*charset\s*=\s*[^;]+", "", content_type, flags=re.IGNORECASE)
         return injected, content_type + "; charset=utf-8"
@@ -435,14 +527,64 @@ class EditorProxy:
     def _session_key(self, category, path):
         return category, path
 
+    @staticmethod
+    def _editor_settings(target, body, content_type):
+        """Skip first-run onboarding only inside this document editor session."""
+        path = urllib.parse.urlsplit(target).path
+        if path in {"/settings/Comfy.TutorialCompleted", "/api/settings/Comfy.TutorialCompleted"}:
+            return b"true", "application/json; charset=utf-8"
+        if path not in {"/settings", "/api/settings"} or "json" not in content_type.lower():
+            return body, content_type
+        try:
+            settings = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body, content_type
+        if not isinstance(settings, dict):
+            return body, content_type
+        settings["Comfy.TutorialCompleted"] = True
+        return json.dumps(settings, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), content_type
+
     def _session_read(self, category, path):
+        if category == "settings" and path == "Comfy.TutorialCompleted":
+            return b"true", "application/json; charset=utf-8"
         with self._data_lock:
+            if category == "settings":
+                saved = self._session_data.get(self._session_key(category, ""))
+                if path and saved is not None:
+                    settings = json.loads(saved[0])
+                    if path in settings:
+                        return json.dumps(settings[path], ensure_ascii=False).encode("utf-8"), saved[1]
+                # Aggregate GET merges the session overlay with upstream defaults.
+                return None
             return self._session_data.get(self._session_key(category, path))
 
-    def _session_write(self, category, path, body, content_type):
-        key = self._session_key(category, path)
+    def _merge_session_settings(self, target, body, content_type):
+        if urllib.parse.urlsplit(target).path not in {"/settings", "/api/settings"}:
+            return body, content_type
+        if "json" not in content_type.lower():
+            return body, content_type
+        try:
+            settings = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body, content_type
+        if not isinstance(settings, dict):
+            return body, content_type
         with self._data_lock:
+            saved = self._session_data.get(self._session_key("settings", ""))
+            if saved is not None:
+                settings.update(json.loads(saved[0]))
+        return json.dumps(settings, ensure_ascii=False).encode("utf-8"), content_type
+
+    def _session_write(self, category, path, body, content_type):
+        with self._data_lock:
+            key = self._session_key(category, "" if category == "settings" else path)
             old = self._session_data.get(key)
+            if category == "settings":
+                value = json.loads(body)
+                settings = json.loads(old[0]) if old is not None else {}
+                settings.update({path: value} if path else value)
+                body = json.dumps(settings, ensure_ascii=False).encode("utf-8")
+                content_type = "application/json; charset=utf-8"
             old_size = len(old[0]) if old else 0
             if self._session_data_bytes - old_size + len(body) > MAX_SESSION_WRITE_BYTES:
                 raise ValueError("本会话临时数据超过 64 MiB 上限")
@@ -714,23 +856,38 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             body = self.proxy.bridge_script.encode("utf-8")
             self.proxy._send_response(self, 200, body, "application/javascript; charset=utf-8", ())
             return
-        if method == "GET" and decoded_path in {"/userdata", "/userdata/", "/api/userdata"}:
-            self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
+        if decoded_path in MEDIA_MODULES:
+            if method != "GET":
+                self.proxy._send_error(self, 403, "媒体编辑模块只允许读取")
+                return
+            path = Path(__file__).resolve().parent.parent / "web" / MEDIA_MODULES[decoded_path]
+            try:
+                body = path.read_bytes()
+                if len(body) > MAX_REQUEST_BYTES:
+                    raise ValueError("媒体模块超过大小限制")
+            except (OSError, ValueError):
+                self.proxy._send_error(self, 503, "媒体编辑模块尚未可用")
+                return
+            self.proxy._send_response(self, 200, body, "application/javascript; charset=utf-8", ())
+            return
+        if method in {"GET", "HEAD"} and decoded_path in {"/userdata", "/userdata/", "/api/userdata", "/api/userdata/"}:
+            self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", _SESSION_CACHE_HEADERS)
             return
         if method == "GET" and decoded_path == "/api/global_subgraphs":
             self.proxy._send_response(self, 200, b"[]", "application/json; charset=utf-8", ())
             return
-        if method == "PUT" and self._is_session_write(decoded_path):
+        if method in {"POST", "PUT"} and self._is_session_write(decoded_path):
             self._session_write(decoded_path)
             return
-        if method == "GET" and self._is_session_read(decoded_path):
+        if method in {"GET", "HEAD"} and self._is_session_read(decoded_path):
             category, key = self._session_location(decoded_path)
             saved = self.proxy._session_read(category, key)
             if saved is not None:
                 body, content_type = saved
-                if self.proxy._needs_css_type(self.path):
+                body, content_type = self.proxy._editor_settings(decoded_path, body, content_type)
+                if self.proxy._needs_css_type(decoded_path):
                     content_type = "text/css; charset=utf-8"
-                self.proxy._send_response(self, 200, body, content_type, ())
+                self.proxy._send_response(self, 200, body, content_type, _SESSION_CACHE_HEADERS)
                 return
         if method == "POST" and decoded_path in _SAFE_READ_ONLY_POST_PATHS:
             content_lengths = self.headers.get_all("Content-Length", [])
@@ -774,6 +931,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             content_type = self.headers.get("Content-Type", "application/octet-stream")
+            if category == "settings":
+                try:
+                    value = json.loads(body)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.proxy._send_error(self, 400, "设置必须是有效 JSON")
+                    return
+                if not key and not isinstance(value, dict):
+                    self.proxy._send_error(self, 400, "完整设置必须是 JSON 对象")
+                    return
             if self.proxy._needs_css_type(self.path):
                 content_type = "text/css; charset=utf-8"
             self.proxy._session_write(category, key, body, content_type)
@@ -801,7 +967,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         return body
 
 
-def _send_response(handler, status, body, content_type, upstream_headers=(), *, head=False):
+def _send_response(handler, status, body, content_type, upstream_headers=(), *, head=False,
+                   content_length="auto"):
     if handler.wfile.closed:
         return
     try:
@@ -821,10 +988,12 @@ def _send_response(handler, status, body, content_type, upstream_headers=(), *, 
             handler.send_header("Cache-Control", "no-store")
             handler.send_header("Referrer-Policy", "no-referrer")
             del handler._editor_bootstrap_cookie
-        handler.send_header("Content-Length", str(len(body)))
+        bodyless_status = status < 200 or status in {204, 304}
+        if not bodyless_status and content_length is not None:
+            handler.send_header("Content-Length", str(len(body)) if content_length == "auto" else content_length)
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.end_headers()
-        if not head and body:
+        if not head and handler.command != "HEAD" and not bodyless_status and body:
             handler.wfile.write(body)
     except (BrokenPipeError, ConnectionResetError, OSError):
         handler.close_connection = True

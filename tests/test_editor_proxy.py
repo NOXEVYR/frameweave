@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from frameweave.editor_proxy import BRIDGE_PATH, EditorProxy
 
@@ -99,12 +100,14 @@ class _ComfyMockHandler(BaseHTTPRequestHandler):
             self._respond(200, b'{"name":"backend workflow"}')
         elif path == "/settings/theme":
             self._respond(200, b'"backend theme"')
+        elif path in {"/settings", "/api/settings"}:
+            self._respond(200, b'{"Comfy.TutorialCompleted":false,"theme":"backend theme","plugin":{"enabled":false}}')
         elif path == "/system_stats":
             self._respond(200, b'{"system":{}}')
         elif path in {"/queue", "/prompt", "/api/queue", "/api/prompt", "/api/system_stats",
                       "/api/object_info", "/api/users", "/api/i18n", "/api/node_replacements"}:
             self._respond(200, b"{}")
-        elif path == "/view":
+        elif path in {"/view", "/api/view"}:
             self._respond(200, b"image bytes", "image/png")
         else:
             self._respond(404, b'{"error":"missing"}')
@@ -183,7 +186,7 @@ class EditorProxyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             EditorProxy(self.backend_url, "http://example.com/path", "")
 
-    def test_first_entry_sets_cookie_and_injects_only_parent_origin_and_nonce(self):
+    def test_first_entry_sets_cookie_and_injects_session_media_protocol_without_secrets(self):
         parsed = urllib.parse.urlsplit(self.info["url"])
         bootstrap_secret = urllib.parse.parse_qs(parsed.query)["session"][0]
         record_start = len(self.backend_server.records)
@@ -199,9 +202,44 @@ class EditorProxyTests(unittest.TestCase):
         match = re.search(r"window\.__PRISM_EDITOR__=(\{.*?\});if", text)
         self.assertIsNotNone(match)
         config = json.loads(match.group(1))
-        self.assertEqual(config, {"parentOrigin": PARENT_ORIGIN, "bridgeNonce": self.info["bridgeNonce"]})
+        self.assertEqual(config, {"parentOrigin": PARENT_ORIGIN, "bridgeNonce": self.info["bridgeNonce"],
+                                  "backendUrl": self.backend_url, "mediaProtocol": 1, "promotedAudioProtocol": 1})
         self.assertNotIn(bootstrap_secret, text)
         self.assertNotIn("session", config)
+
+    def test_exact_media_modules_are_local_authenticated_reads_without_upstream_requests(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        for path, export in [("/prism-editor-media.mjs", b"createNativeEditorMedia"),
+                             ("/native-editor-vhs-preview.mjs", b"export "),
+                             ("/prism-editor-media-preview.mjs", b"createEditorMediaPreview")]:
+            status, headers, body = self._get(path, cookie)
+            self.assertEqual(status, 200)
+            self.assertIn(export, body)
+            self.assertTrue(any(name.lower() == "content-type" and "javascript" in value for name, value in headers))
+            status, _, _ = self._raw_request("GET", path)
+            self.assertEqual(status, 403)
+            status, _, _ = self._raw_request("POST", path, cookie=cookie,
+                                            headers={"Origin": self.origin}, body=b"{}")
+            self.assertEqual(status, 403)
+        self.assertEqual(len(self.backend_server.records), before)
+        status, _, _ = self._raw_request("GET", "/prism-editor-media.mjs")
+        self.assertEqual(status, 403)
+        status, _, _ = self._raw_request("POST", "/prism-editor-media.mjs", cookie=cookie,
+                                        headers={"Origin": self.origin}, body=b"{}")
+        self.assertEqual(status, 403)
+
+    def test_media_modules_do_not_open_vhs_transcode_query_or_arbitrary_files(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        for path in ["/vhs/viewvideo?filename=x.mp4&type=input", "/vhs/queryvideo?filename=x.mp4",
+                     "/api/vhs/queryvideo?filename=x.mp4", "/native-editor-vhs-preview.mjs/other.mjs",
+                     "/native-editor-vhs-preview.mjs.bak",
+                     "/prism-editor-media.mjs/other.mjs", "/prism-editor-media-preview.mjs.bak",
+                     "/prism-editor-media.mjs%2f..%2fsettings"]:
+            status, _, _ = self._get(path, cookie)
+            self.assertIn(status, {400, 403})
+        self.assertEqual(len(self.backend_server.records), before)
 
     def test_host_origin_and_cookie_are_checked(self):
         parsed = urllib.parse.urlsplit(self.info["url"])
@@ -250,10 +288,50 @@ class EditorProxyTests(unittest.TestCase):
             self.assertTrue(dict(headers)["Content-Type"].startswith("text/css"), path)
         self.assertFalse(any("Cookie" in record[2] for record in self.backend_server.records))
 
+    def test_embedded_editor_skips_onboarding_without_changing_backend_settings(self):
+        cookie = self._bootstrap()
+        for path in ("/settings", "/api/settings"):
+            status, _, body = self._get(path, cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"Comfy.TutorialCompleted": True,
+                                               "theme": "backend theme", "plugin": {"enabled": False}})
+        for path in ("/settings", "/api/settings"):
+            status, _, _ = self._raw_request("PUT", path, cookie=cookie,
+                                             headers={"Origin": self.origin, "Content-Type": "application/json"},
+                                             body=b'{"Comfy.TutorialCompleted":false,"theme":"session theme"}')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(self._get(path, cookie)[2]),
+                             {"Comfy.TutorialCompleted": True, "theme": "session theme",
+                              "plugin": {"enabled": False}})
+        for path in ("/settings/Comfy.TutorialCompleted", "/api/settings/Comfy.TutorialCompleted"):
+            self.assertEqual(self._get(path, cookie)[2], b"true")
+        self.assertFalse(any(method in {"PUT", "POST"} for method, _, _ in self.backend_server.records))
+
+    def test_editor_settings_ignore_conditional_requests_and_disable_caching(self):
+        cookie = self._bootstrap()
+        status, headers, body = self._raw_request("GET", "/api/settings?version=2", cookie=cookie,
+                                                headers={"If-None-Match": "old", "If-Modified-Since": "yesterday",
+                                                         "Range": "bytes=0-4"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["Comfy.TutorialCompleted"])
+        self.assertEqual(dict(headers)["Cache-Control"], "no-store")
+        upstream = next(record for record in self.backend_server.records if record[1] == "/api/settings?version=2")
+        self.assertFalse(any(key in upstream[2] for key in ("If-None-Match", "If-Modified-Since", "Range")))
+        _, headers, _ = self._get("/settings/Comfy.TutorialCompleted?version=2", cookie)
+        self.assertEqual(dict(headers)["Cache-Control"], "no-store")
+
+    def test_editor_settings_overlay_preserves_unknown_and_malformed_responses(self):
+        for target, body, content_type in (("/settings", b"[]", "application/json"),
+                                            ("/settings", b"not json", "application/json"),
+                                            ("/settings", b"{}", "text/plain"),
+                                            ("/object_info", b"{}", "application/json")):
+            self.assertEqual(EditorProxy._editor_settings(target, body, content_type), (body, content_type))
+
     def test_settings_and_userdata_writes_are_scoped_to_proxy_session(self):
         cookie = self._bootstrap()
-        status, _, listing = self._get("/userdata", cookie)
-        self.assertEqual((status, listing), (200, b"[]"))
+        for path in ("/userdata", "/userdata/", "/api/userdata", "/api/userdata/"):
+            status, _, listing = self._get(path, cookie)
+            self.assertEqual((status, listing), (200, b"[]"))
         status, _, original = self._get("/userdata/workflow.json", cookie)
         self.assertEqual(status, 200)
         self.assertIn(b"backend workflow", original)
@@ -295,6 +373,142 @@ class EditorProxyTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIn(b"backend workflow", response.read())
         other_conn.close()
+
+    def test_frontend_post_settings_merge_and_share_reads_with_legacy_put(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        cases = (("POST", "/api/settings", b'{"theme":"dark","custom":7}'),
+                 ("POST", "/api/settings/theme", b'"light"'),
+                 ("PUT", "/settings/custom", b'8'))
+        for method, path, body in cases:
+            status, _, _ = self._raw_request(method, path, cookie=cookie,
+                                             headers={"Origin": self.origin,
+                                                      "Content-Type": "application/json"}, body=body)
+            self.assertEqual(status, 200, (method, path))
+        for path in ("/settings", "/api/settings"):
+            status, headers, body = self._get(path, cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"Comfy.TutorialCompleted": True, "theme": "light",
+                                               "plugin": {"enabled": False}, "custom": 8})
+            self.assertEqual(dict(headers)["Cache-Control"], "no-store")
+        self.assertEqual(json.loads(self._get("/api/settings/custom", cookie)[2]), 8)
+        self.assertEqual(json.loads(self._get("/settings/theme", cookie)[2]), "light")
+        self.assertFalse(any(method in {"POST", "PUT"}
+                             for method, _, _ in self.backend_server.records[before:]))
+
+    def test_frontend_post_encoded_userdata_round_trips_in_session_only(self):
+        cookie = self._bootstrap()
+        file = "workflows/nested/测试.json"
+        encoded = urllib.parse.quote(file, safe="")
+        body = b'{"nodes":[],"version":0.4}'
+        before = len(self.backend_server.records)
+        target = "/api/userdata/" + encoded + "?overwrite=true&full_info=false"
+        status, _, _ = self._raw_request("POST", target, cookie=cookie,
+                                         headers={"Origin": self.origin,
+                                                  "Content-Type": "application/json"}, body=body)
+        self.assertEqual(status, 200)
+        for prefix in ("/api/userdata/", "/userdata/"):
+            self.assertEqual(self._get(prefix + encoded, cookie)[::2], (200, body))
+        status, _, _ = self._raw_request("PUT", "/userdata/" + encoded, cookie=cookie,
+                                         headers={"Origin": self.origin}, body=b"legacy")
+        self.assertEqual(status, 200)
+        self.assertEqual(self._get("/api/userdata/" + encoded, cookie)[::2], (200, b"legacy"))
+        self.assertEqual(len(self.backend_server.records), before)
+
+    def test_frontend_post_still_requires_session_and_trusted_origin(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        for path in ("/api/settings", "/api/userdata/workflows%2Ftest.json"):
+            for request_cookie, headers in ((None, {"Origin": self.origin}),
+                                            (cookie, {}),
+                                            (cookie, {"Origin": "http://evil.example"})):
+                status, _, _ = self._raw_request("POST", path, cookie=request_cookie,
+                                                 headers=headers, body=b"{}")
+                self.assertEqual(status, 403)
+        self.assertFalse(self.proxy._session_data)
+        self.assertEqual(len(self.backend_server.records), before)
+
+    def test_deep_media_subfolder_query_allows_single_encoded_slash(self):
+        cookie = self._bootstrap()
+        query = urllib.parse.urlencode({"filename": "frame.png", "subfolder": "a/b/c", "type": "input"})
+        target = "/view?" + query
+        before = len(self.backend_server.records)
+        self.assertEqual(self._get(target, cookie)[::2], (200, b"image bytes"))
+        self.assertEqual(self.backend_server.records[before][1], target)
+
+    def test_encoded_paths_and_queries_cannot_escape_userdata_or_media(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        targets = ("/api/userdata/%2Fsettings", "/api/userdata/workflows%2F..%2Fsecret.json",
+                   "/api/userdata/%252e%252e%252fsecret", "/api/userdata/x%255cy",
+                   "/api/userdata/x%5Cy", "/api/userdata/C%3A%2Fsecret",
+                   "/api/userdata/x%2F%2Fy", "/api/userdata/..%20%2Fsecret",
+                   "/api/userdata/x%00.json", "/api/userdata/x%0A.json",
+                   "/api/userdata/x%2520.json", "/api/userdata/x%23y",
+                   "/api%2Fuserdata%2Fx", "/api/userdata%2Fx", "/api%2Fprompt",
+                   "/assets/test.js%2F..%2Fsettings", "/assets/test%0A.js",
+                   "/view?filename=frame.png&subfolder=a%2F..%2Fsecret",
+                   "/view?filename=frame.png&subfolder=a%252Fb",
+                   "/view?filename=frame.png&subfolder=a%5Cb",
+                   "/view?filename=frame.png&subfolder=..%20%2Fsecret",
+                   "/view?filename=%2Fsecret&subfolder=",
+                   "/view?filename=frame.png&subfolder=C%3A%2Fsecret",
+                   "/view?filename=frame.png&subfolder=a%0Ab")
+        for target in targets:
+            for method, body in (("GET", None), ("POST", b"{}")):
+                status, _, _ = self._raw_request(method, target, cookie=cookie,
+                                                 headers={"Origin": self.origin}, body=body)
+                self.assertEqual(status, 400, (method, target))
+        self.assertFalse(self.proxy._session_data)
+        self.assertEqual(len(self.backend_server.records), before)
+
+    def test_native_asset_hash_and_literal_percent_media_names(self):
+        cookie = self._bootstrap()
+        for filename in ("blake3:" + "a" * 64, "50%AB.png", "画面 50%.png"):
+            for route in ("/view", "/api/view"):
+                target = route + "?" + urllib.parse.urlencode({"filename": filename, "subfolder": "nested/images", "type": "input"})
+                before = len(self.backend_server.records)
+                status, _, _ = self._get(target, cookie)
+                self.assertEqual(status, 200, filename)
+                self.assertEqual(self.backend_server.records[before][1], target)
+        before = len(self.backend_server.records)
+        for filename in ("blake3:../secret", "blake3:" + "g" * 64, "C:/secret.png", "file:secret.png", "50%2fsecret.png", "x%250asecret.png"):
+            target = "/view?" + urllib.parse.urlencode({"filename": filename})
+            self.assertEqual(self._get(target, cookie)[0], 400, filename)
+        self.assertEqual(len(self.backend_server.records), before)
+
+    def test_encoded_view_alias_keeps_media_validation_and_generic_query_is_not_a_path(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        for route in ("/%76iew", "/api/%76iew"):
+            for value in ("C:/secret.png", "/secret", "../secret", "a/../secret"):
+                target = route + "?" + urllib.parse.urlencode({"filename": value})
+                self.assertEqual(self._get(target, cookie)[0], 400, target)
+        self.assertEqual(len(self.backend_server.records), before)
+        self.assertEqual(self._get("/system_stats?display=.&label=50%25AB", cookie)[0], 200)
+
+    def test_post_session_limits_and_invalid_settings_leave_data_unchanged(self):
+        cookie = self._bootstrap()
+        before = len(self.backend_server.records)
+        for path, body in (("/api/settings", b"[]"), ("/api/settings/theme", b"bad json")):
+            status, _, _ = self._raw_request("POST", path, cookie=cookie,
+                                             headers={"Origin": self.origin}, body=body)
+            self.assertEqual(status, 400)
+        with patch("frameweave.editor_proxy.MAX_REQUEST_BYTES", 4):
+            status, _, _ = self._raw_request("POST", "/api/userdata/x.json", cookie=cookie,
+                                             headers={"Origin": self.origin}, body=b"12345")
+            self.assertEqual(status, 413)
+        with patch("frameweave.editor_proxy.MAX_SESSION_WRITE_BYTES", 4):
+            status, _, _ = self._raw_request("POST", "/api/userdata/x.json", cookie=cookie,
+                                             headers={"Origin": self.origin}, body=b"12345")
+            self.assertEqual(status, 413)
+        status, _, _ = self._raw_request("POST", "/api/userdata/x.json", cookie=cookie,
+                                         headers={"Origin": self.origin, "Transfer-Encoding": "chunked"},
+                                         body=b"{}")
+        self.assertEqual(status, 413)
+        self.assertFalse(self.proxy._session_data)
+        self.assertEqual(self.proxy._session_data_bytes, 0)
+        self.assertEqual(len(self.backend_server.records), before)
 
     def test_jobs_uploads_unknown_routes_and_methods_are_denied(self):
         cookie = self._bootstrap()

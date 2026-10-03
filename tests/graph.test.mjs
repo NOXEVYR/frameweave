@@ -224,6 +224,7 @@ test('canvas zoom up to 300 percent survives save and reload while out-of-range 
 const workflowNode = (label, fields = ['image']) => createNode('generation', 0, 0, {
   title: label, kind: 'package', package_id: `p-${label}`,
   packageFields: fields.map(id => ({ id, label: id, type: 'image' })),
+  editor_output_fields: [{ id: 'output', mediaType: 'image' }],
 });
 
 test('package image edges preserve independent output indices for the same upstream source', () => {
@@ -388,6 +389,18 @@ test('package image values preserve owner and are checked only when an image fie
   restored.nodes[0].data.packageMediaBackends.image.backend = 'http://127.0.0.1:8188';
   restored.nodes[0].data.packageMediaBackends.image.name = 'old-filename.png';
   assert.throws(() => validateExecutionMediaBackends(restored, [target.id], 'http://127.0.0.1:8189', 'http://127.0.0.1:8188'), /没有上传引擎记录/);
+});
+
+test('package upload preview survives round trips and rejects arbitrary media addresses', () => {
+  const target = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-test',
+    packageFields: [{ id: 'image', label: 'Image', type: 'image' }], packageValues: { image: 'input.png' },
+    packageMediaBackends: { image: { name: 'input.png', backend: 'http://127.0.0.1:8188', preview_url: `/api/media/${'a'.repeat(32)}` } } });
+  const graph = { nodes: [target], edges: [] };
+  assert.equal(parseGraph(serializeGraph(graph)).nodes[0].data.packageMediaBackends.image.preview_url, `/api/media/${'a'.repeat(32)}`);
+  for (const url of ['https://evil.test/a.png', '/api/settings', '/api/media/../../settings', `/api/media/${'a'.repeat(32)}?extra=1`]) {
+    target.data.packageMediaBackends.image.preview_url = url;
+    assert.throws(() => parseGraph(serializeGraph(graph)), /已登记的本机媒体地址/);
+  }
 });
 
 test('package audio values stop on a different engine and pass after upload to the target engine', () => {

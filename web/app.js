@@ -1,24 +1,49 @@
-import { liveProgressText } from './job-progress.mjs';
+import { configureWorkflowInterface } from './workflow-interface-controller.mjs';
+import { createStudioWorkflowEditor, chooseStudioEditorSource } from './studio-workflow-editor.mjs';
+import { liveProgressText, elapsedText, previewStatusText, updateLiveProgress } from './job-progress.mjs';
+import { isJobActive, isJobTerminal, jobStatusLabel, jobStateDetail, canCancelJob, canRefreshJob, canSwitchJobBackend, cancelActionLabel } from './job-state.mjs';
 import { createUpdateCenter } from './update-center.mjs';
 document.title = `棱光 PrismCanvas · 工作区 ${location.port}`;
 import { createEngineCenter } from './engine-center.mjs';
-import { createNode, createDemo, connect, removeNodes, generationPayload, generationInputPorts, edgeInputField, canConnect, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
-import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, redactLocalText, publicChecksReport } from './packages.mjs';
+import { createHubCenter } from './hub-center.mjs';
+import { selectedHubRequest } from './hub-selection.mjs';
+import { createNode, createDemo, connect, removeNodes, removeEdges, generationPayload, generationInputPorts, edgeInputField, canConnect, recipeGraph, serializeGraph, parseGraph, stableStringify, progressPercent } from './graph.mjs';
+import { PACKAGE_LIMIT, defaultValues, fieldType, coerceFieldValue, selectFieldState, validateValues, parseJSONWithSafeNumbers, parsePackageDocument, apiPromptFromDocument, redactLocalText, publicChecksReport } from './packages.mjs';
 import { filterJobs, filterPackages } from './library.mjs';
-import { placeFragment } from './canvas-layout.mjs';
+import { placeFragment, canvasContentArea } from './canvas-layout.mjs';
 import { selectionBounds, copySelection, pasteSelection, moveSelection, arrangeSelection, clampMenuPosition } from './canvas-actions.mjs';
 import { createGenerationStudio } from './generation-studio.mjs';
 import { createWorkspaceTools } from './workspace-tools.mjs';
-import { createWorkflowCanvas } from './workflow-canvas.mjs';
+import { createWorkflowCanvas, validateCanvasStructure } from './workflow-canvas.mjs';
 import { createNativeWorkflowEditor, editorDocument, EDITOR_LIMIT } from './native-workflow-editor.mjs';
-import { chooseEditorInterface, resolveEditorConflicts } from './editor-interface-panel.mjs';
+import { autoEditorInterfaceSelection, chooseEditorInterface, resolveEditorConflicts, initialEditorFieldIds } from './editor-interface-panel.mjs';
+import { cachedPackageField, visibleInputPorts, inputPortCandidates, outputChoices, portExpansionPositions, CANVAS_PORT_PAGE_SIZE } from './canvas-port-layout.mjs';
+import { createContentLayout } from './canvas-content-layout.mjs';
 import { editorConnectionSummary, applyEditorInterfaceGraph } from './editor-canvas-interface.mjs';
-import { chooseWorkflowBackend, workflowBackendTarget } from './editor-backend-picker.mjs';
+import { chooseWorkflowBackend, workflowBackendTarget, workflowRootBackendTarget } from './editor-backend-picker.mjs';
 import { createWorkflowConfigurations } from './workflow-configurations.mjs';
-import { validateMediaFile, importPosition, prepareLocalImages } from './canvas-images.mjs';
+import { validateMediaFile, mediaFileContentType, importPosition, prepareLocalImages, assertReferenceImportsReady, upstreamNodeIds } from './canvas-images.mjs';
+import { createMediaTransfers } from './media-transfers.mjs';
+import { readWorkflowFile } from './workflow-file.mjs';
+import { choosePngWorkflow } from './workflow-file-dialog.mjs';
+import { packageNodePresentation } from './package-node-presentation.mjs';
+import { repairInterfaceInputs, chooseMissingInputValues } from './interface-repair.mjs';
+import { mergeDiagnosticChecks } from './diagnostics-view.mjs';
+import { createCanvasInspection, captureRequestInspection, inspectWithDiscovery } from './canvas-inspection.mjs';
+import { editorPreparationBackend, captureEditorPreparationTarget, assertEditorPreparationTarget, projectEditorInputs } from './editor-preparation.mjs';
+import { stageEditorMediaSync } from './editor-media-sync.mjs';
+import { createNodeActionPress } from './node-action-press.mjs';
+import { interfacePage, interfaceSearch } from './interface-pagination.mjs';
+import { INTERFACE_PAGE_SIZE } from './interface-limits.mjs';
+import { createPackageCatalog } from './package-catalog.mjs';
+import { collectPresetEditRequest } from './preset-edit-request.mjs';
+import { preparePresetEditGraph } from './preset-edit-graph.mjs';
+import { openResultReferenceDialog } from './result-reference-dialog.mjs';
+import { prepareResultEdit } from './result-edit.mjs';
 
 const $ = selector => document.querySelector(selector);
 const STORAGE_KEY = 'frameweave.canvas.v1';
+const PORT_VIEW_STORAGE_KEY = 'frameweave.canvas.ports.v1';
 const TITLE_STORAGE_KEY = 'frameweave.canvas.title.v1';
 const JOB_MAP_KEY = 'frameweave.jobs.v1';
 const RETRY_REQUESTS_KEY = 'frameweave.retry-requests.v1';
@@ -37,20 +62,59 @@ let selectedEdge = null;
 let history = [];
 let future = [];
 let csrf = '';
+const nativeSyncTargets = new WeakMap();
+const workspaceEditorTargets = new WeakMap();
+const nativeSessionContexts = new WeakMap();
+const editorMediaSyncs = new WeakMap();
+const nodeActionPress = createNodeActionPress({ isCurrent: node => !!node && getNode(node.id) === node });
 const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copyText,
+  forTarget: target => workspaceEditorTargets.get(target),
   ensureBackend: ensureWorkflowBackend,
+  prepareSession: prepareNativeEditorSession,
+  endSession: endNativeEditorSession,
+  reopen: node => openNodeWorkflow(getNode(node.id)),
   async ensureInstance(node) {
+    const context = nativeSessionContexts.get(node);
+    context?.assertCurrent();
     if (graph.nodes.filter(other => other.data.editor_id === node.data.editor_id).length < 2) return;
     const original = await api(`/api/editor-workflows/${node.data.editor_id}`);
-    const copied = await api('/api/editor-workflows', { name: original.name, source_json: original.source_json });
+    context?.assertCurrent();
+    const copied = await api('/api/editor-workflows', { name: original.name, source_json: original.source_json, source_kind: original.source_kind || 'unknown' });
+    context?.assertCurrent();
     mutate(() => { node.data.editor_id = copied.id; });
+    context?.rebaseTarget();
   },
-  fields: node => packages.find(pack => pack.id === node.data.package_id)?.fields || [],
-  syncOuterValues(node, updates) { mutate(() => { node.data.packageValues = { ...node.data.packageValues, ...updates }; }); },
+  fields: node => {
+    const context = nativeSessionContexts.get(node);
+    context?.assertCurrent();
+    const fields = context?.fields || packageCatalog.peek(node.data.package_id)?.fields || node.data.packageFields || [];
+    const byId = new Map(fields.map(field => [field.id, field]));
+    for (const item of node.data.editor_hidden_updates || []) if (!byId.has(item.field.id)) byId.set(item.field.id, item.field);
+    return [...byId.values()];
+  },
+  syncOuterValues(node, updates) {
+    const context = nativeSessionContexts.get(node);
+    context?.assertCurrent();
+    const guard = nativeSyncTargets.get(node) || captureNativeInterfaceTarget(node);
+    assertNativeInterfaceTarget(guard);
+    mutate(() => {
+      for (const target of new Set([node, guard.node])) {
+        const hiddenIds = new Set((target.data.editor_hidden_updates || []).map(item => item.field.id));
+        target.data.packageValues = { ...target.data.packageValues, ...Object.fromEntries(Object.entries(updates).filter(([id]) => !hiddenIds.has(id))) };
+        if (hiddenIds.size) target.data.editor_hidden_updates = target.data.editor_hidden_updates.map(item =>
+          Object.hasOwn(updates, item.field.id) ? { ...item, value: updates[item.field.id] } : item);
+        // An internal filename selection is not an upload receipt. It must not
+        // inherit the previous external file's backend or local thumbnail.
+        for (const id of Object.keys(updates)) if (target.data.packageMediaBackends?.[id]) delete target.data.packageMediaBackends[id];
+      }
+    });
+    context?.rebaseTarget();
+  },
   resolveConflicts: resolveEditorConflicts,
   applyInterface: configureNativeInterface,
   releaseSession(session_id) { fetch('/api/editor-sessions/close', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-FW-Token': csrf }, body: JSON.stringify({ session_id }), keepalive: true }).catch(() => {}); },
   async applied(node, result) {
+    if (result._canvas_guard) assertNativeInterfaceTarget(result._canvas_guard);
     let source = graph;
     if (node.data.kind !== 'package') {
       source = clone(graph);
@@ -58,53 +122,304 @@ const nativeEditor = createNativeWorkflowEditor({ api, toast, downloadJSON, copy
       source.nodes.find(n=>n.id===node.id).data.kind='package';
     }
     const updated = applyEditorInterfaceGraph(source, node.id, result);
-    packages = [...packages.filter(pack => pack.id !== result.package.id), result.package];
+    rememberPackageDefinition(result.package);
     mutate(() => {
       graph = updated;
     });
   }
 });
 
-async function configureNativeInterface(node, compiled = null, session = null) {
-  const previousFields = packages.find(pack => pack.id === node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
-  const prefix = `/api/editor-workflows/${node.data.editor_id}`;
-  const info = await api(`${prefix}/interface`, compiled ? { prompt: compiled.output } : { package_id: node.data.package_id, values: node.data.packageValues, previous_baseline: node.data.editor_baseline });
-  const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
-  const connectionGraph=clone(graph);
-  if(node.data.kind!=='package') for(const edge of connectionGraph.edges.filter(e=>e.target===node.id)) edge.targetField=edgeInputField(graph,edge);
-  const connections = editorConnectionSummary(connectionGraph, node.id, oldOutputs);
-  if (!compiled) info.outputs = info.outputs.map(item => ({ ...item, label: oldOutputs.find(old => old.id === item.id)?.label || item.label }));
-  const selection = await chooseEditorInterface({ ...info, previousFields, previousValues: node.data.packageValues, previousBaseline: node.data.editor_baseline, selectedOutputs: oldOutputs.length ? oldOutputs : node.data.editor_outputs || [], connections });
-  if (!selection) return null;
-  const payload = { ...session, fields: selection.fields, output_nodes: selection.output_nodes, rebindings: selection.rebindings,
-    previous_package_id: node.data.package_id || null, previous_values: node.data.packageValues || {}, previous_baseline: node.data.editor_baseline || {},
-    ...(compiled ? { document: compiled.workflow, prompt: compiled.output } : { package_id: node.data.package_id, values: node.data.packageValues, backend_url: node.data.editor_backend }) };
-  let result = await api(`${prefix}/${compiled ? 'apply' : 'configure'}`, payload);
-  if (result.requires_resolution) {
-    const resolutions = await resolveEditorConflicts(result.changes.conflicts);
-    if (!resolutions) return null;
-    result = await api(`${prefix}/${compiled ? 'apply' : 'configure'}`, { ...payload, resolutions });
-    if (result.requires_resolution) throw new Error('仍有参数冲突未选择，请重新配置');
+/** Fixed direct-input witnesses survive source loading and the whole editor session. */
+function beginNativeEditorContext(node) {
+  if (editorMediaSyncs.has(node)) throw new Error('参考素材正在同步，请完成后再进入工作流');
+  const previous = nativeSessionContexts.get(node);
+  if (previous) { previous.assertCurrent(); return previous; }
+  const target = getNode(node.id);
+  if (!target) throw new Error('工作流节点已不存在，未准备内部编辑器');
+  const context = { target, aliases: new Set([node, target]), fields: null, package: null,
+    sourceRevision: target.data.package_id || target.data.editor_id || null, baselineBackend: null };
+  const live = () => ({ canvasId: currentCanvasIdentity(), backend: settings.backend_url,
+    sourceRevision: context.sourceRevision, referenceImports, mediaTransfers: packageMediaTransfers });
+  context.guard = captureEditorPreparationTarget(graph, target.id, live());
+  context.assertCurrent = () => assertEditorPreparationTarget(context.guard, graph, live());
+  context.rebaseTarget = () => {
+    const fresh = captureEditorPreparationTarget(graph, target.id, live());
+    assertEditorPreparationTarget({ ...context.guard, signature: fresh.signature }, graph, live());
+    context.guard = { ...context.guard, signature: fresh.signature };
+  };
+  context.acceptBackend = expected => {
+    if (settings.backend_url !== expected) throw new Error('选择期间推理引擎已变化，请重新进入工作流');
+    const fresh = captureEditorPreparationTarget(graph, target.id, live());
+    if (context.baselineBackend && fresh.backend !== context.baselineBackend) throw new Error('首次转换的基准属于原推理引擎；后端已变化，请重新进入以重新准备完整来源');
+    assertEditorPreparationTarget({ ...context.guard, backend: fresh.backend }, graph, live());
+    context.guard = { ...context.guard, backend: fresh.backend };
+  };
+  for (const alias of context.aliases) nativeSessionContexts.set(alias, context);
+  return context;
+}
+function aliasNativeEditorContext(context, node) {
+  context.aliases.add(node); nativeSessionContexts.set(node, context);
+}
+function endNativeEditorSession(node) {
+  const context = nativeSessionContexts.get(node);
+  if (!context) return;
+  for (const alias of context.aliases) if (nativeSessionContexts.get(alias) === context) nativeSessionContexts.delete(alias);
+}
+async function loadNativeEditorFields(context) {
+  context.assertCurrent();
+  if (context.fields) return;
+  if (!context.target.data.package_id) { context.fields = []; return; }
+  const pack = await ensurePackageDefinition(context.target.data.package_id);
+  context.assertCurrent();
+  if (pack.id !== context.target.data.package_id || !Array.isArray(pack.fields)) throw new Error('完整工作流包定义已变化，请重新进入');
+  context.package = pack; context.fields = clone(pack.fields);
+}
+function nativeEditorProjection(context, node, ownOnly = false) {
+  const target = context.target;
+  const base = context.sessionGraph || graph;
+  const source = { nodes: base.nodes, edges: ownOnly ? base.edges.filter(edge => edge.target !== target.id) : base.edges };
+  return projectEditorInputs(source, target.id, { fields: context.fields || [], backend: settings.backend_url,
+    canvasId: currentCanvasIdentity(), referenceImports, mediaTransfers: packageMediaTransfers });
+}
+async function prepareNativeEditorSession(node, workflow) {
+  const context = nativeSessionContexts.get(node) || beginNativeEditorContext(node);
+  context.assertCurrent();
+  await loadNativeEditorFields(context); context.assertCurrent();
+  const projection = nativeEditorProjection(context, node);
+  let provenance = [], ownMedia = [], pending = projection.pending;
+  const document = context.baselineDocument || (node.data.kind === 'api' ? { prompt: node.data.apiPrompt } : null);
+  if (context.package || document) {
+    const request = { backend_url: settings.backend_url, overrides: projection.overrides, pending: projection.pending,
+      ...(context.package ? { package_id: context.package.id } : { document, fields: context.fields || [] }) };
+    const prepared = await api('/api/editor-prepare', request); context.assertCurrent();
+    if (prepared.backend_url !== settings.backend_url || context.package && prepared.source_revision !== context.package.id) throw new Error('编辑准备结果的来源或后端已变化');
+    const byId = new Map((context.fields || []).map(field => [field.id, field]));
+    for (const item of context.target.data.editor_hidden_updates || []) if (!byId.has(item.field.id)) byId.set(item.field.id, item.field);
+    const enrich = (result, items) => items.map(item => {
+      const field = byId.get(item.field_id), definition = result.prompt?.[item.node_id];
+      if (!field || field.node_id !== item.node_id || field.input !== item.input || !definition?.class_type) throw new Error('连线投影缺少完整且匹配的字段证明');
+      if (!Object.is(definition.inputs?.[item.input], item.value)) throw new Error('编辑准备响应与实际执行输入不一致');
+      return { ...item, class_type: definition.class_type, type: field.type, label: field.label || field.id };
+    });
+    provenance = enrich(prepared, (prepared.overrides || []).filter(item => item.origin === 'connected'));
+    // A connected C hides its own fallback F in the effective projection.
+    // Prove F independently before syncing it into the native baseline N.
+    const ownProjection = nativeEditorProjection(context, node, true);
+    const mediaIds = new Set([...byId.values()].filter(field => ['image', 'video', 'audio'].includes(field.type)).map(field => field.id));
+    const ownOverrides = ownProjection.overrides.filter(item => mediaIds.has(item.field_id));
+    if (ownOverrides.length) {
+      const ownPrepared = await api('/api/editor-prepare', { ...request, overrides: ownOverrides,
+        pending: ownProjection.pending.filter(item => mediaIds.has(item.field_id)) });
+      context.assertCurrent();
+      if (ownPrepared.backend_url !== settings.backend_url || context.package && ownPrepared.source_revision !== context.package.id) throw new Error('素材准备结果的来源或后端已变化');
+      ownMedia = enrich(ownPrepared, (ownPrepared.overrides || []).filter(item => mediaIds.has(item.field_id) && item.origin === 'own'));
+    }
+    pending = prepared.pending || pending;
+  } else if (context.target.data.editor_id) {
+    pending = [...pending, { reason: 'source_unavailable', message: '这套原生工作流尚未绑定可验证的外部字段来源；请在内部选择参数并管理外部接口，当前连线未投影到内部。' }];
   }
-  return { ...result, outputs: info.outputs, controls: compiled?.controls || node.data.editor_controls || [], rebindings: selection.rebindings, output_rebindings: selection.output_rebindings };
+  context.provenance = provenance; context.pending = pending;
+  return { assertCurrent: context.assertCurrent, provenance: clone(provenance), ownMedia: clone(ownMedia), pending: clone(pending) };
+}
+
+function editorMediaSyncButton(node) {
+  const control = button(editorMediaSyncs.has(node) ? '正在同步参考素材…' : '同步参考素材到引擎', 'button quiet sync-editor-media', () => syncEditorMedia(node));
+  control.disabled = editorMediaSyncs.has(node); control.dataset.syncMediaNode = node.id;
+  control.title = '从本地副本重新同步直连图片、视频和音频，可恢复引擎已丢失的素材；同一文件只传一份，会新增引擎输入文件，保留旧文件，不开始生成';
+  return control;
+}
+async function syncEditorMedia(node) {
+  if (editorMediaSyncs.has(node)) return editorMediaSyncs.get(node);
+  if (nativeSessionContexts.has(node)) throw new Error('请先返回画布，再同步参考素材并重新进入工作流');
+  const backend = editorPreparationBackend(graph, node.id, settings.backend_url);
+  if (backend !== settings.backend_url) throw new Error('请先连接此工作流绑定的推理引擎，再同步参考素材');
+  const live = () => ({ canvasId: currentCanvasIdentity(), backend: settings.backend_url,
+    sourceRevision: node.data.package_id || node.data.editor_id || null, referenceImports, mediaTransfers: packageMediaTransfers });
+  const guard = captureEditorPreparationTarget(graph, node.id, live());
+  const check = () => {
+    if (nativeSessionContexts.has(node)) throw new Error('内部工作流已打开，未应用迟到的素材同步；请返回画布后重试');
+    return assertEditorPreparationTarget(guard, graph, live());
+  };
+  const showProgress = (done, total) => {
+    for (const control of document.querySelectorAll('[data-sync-media-node]')) if (control.dataset.syncMediaNode === node.id) {
+      control.disabled = true; control.textContent = total ? `正在同步参考素材 ${done}/${total}…` : '正在检查参考素材…';
+    }
+  };
+  const task = (async () => {
+    showProgress(0, 0);
+    const pack = node.data.package_id ? await ensurePackageDefinition(node.data.package_id) : null;
+    check();
+    const result = await stageEditorMediaSync(graph, node.id, { ...live(), fields: pack?.fields || [] }, api, check, showProgress);
+    const status = await api('/api/status'); check();
+    if (status.backend_url !== backend) throw new Error('同步期间引擎已切换，未改写画布；请重新连接后同步');
+    if (result.updates.length) mutate(() => {
+      for (const update of result.updates) {
+        const source = getNode(update.id);
+        source.data.name = update.name; source.data.uploadBackend = update.uploadBackend;
+      }
+    });
+    const reasons = { upstream_not_run: '上游尚未生成', mapping_unavailable: '尚未建立对应媒体接口',
+      ambiguous_connection: '同一端口存在多条连接', import_pending: '素材正在导入', import_failed: '素材导入失败',
+      media_type_mismatch: '素材类型与端口不一致', local_only: '本地素材不可用', other_backend: '缺少可重新同步的本地素材',
+      owner_unknown: '缺少可重新同步的本地素材', media_missing: '尚未选择素材',
+      local_copy_unavailable: '缺少本地副本，无法重新同步；请重新导入素材' };
+    const pending = [...new Set(result.pending.map(item => reasons[item.reason] || '请检查素材和端口映射'))];
+    toast(`${result.updates.length ? `已同步 ${result.updates.length} 份参考素材，可进入工作流查看` : '没有需要同步的直接本地素材'}${pending.length ? `；待处理：${pending.join('、')}` : ''}。尚未开始生成`, !!pending.length);
+  })();
+  editorMediaSyncs.set(node, task);
+  try { return await task; }
+  finally {
+    editorMediaSyncs.delete(node); renderNodes(); renderInspector();
+    // Cached node cards can survive a redraw with unchanged content. Settle
+    // transient button state explicitly rather than leaving the old busy DOM.
+    for (const control of document.querySelectorAll('[data-sync-media-node]')) {
+      if (control.dataset.syncMediaNode === node.id && !editorMediaSyncs.has(getNode(node.id))) {
+        control.disabled = false; control.textContent = '同步参考素材到引擎';
+      }
+    }
+  }
+}
+
+function captureNativeInterfaceTarget(node) {
+  const target = getNode(node.id);
+  if (!target) throw new Error('工作流节点已不存在；未应用外部接口');
+  return { identity: currentCanvasIdentity(), node: target, signature: stableStringify(target.data),
+    edges: stableStringify(graph.edges), sources: [...new Set(graph.edges.filter(edge => edge.target === target.id).map(edge => edge.source))].map(id => {
+      const source = getNode(id); return { id, node: source, signature: stableStringify(source ? { type: source.type, data: source.data } : null) };
+    }) };
+}
+function assertNativeInterfaceTarget(guard) {
+  nativeSessionContexts.get(guard.node)?.assertCurrent();
+  if (guard.identity !== currentCanvasIdentity() || getNode(guard.node.id) !== guard.node ||
+      guard.signature !== stableStringify(guard.node.data) || guard.edges !== stableStringify(graph.edges) ||
+      (guard.sources || []).some(source => getNode(source.id) !== source.node || source.signature !== stableStringify(source.node ? { type: source.node.type, data: source.node.data } : null))) {
+    throw new Error('画布、节点或连线已变化；内部工作流和接口候选仍保留，未覆盖当前画布，请重新应用');
+  }
+}
+async function completeInterfaceInputs(info, selection, { path, payload, options, ensureCurrent = () => {} }) {
+  if (!(info.missing_fields || []).length) return { info, selection, missing_values: {} };
+  const backend = settings.backend_url;
+  const check = async () => {
+    ensureCurrent();
+    const status = await api('/api/status'); ensureCurrent();
+    if (status.backend_url !== backend || settings.backend_url !== backend) throw new Error('补齐参数期间推理引擎已变化，请重新检查。');
+  };
+  return repairInterfaceInputs({ info, selection, ensureCurrent, notify: toast, chooseValues: chooseMissingInputValues,
+    inspect: async repair => { ensureCurrent(); const next = await api(path, { ...payload, ...repair }); await check(); return next; },
+    chooseFields: async (next, previous) => {
+      const selectedIds = new Set(previous.fields.map(field => field.id));
+      const retained = new Map((options.previousFields || []).map(field => [field.id, { ...field, selected: selectedIds.has(field.id) }]));
+      for (const field of previous.fields) if (!retained.has(field.id)) retained.set(field.id, field);
+      return chooseEditorInterface({ ...options, ...next, previousFields: [...retained.values()], selectedOutputs: previous.output_nodes });
+    },
+  });
+}
+async function configureNativeInterface(node, compiled = null, session = null, { automatic = false, syncBaseline = [] } = {}) {
+  const context = nativeSessionContexts.get(node); context?.assertCurrent();
+  const guard = captureNativeInterfaceTarget(node);
+  const previousFields = context?.fields || packageCatalog.peek(node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
+  const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
+  const connectionGraph = clone(graph);
+  if (node.data.kind !== 'package') for (const edge of connectionGraph.edges.filter(e => e.target === node.id)) edge.targetField = edgeInputField(graph, edge);
+  const result = await configureWorkflowInterface({ api, toast, chooseEditorInterface,
+    autoEditorInterfaceSelection, resolveEditorConflicts, completeInterfaceInputs }, node.data,
+    { compiled, session, automatic, syncBaseline, previousFields,
+      connections: editorConnectionSummary(connectionGraph, node.id, oldOutputs),
+      assertCurrent: () => assertNativeInterfaceTarget(guard) });
+  return result ? { ...result, _canvas_guard: guard } : null;
 }
 async function configureNativePanel(node) {
-  if (!await ensureWorkflowBackend(node)) return;
-  const result = await configureNativeInterface(node);
-  if (result) { await nativeEditor.applyToNode(node, result); toast('外层参数面板已更新；无需进入内部即可调节'); }
+  const existing = nativeSessionContexts.get(node), context = existing || beginNativeEditorContext(node);
+  try {
+    if (!await ensureWorkflowBackend(node)) return;
+    await loadNativeEditorFields(context); context.assertCurrent();
+    const result = await configureNativeInterface(node);
+    if (result) { await nativeEditor.applyToNode(node, result); toast('外层参数面板已更新；无需进入内部即可调节'); }
+  } finally { if (!existing) endNativeEditorSession(node); }
+}
+async function configurePackageInterface(node) {
+  if (node.data.editor_id) return configureNativePanel(node);
+  const openingIdentity = currentCanvasIdentity(), openingPackage = node.data.package_id, openingData = stableStringify(node.data), openingBackend = settings.backend_url;
+  const pack = await ensurePackageDefinition(openingPackage);
+  if (openingIdentity !== currentCanvasIdentity() || getNode(node.id) !== node || node.data.package_id !== openingPackage || openingData !== stableStringify(node.data) || openingBackend !== settings.backend_url) throw new Error('画布或工作流已变化，请重新打开接口设置');
+  const snapshot = stableStringify(node.data), identity = currentCanvasIdentity(), backend = settings.backend_url;
+  const saved = { package_id: pack.id, values: node.data.packageValues, previous_baseline: node.data.editor_baseline };
+  let info = await api('/api/interfaces/inspect', saved);
+  const options = { ...info, previousFields: pack.fields, previousValues: node.data.packageValues,
+    previousBaseline: node.data.editor_baseline, selectedOutputs: node.data.editor_outputs || [],
+    connections: editorConnectionSummary(graph,node.id,node.data.editor_output_fields || []) };
+  const ensureCurrent = () => { if (identity !== currentCanvasIdentity() || getNode(node.id) !== node || snapshot !== stableStringify(node.data)) throw new Error('画布或工作流已变化，请重新打开接口设置'); };
+  let selection = await chooseEditorInterface(options);
+  if (!selection) return;
+  const repaired = await completeInterfaceInputs(info, selection, { path: '/api/interfaces/inspect', payload: saved, options, ensureCurrent });
+  if (!repaired) return;
+  ({ info, selection } = repaired); ensureCurrent();
+  const payload = { ...saved, ...selection, missing_values: repaired.missing_values, name: pack.name, backend_url: backend,
+    previous_package_id: pack.id, previous_values: node.data.packageValues || {} };
+  let result = await api('/api/interfaces/apply', payload);
+  if (result.requires_resolution) {
+    const resolutions = await resolveEditorConflicts(result.changes.conflicts);
+    if (!resolutions) return;
+    result = await api('/api/interfaces/apply', { ...payload, resolutions });
+  }
+  if (result.requires_resolution) throw new Error('仍有参数冲突未处理');
+  if (identity !== currentCanvasIdentity() || getNode(node.id) !== node || snapshot !== stableStringify(node.data)) throw new Error('画布已变化，接口已保存在包库；未覆盖当前节点');
+  await nativeEditor.applyToNode(node, { ...result, rebindings: selection.rebindings, output_rebindings: selection.output_rebindings });
+  toast('外部接口已更新；已有连线和参数已核对');
+}
+async function importApiInterface(document, name, target = null) {
+  const prompt = apiPromptFromDocument(document), backend = settings.backend_url, identity = currentCanvasIdentity();
+  // Preserve API data even when an extension or schema prevents compilation.
+  const rawNode = target || addNode('generation', { title: name, kind: 'api', apiPrompt: prompt });
+  if (target) mutate(() => { target.data.apiPrompt = prompt; });
+  const signature = stableStringify(rawNode.data);
+  let info = await api('/api/interfaces/inspect', { document: { prompt } });
+  const options = { ...info, previousFields: rawNode.data.packageFields || [],
+    selectedOutputs: rawNode.data.editor_output_fields || [],
+    connections: editorConnectionSummary(graph, rawNode.id, rawNode.data.editor_output_fields || []) };
+  const ensureCurrent = () => { if (identity !== currentCanvasIdentity() || getNode(rawNode.id) !== rawNode || signature !== stableStringify(rawNode.data)) throw new Error('画布或工作流已变化，请重新导入；原始执行图已保留。'); };
+  let selection = autoEditorInterfaceSelection(options) || await chooseEditorInterface(options);
+  if (!selection) return;
+  const repaired = await completeInterfaceInputs(info, selection, { path: '/api/interfaces/inspect', payload: { document: { prompt } }, options, ensureCurrent });
+  if (!repaired) return;
+  ({ info, selection } = repaired); ensureCurrent();
+  const result = await api('/api/interfaces/apply', { prompt, name, backend_url: backend, ...selection, missing_values: repaired.missing_values });
+  if (identity !== currentCanvasIdentity() || getNode(rawNode.id) !== rawNode || signature !== stableStringify(rawNode.data)) throw new Error('画布已变化，工作流已保存在包库；未覆盖当前节点');
+  const node = rawNode;
+  await nativeEditor.applyToNode(node, { ...result, rebindings: selection.rebindings, output_rebindings: selection.output_rebindings });
+  $('#packages-dialog').close(); $('#package-editor-dialog').close();
+  try { await loadPackages(); } catch (error) { toast(`接口已应用；包库刷新失败：${error.message}`, true); }
+  toast(`已编译外部接口：${result.package.fields.length} 项参数、${result.output_nodes.length} 个输出。可点“管理外部接口”调整`);
+  if (result.readiness?.issues?.length) toast(result.readiness.issues[0].message, true);
 }
 async function ensureWorkflowBackend(node, _workflow = null, force = false) {
+  const context = nativeSessionContexts.get(node);
+  context?.assertCurrent();
   const report = await api(`/api/editor-workflows/${node.data.editor_id}/backends`, {});
+  context?.assertCurrent();
   const target = await chooseWorkflowBackend(report, node.data.editor_backend, force);
+  context?.assertCurrent();
   if (!target) return false;
   if (target !== report.current || target !== settings.backend_url) await useBackend(target);
-  if (!node.data.package_id && node.data.editor_backend !== target) mutate(() => { node.data.editor_backend = target; });
+  context?.acceptBackend(target); context?.assertCurrent();
+  if (!node.data.package_id && node.data.editor_backend !== target) {
+    mutate(() => { node.data.editor_backend = target; }); context?.rebaseTarget();
+  }
   return target;
 }
-async function prepareWorkflowBackend(targets) {
+async function prepareEditorRootBackend(context) {
+  context.assertCurrent();
+  const target = editorPreparationBackend(graph, context.target.id, settings.backend_url);
+  if (target === settings.backend_url) return;
+  const profiles = (await api('/api/engines')).profiles || []; context.assertCurrent();
+  if (!profiles.some(item => item.base_url === target && item.online)) throw new Error('工作流绑定的引擎尚未登记或未启动，请在设置中连接后再进入。');
+  await useBackend(target); context.acceptBackend(target); context.assertCurrent();
+}
+async function prepareWorkflowBackend(targets, options = {}) {
   const currentBackend = settings.backend_url;
-  const snapshot = parseGraph(serializeGraph(graph));
-  const target = workflowBackendTarget(snapshot, targets, currentBackend);
+  const snapshot = options.graph || parseGraph(serializeGraph(graph));
+  if (serializeGraph(graph) !== serializeGraph(snapshot)) throw new Error('准备工作流期间画布已变化，请重新运行');
+  const target = (options.rootOnly ? workflowRootBackendTarget : workflowBackendTarget)(snapshot, targets, currentBackend);
   if (target === currentBackend) return;
   const profiles = (await api('/api/engines')).profiles || [];
   if (settings.backend_url !== currentBackend) throw new Error('准备工作流期间推理引擎已变化，请重新运行以检查参考图片归属。');
@@ -123,6 +438,15 @@ let tool = 'select';
 let spaceDown = false;
 let uploadTarget = null;
 const referenceImports = new Map();
+const packageMediaTransfers = createMediaTransfers();
+const packageMediaOwner = node => `${currentCanvasIdentity()}:${node.id}`;
+function assertCanvasMediaReady(targets, source = graph, scoped = false) {
+  assertReferenceImportsReady(source, targets, referenceImports);
+  const needed = upstreamNodeIds(source, targets), identity = currentCanvasIdentity();
+  const fields = scoped ? new Map(source.nodes.filter(node => needed.has(node.id) && node.data.kind === 'package')
+    .map(node => [`${identity}:${node.id}`, new Set((node.data.packageFields || []).map(field => field.id))])) : null;
+  packageMediaTransfers.assertReady([...needed].map(id => `${identity}:${id}`), fields);
+}
 const referenceImportTickets = new Map();
 let workflowTarget = null;
 let saveTimer;
@@ -131,6 +455,19 @@ let restored = false;
 let submitting = new Set();
 let projectTitle = '未命名画布';
 let packages = [];
+const packageCatalog = createPackageCatalog({ api });
+const sidebarPackageLoads = new WeakMap();
+const sidebarRefreshGuards = new WeakMap();
+const packageNodeAdds = new Map();
+let activeSidebarPackage = null;
+async function ensurePackageDefinition(id) {
+  const previous = packages.find(item => item.id === id);
+  const full = await packageCatalog.ensure(id);
+  packages = packageCatalog.summaries();
+  if (packages.find(item => item.id === id) !== previous) renderNodes();
+  return full;
+}
+function rememberPackageDefinition(pack) { const full = packageCatalog.remember(pack); packages = packageCatalog.summaries(); return full; }
 let editorLibrary = [];
 let packagesLoaded = false;
 let packageDraft = null;
@@ -143,6 +480,7 @@ let diagnosticNodeId = null;
 let diagnosticBusy = false;
 const jobViews = new Map();
 const retrying = new Set();
+const controllingJobs = new Set();
 const retryRequests = new Map();
 const reusing = new Set();
 const organizingPackages = new Set();
@@ -151,6 +489,7 @@ let canvasClipboard = null;
 let pasteOffset = 0;
 let nodeMenu = null;
 let keyboardMoveBefore = null;
+let contentLayout = null;
 let studio = null;
 let workflowCanvas = null;
 let edgeScale = null;
@@ -167,7 +506,30 @@ function button(text, className, action, title) {
   const element = el('button', className, text);
   element.type = 'button';
   if (title) { element.title = title; element.setAttribute('aria-label', title); }
-  element.addEventListener('click', event => { event.stopPropagation(); Promise.resolve().then(() => action(event)).catch(reportError); });
+  // Keep the pressed button in place until click: opening the inspector on
+  // canvas pointerdown can move or cover the target before pointerup.
+  element.addEventListener('pointerdown', event => {
+    const card = element.closest('.node');
+    if (event.button === 0 && !spaceDown && tool !== 'hand' && card) {
+      nodeActionPress.begin(element, card, card._node, event.pointerId); event.stopPropagation();
+    }
+  });
+  element.addEventListener('click', event => {
+    event.stopPropagation();
+    const card = element.closest('.node');
+    if (card && !nodeActionPress.activate(element, card._node, !event.detail)) { renderNodes(); return; }
+    if (card && !element.closest('.node-input-ports')) {
+      selected = new Set([card.dataset.nodeId]); selectedEdge = null;
+      revealInspector(); renderSelection(); renderInspector(); switchTab('properties');
+    }
+    if (!card) { Promise.resolve().then(() => action(event)).catch(reportError); return; }
+    // Activation has already consumed the pointer press. Let a synchronous
+    // content transaction render its changed card before recording history.
+    nodeActionPress.finish(element);
+    try { Promise.resolve(action(event)).catch(reportError); }
+    catch (error) { reportError(error); }
+    finally { if (card) { nodeActionPress.finish(element); renderNodes(); } }
+  });
   return element;
 }
 function bind(selector, action) {
@@ -175,7 +537,11 @@ function bind(selector, action) {
 }
 function toast(message, error = false) {
   const messageElement = el('div', `toast${error ? ' error' : ''}`, message);
-  $('#toast-region').append(messageElement);
+  const region = $('#toast-region');
+  // Keep rapid import/connect feedback from covering the canvas. Error
+  // messages retain their own lifetime and are not displaced by successes.
+  if (!error) [...region.querySelectorAll('.toast:not(.error)')].slice(0, -1).forEach(item => item.remove());
+  region.append(messageElement);
   setTimeout(() => messageElement.remove(), error ? 7000 : 3500);
 }
 function reportError(error) { toast(error?.message || String(error), true); }
@@ -208,7 +574,7 @@ function ensureCanvasIdentity() {
   return canvasIdentity;
 }
 function currentCanvasIdentity() { const identity = ensureCanvasIdentity(); localStorage.setItem(CANVAS_ID_KEY, identity); return identity; }
-function replaceCanvasIdentity() { const next = crypto.randomUUID(); localStorage.setItem(CANVAS_ID_KEY, next); canvasIdentity = next; jobNodes = {}; }
+function replaceCanvasIdentity() { const next = crypto.randomUUID(); localStorage.setItem(CANVAS_ID_KEY, next); canvasIdentity = next; jobNodes = {}; expandedInputs.clear(); portBindings.clear(); contentLayout?.reset(); }
 function normalizeProjectTitle(value, fallback = '未命名画布') {
   const title = typeof value === 'string' ? value.trim().slice(0, 120) : '';
   const safeFallback = typeof fallback === 'string' ? fallback.trim().slice(0, 120) : '';
@@ -224,15 +590,32 @@ function setProjectTitle(value, fallback) {
 }
 function singleSelected() { return selected.size === 1 ? getNode([...selected][0]) : null; }
 function selectedGeneration() { const node = singleSelected(); return node?.type === 'generation' ? node : graph.nodes.find(item => item.type === 'generation'); }
-function snapshot() { return JSON.stringify({ graph, canvasIdentity: ensureCanvasIdentity(), jobNodes, projectTitle }); }
+function snapshot(includeSelection = true) {
+  return JSON.stringify({ graph, canvasIdentity: ensureCanvasIdentity(), jobNodes, projectTitle,
+    expandedInputs: [...expandedInputs],
+    portViews: savedPortViews(),
+    ...(includeSelection ? { selection: { nodes: [...selected], edge: selectedEdge } } : {}) });
+}
+function snapshotChanged(before) {
+  const previous = JSON.parse(before); delete previous.selection;
+  return JSON.stringify(previous) !== snapshot(false);
+}
 function restoreSnapshot(value) {
+  contentLayout?.reset();
   const state = JSON.parse(value);
   localStorage.setItem(CANVAS_ID_KEY, state.canvasIdentity);
   canvasIdentity = state.canvasIdentity; graph = state.graph; jobNodes = state.jobNodes || {};
+  expandedInputs.clear();
+  portBindings.clear();
+  for (const id of state.expandedInputs || []) if (getNode(id)) expandedInputs.add(id);
+  restorePortViews(state.portViews);
   setProjectTitle(state.projectTitle);
+  if (Array.isArray(state.selection?.nodes)) selected = new Set(state.selection.nodes.filter(id => getNode(id)));
+  if (state.selection) selectedEdge = state.selection.edge || null;
+  if (selectedEdge && !graph.edges.some(edge => edge.id === selectedEdge)) selectedEdge = null;
 }
 function pushHistory(before) {
-  if (before === snapshot()) return;
+  if (!snapshotChanged(before)) return;
   history.push(before);
   if (history.length > 80) history.shift();
   future = [];
@@ -242,15 +625,45 @@ function pushHistory(before) {
 function mutate(action, options = {}) {
   finishKeyboardMove();
   const before = snapshot();
-  action();
-  if (draftEditing) {
-    if (!draftEditing.recorded && before !== snapshot()) { pushHistory(before); draftEditing.recorded = true; }
-    else save();
-    return;
+  contentLayout?.begin();
+  try {
+    action();
+    if (draftEditing) {
+      if (!draftEditing.recorded && snapshotChanged(before)) { pushHistory(before); draftEditing.recorded = true; }
+      else save();
+      return;
+    }
+    // A blur/change event often recommits the last live draft value. It is
+    // only a redraw, not a new content transaction that may absorb a pending
+    // backend resize into the user's ordinary snapshot history.
+    if (!snapshotChanged(before)) {
+      contentLayout?.end();
+      renderNodes();
+      if (options.inspector !== false) renderInspector();
+      return;
+    }
+    renderNodes();
+    pushHistory(before);
+    if (options.inspector !== false) renderInspector();
+  } catch (error) {
+    restoreSnapshot(before); renderAll(); throw error;
+  } finally {
+    contentLayout?.end();
   }
-  pushHistory(before);
-  renderNodes();
-  if (options.inspector !== false) renderInspector();
+}
+function layoutHistoryEntry(positions) {
+  return { kind: 'content-layout', canvasIdentity: ensureCanvasIdentity(), positions };
+}
+function inverseHistoryEntry(entry) {
+  return entry?.kind === 'content-layout'
+    ? layoutHistoryEntry(entry.positions.flatMap(position => { const node = getNode(position.id); return node ? [{ id: node.id, x: node.x, y: node.y }] : []; }))
+    : snapshot();
+}
+function restoreHistoryEntry(entry) {
+  if (entry?.kind !== 'content-layout') return restoreSnapshot(entry);
+  contentLayout?.reset();
+  if (entry.canvasIdentity !== ensureCanvasIdentity()) return;
+  for (const position of entry.positions) { const node = getNode(position.id); if (node) { node.x = position.x; node.y = position.y; } }
 }
 function save(immediate = false) {
   clearTimeout(saveTimer);
@@ -258,6 +671,7 @@ function save(immediate = false) {
   const write = () => {
     try {
       localStorage.setItem(STORAGE_KEY, serializeGraph(graph, viewport));
+      localStorage.setItem(PORT_VIEW_STORAGE_KEY, JSON.stringify({ canvasIdentity: currentCanvasIdentity(), nodes: [...expandedInputs].filter(id => getNode(id)), views: savedPortViews() }));
       localStorage.setItem(JOB_MAP_KEY, JSON.stringify(jobNodes));
       localStorage.setItem(TITLE_STORAGE_KEY, projectTitle);
       $('#save-state').textContent = '浏览器草稿已保存';
@@ -269,7 +683,7 @@ function save(immediate = false) {
 function undo() {
   finishKeyboardMove();
   if (!history.length) return;
-  const before = snapshot(); restoreSnapshot(history.at(-1));
+  const before = inverseHistoryEntry(history.at(-1)); restoreHistoryEntry(history.at(-1));
   history.pop(); future.push(before);
   selected = new Set([...selected].filter(id => getNode(id)));
   renderAll(); save();
@@ -277,7 +691,7 @@ function undo() {
 function redo() {
   finishKeyboardMove();
   if (!future.length) return;
-  const before = snapshot(); restoreSnapshot(future.at(-1));
+  const before = inverseHistoryEntry(future.at(-1)); restoreHistoryEntry(future.at(-1));
   future.pop(); history.push(before);
   selected = new Set([...selected].filter(id => getNode(id)));
   renderAll(); save();
@@ -288,6 +702,8 @@ function viewPoint(clientX, clientY) {
   return { x: (clientX - rect.left - viewport.x) / viewport.scale, y: (clientY - rect.top - viewport.y) / viewport.scale };
 }
 function applyViewport() {
+  const scaleChanged = edgeScale !== viewport.scale;
+  const contentBeforeScale = scaleChanged ? contentLayout?.captureViewChange() : null;
   // Native layout zoom rerasterizes text at its displayed size. GPU scaling of
   // the entire world can reuse a low-resolution texture on HiDPI WebView2.
   if (globalThis.CSS?.supports('zoom', '1')) {
@@ -301,6 +717,9 @@ function applyViewport() {
   // changes need fresh pixel-rounded port centers; rebuilding on every pan
   // would replace thousands of paths unnecessarily on larger canvases.
   const visible = canvas.offsetParent !== null;
+  // CSS layout zoom rounds text metrics differently. A view change is never
+  // content growth. Preserve content already waiting for an edit to finish.
+  if (scaleChanged) contentLayout?.rebase(contentBeforeScale);
   if (edgeScale !== viewport.scale || edgeCanvasVisible !== visible) renderEdges();
   else drawMinimap();
 }
@@ -328,10 +747,26 @@ function placeNewNodes(nodes, preferredAnchor = null) {
   const preferred = preferredAnchor ? { x: preferredAnchor.x + Math.min(...rectangles.map(rect => rect.x)) - nodes[0].x, y: preferredAnchor.y + Math.min(...rectangles.map(rect => rect.y)) - nodes[0].y } : null;
   placeFragment(rectangles, occupied, preferred).forEach((position, index) => { nodes[index].x = position.x; nodes[index].y = position.y; });
 }
+function visibleCanvasArea(contentSize) {
+  const shell = canvas.closest('.canvas-shell') || canvas;
+  const groups = [
+    ['top', '.canvas-topline,.canvas-action-bar,.discovery-banner,.workflow-canvas-toolbar'],
+    ['bottom', '.canvas-footer'],
+    ['obstacle', '#minimap-button,.workflow-run-details,.workflow-menu-actions'],
+  ];
+  const overlays = groups.flatMap(([kind, selector]) => [...shell.querySelectorAll(selector)]
+    .filter(element => !element.hidden && !element.closest('details:not([open])') && element.getClientRects().length).map(element => {
+      const rect = element.getBoundingClientRect();
+      return { kind, left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height };
+    }));
+  return canvasContentArea(canvas.getBoundingClientRect(), overlays, contentSize);
+}
 function centerOnNode(node) {
   const size = nodeSize(node);
-  viewport.x = canvas.clientWidth / 2 - (node.x + size.width / 2) * viewport.scale;
-  viewport.y = Math.max(112, (canvas.clientHeight - size.height * viewport.scale) / 2) - node.y * viewport.scale;
+  const area = visibleCanvasArea(size);
+  if (area.width <= 0 || area.height <= 0) { toast('画布空间不足，请收起侧栏或浮层后重试'); return; }
+  viewport.x = area.x + area.width / 2 - (node.x + size.width / 2) * viewport.scale;
+  viewport.y = area.y + Math.max(0, (area.height - size.height * viewport.scale) / 2) - node.y * viewport.scale;
   applyViewport(); save();
 }
 function bounds(nodes = graph.nodes) {
@@ -342,11 +777,11 @@ function fitView(onlySelected = false) {
   const nodes = onlySelected ? graph.nodes.filter(node => selected.has(node.id)) : graph.nodes;
   if (onlySelected && !nodes.length) { toast('先选择需要查看的节点'); return; }
   const box = bounds(nodes);
-  const availableWidth = Math.max(100, canvas.clientWidth - 90);
-  const availableHeight = Math.max(100, canvas.clientHeight - 240);
-  viewport.scale = Math.min(1, Math.max(.2, Math.min(availableWidth / (box.maxX - box.minX), availableHeight / (box.maxY - box.minY))));
-  viewport.x = (canvas.clientWidth - (box.maxX - box.minX) * viewport.scale) / 2 - box.minX * viewport.scale;
-  viewport.y = 132 - box.minY * viewport.scale + Math.max(0, (availableHeight - (box.maxY - box.minY) * viewport.scale) / 3);
+  const area = visibleCanvasArea({ width: box.maxX - box.minX, height: box.maxY - box.minY });
+  if (area.width <= 0 || area.height <= 0) { toast('画布空间不足，请收起侧栏或浮层后重试'); return; }
+  viewport.scale = Math.min(1, Math.max(.2, Math.min(area.width / (box.maxX - box.minX), area.height / (box.maxY - box.minY))));
+  viewport.x = area.x + (area.width - (box.maxX - box.minX) * viewport.scale) / 2 - box.minX * viewport.scale;
+  viewport.y = area.y - box.minY * viewport.scale + Math.max(0, (area.height - (box.maxY - box.minY) * viewport.scale) / 3);
   applyViewport(); save();
 }
 function drawMinimap() {
@@ -466,10 +901,41 @@ function finishConnection(node, field = '') {
   if (node.data.kind === 'package' && !field) { cancelConnection(); return workflowCanvas.connectNodes(source,node.id); }
   const options = field ? {targetField:field} : {};
   if (field && getNode(source)?.type === 'prompt') options.sourceField = field === 'negative' ? 'negative' : 'text';
+  if (field && ['generation', 'result'].includes(getNode(source)?.type)) {
+    const type = generationInputPorts(node).find(item => item.id === field)?.type;
+    const available = outputChoices(graph, source, type);
+    if (available.ambiguous) { cancelConnection(); return workflowCanvas.connectNodes(source, node.id, field); }
+    if (available.choices.length === 1) options.sourceOutput = available.choices[0].id;
+    else if (available.actual.length === 1 && available.actual[0].node_id) options.sourceOutput = available.actual[0].node_id;
+    if (['image', 'video', 'audio'].includes(type)) options.sourceField = type;
+  }
   mutate(() => connect(graph,source,node.id,options)); cancelConnection(); toast('节点已连接');
 }
 let portDrag = null, suppressPortClick = false;
 const expandedInputs = new Set();
+const portBindings = new Map();
+function portBindingSignature(node) {
+  return JSON.stringify([node.data.kind, node.data.package_id, node.data.editor_id,
+    generationInputPorts(node, graph).map(field => [field.id, field.type])]);
+}
+function savedPortViews() {
+  return [...expandedInputs].flatMap(id => {
+    const node = getNode(id);
+    return node ? [{ id, binding: portBindingSignature(node), ...interfaceViewState(node, 'ports') }] : [];
+  });
+}
+function restorePortViews(views) {
+  if (!Array.isArray(views)) return;
+  for (const view of views.slice(0, 500)) {
+    const node = getNode(view?.id);
+    if (!node || !expandedInputs.has(node.id)) continue;
+    if (view.binding !== undefined && view.binding !== portBindingSignature(node)) { expandedInputs.delete(node.id); continue; }
+    Object.assign(interfaceViewState(node, 'ports'), {
+      page: Number.isSafeInteger(view.page) && view.page >= 0 ? view.page : 0,
+      query: typeof view.query === 'string' ? view.query.slice(0, 1000) : '',
+    });
+  }
+}
 function port(node, direction, field = '', label = '') {
   const element = button('', `port ${direction}${connecting?.source === node.id && direction === 'output' ? ' armed' : ''}`, () => {
     if (suppressPortClick) { suppressPortClick = false; return; }
@@ -487,30 +953,58 @@ function port(node, direction, field = '', label = '') {
   return element;
 }
 function inputPorts(node, body) {
-  const fields = generationInputPorts(node,graph).filter(field=>['text','image','video'].includes(field.type));
+  const fields = generationInputPorts(node,graph);
   if (!fields.length) return;
   const list = el('div','node-input-ports');
   const connected = new Set(graph.edges.filter(e=>e.target===node.id).map(e=>edgeInputField(graph,e)));
-  const imageFields = fields.filter(f=>f.type==='image');
-  const showCount = Math.max(2,1+imageFields.reduce((max,f,i)=>connected.has(f.id)?Math.max(max,i+1):max,0));
-  const visible = expandedInputs.has(node.id) || node.data.kind === 'package' ? fields : fields.filter(f=>f.type!=='image'||imageFields.indexOf(f)<showCount);
-  for (const field of visible) {
-    const row = el('div',`node-input-row type-${field.type}`);
-    const bound = graph.edges.find(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id);
-    const socket = port(node,'input',field.id,field.label); row.append(socket,el('span','input-port-label',field.label),el('span','input-port-type',{text:'文本',image:'图片',video:'视频'}[field.type]||field.type));
-    if (bound) { row.classList.add('connected'); row.title = `来自：${getNode(bound.source)?.data.title || '来源'}；选中连线可删除`; }
-    list.append(row);
-  }
-  if (visible.length < fields.length) list.append(button(`展开全部 ${imageFields.length} 个图片输入`,'node-action',()=>{expandedInputs.add(node.id); document.activeElement?.blur(); const card=document.getElementById(`fw-node-${node.id}`);if(card)card._signature='';renderNodes();}));
-  body.append(list);
+  const state = interfaceViewState(node, 'ports');
+  const candidates = inputPortCandidates(fields, connected);
+  if (!candidates.length) return;
+  const heading = el('div', 'node-ports-heading'); heading.append(el('span', '', '输入'), el('span', '', `${connected.size} 已连接 · ${candidates.length} 个接口`)); list.append(heading);
+  const search = el('input', 'field-input'); search.type = 'search'; search.value = state.query;
+  search.placeholder = '搜索输入名称 / ID'; search.setAttribute('aria-label', '搜索画布输入端口');
+  const rows = el('div');
+  const updateLayout = change => {
+    mutate(() => { change(); refresh(); }, { inspector: false });
+    renderEdges();
+  };
+  const refresh = () => {
+    rows.replaceChildren();
+    const expanded = expandedInputs.has(node.id);
+    search.value = state.query;
+    search.hidden = !expanded || candidates.length <= CANVAS_PORT_PAGE_SIZE;
+    const { visible, hidden, page } = visibleInputPorts(fields, connected, expanded, 4, state);
+    state.page = page.page;
+    for (const field of visible) {
+      const row = el('div',`node-input-row type-${field.type}`);
+      const bound = graph.edges.find(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id);
+      const socket = port(node,'input',field.id,field.label); row.append(socket,el('span','input-port-label',field.label),el('span','input-port-type',{text:'文本',image:'图片',video:'视频',audio:'音频'}[field.type]||field.type));
+      if (bound) { row.classList.add('connected'); row.title = `来自：${getNode(bound.source)?.data.title || '来源'}；选中连线可删除`; }
+      rows.append(row);
+    }
+    if (expanded) appendInterfacePager(rows, page, '端口', number => updateLayout(() => { state.page = number; }));
+    if (hidden || expanded && candidates.length > 4) rows.append(button(expanded ? '收起未连接接口' : `＋ 其他 ${hidden} 个接口`,'node-action port-overflow',()=>{
+      updateLayout(() => { if (expanded) expandedInputs.delete(node.id); else expandedInputs.add(node.id); });
+    }));
+  };
+  search.addEventListener('input', () => { try { updateLayout(() => { state.query = search.value; state.page = 0; }); } catch (error) { reportError(error); } });
+  list.append(search, rows); refresh(); body.append(list);
 }
 function cancelConnection() { connecting = null; canvas.classList.remove('connecting'); $('#canvas-hint').textContent = '左键框选 · 中键平移 · 双击新建 · 滚轮缩放'; renderEdges(); renderSelection(); }
 function renderNodes() {
+  for (const id of portBindings.keys()) if (!getNode(id)) { portBindings.delete(id); expandedInputs.delete(id); }
   const remaining = new Map([...nodesLayer.children].map(card => [card.dataset.nodeId, card]));
   graph.nodes.forEach((node, index) => {
+    if (node.type === 'generation') {
+      const binding = portBindingSignature(node);
+      if (portBindings.has(node.id) && portBindings.get(node.id) !== binding) {
+        expandedInputs.delete(node.id); Object.assign(interfaceViewState(node, 'ports'), { page: 0, query: '' });
+      }
+      portBindings.set(node.id, binding);
+    }
     const previous = remaining.get(node.id); remaining.delete(node.id);
-    const signature = JSON.stringify([node.data, referenceImports.get(node.id), index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => [edge, getNode(edge.source)?.data]), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
-    if (previous && previous._node === node && (previous._signature === signature || previous.contains(document.activeElement) && document.activeElement.matches('input,textarea,select,[contenteditable=true]'))) {
+    const signature = JSON.stringify([node.data, expandedInputs.has(node.id), referenceImports.get(node.id), index, submitting.has(node.id), graph.edges.filter(edge => edge.target === node.id).map(edge => [edge, getNode(edge.source)?.data]), node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null]);
+    if (previous && previous._node === node && (nodeActionPress.preserves(previous, node) || previous._signature === signature || previous.contains(document.activeElement) && document.activeElement.matches('input,textarea,select,[contenteditable=true]'))) {
       previous.style.left = `${node.x}px`; previous.style.top = `${node.y}px`; previous.classList.toggle('selected', selected.has(node.id));
       if (nodesLayer.children[index] !== previous) nodesLayer.insertBefore(previous, nodesLayer.children[index] || null);
       return;
@@ -530,64 +1024,74 @@ function renderNodes() {
       body.append(text); card.append(body);
       const footer = el('div', 'node-footer'); footer.append(el('span', '', `${node.data.text.length} 字 · 可连接多个生成节点`), button('复制提示词 ↗', 'node-action', () => copyText(node.data.text))); card.append(footer, port(node, 'output'));
     } else if (node.type === 'generation') {
-      inputPorts(node,body);
       const pack = node.data.kind === 'package' ? packages.find(item => item.id === node.data.package_id) : null;
-      const labels = el('div', 'port-label'); labels.append(el('span', '', node.data.kind === 'package' ? 'INPUT / 连线与表单' : 'INPUT / 提示词与参考'), el('span', '', 'OUTPUT'));
-      body.append(labels, el('span', 'model-chip', node.data.kind === 'package' ? '可复用工作流包' : node.data.kind.startsWith('h3') ? 'MiniMax H3 · 本地推理' : node.data.kind === 'api' ? 'API 工作流 · 高级' : `${node.data.kind.startsWith('qwen21_') ? 'Qwen Image 2.1' : node.data.kind === 'krea' ? 'Krea 2' : 'SDXL'} · 本地推理`));
-      const summary = el('div', 'generation-summary');
-      const stats = node.data.kind === 'package' ? [['工作流', pack?.name || (node.data.editor_id ? '原生工作流 · 待应用' : '待导入对应包')], ['可填输入', pack?.fields?.length ?? '—'], ['执行', '本地引擎'], ['操作', '填写 → 生成']] : node.data.kind === 'api' ? [['工作流', '已导入 API'], ['节点', Object.keys(node.data.apiPrompt || {}).length], ['执行', '本地引擎'], ['编辑', '原始 JSON']] : [['尺寸', `${node.data.width} × ${node.data.height}`], ['模式', node.data.kind.startsWith('h3') ? `${node.data.seconds}s · ${node.data.fps}fps` : '静态图像'], ['采样步数', node.data.steps], ['种子', node.data.seed]];
-      stats.forEach(([name, value]) => { const stat = el('div', 'stat'); stat.append(el('span', '', name), el('strong', '', value)); summary.append(stat); });
-      body.append(summary);
-      let prompt = ''; try { prompt = generationPayload(graph, node.id).positive; } catch { /* API import has no prompt yet. */ }
-      body.append(el('p', 'node-prompt-summary', node.data.kind === 'package' ? pack?.description || (pack ? '连接提示词或上游图片，也可在右侧填写输入。运行时自动完成上游依赖。' : node.data.editor_id ? '先提取外层参数，或复用已保存的完整工作流配置。' : '本机包库中还没有对应工作流包，请先导入。') : node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
-      if (pack) {
-        const inputs = el('div', 'node-workflow-inputs');
-        for (const definition of pack.fields.filter(f => ['text', 'image', 'video'].includes(f.type)).slice(0, 6)) {
-          const link = workflowCanvas?.describeInput(node.id, definition);
-          inputs.append(el('span', '', `${link ? '●' : '○'} ${definition.label}${link ? ` ← ${getNode(link.edge.source)?.data.title || '来源'}` : ''}`));
+      if (node.data.kind === 'package') {
+        card.classList.add('node-package');
+        const view = packageNodePresentation(node, pack);
+        const overview = el('div', 'package-node-overview');
+        overview.append(el('span', 'package-node-kind', '工作流包'), el('strong', 'package-node-name', view.name));
+        const counts = el('div', 'package-node-counts'); counts.append(el('span', '', view.inputs), el('span', '', view.outputs)); overview.append(counts);
+        body.append(overview);
+        if (node.data.editor_id && !pack) {
+          body.append(button('提取外层参数', 'button primary prepare-workflow', () => nativeEditor.prepare(node)), button('复用已保存配置', 'button quiet reuse-workflow', () => workflowConfigurations.choose(node)));
         }
-        body.append(inputs);
+        const actions = el('div', 'package-node-actions');
+        actions.append(button(!node.data.package_id && !node.data.editor_id ? '选择工作流' : '进入工作流 ↗', 'button quiet enter-workflow', () => openNodeWorkflow(node)));
+        if (pack) actions.append(button('管理外部接口', 'button quiet manage-package-interface', () => configurePackageInterface(node)));
+        actions.append(editorMediaSyncButton(node));
+        body.append(actions, el('p', 'package-node-hint', view.hint));
+        inputPorts(node, body);
+        if (pack?.description) { const description = el('p', 'node-prompt-summary package-node-description', pack.description); description.title = pack.description; body.append(description); }
+      } else {
+        inputPorts(node, body);
+        const labels = el('div', 'port-label'); labels.append(el('span', '', 'INPUT / 提示词与参考'), el('span', '', 'OUTPUT'));
+        body.append(labels, el('span', 'model-chip', node.data.kind.startsWith('h3') ? 'MiniMax H3 · 本地推理' : node.data.kind === 'api' ? 'API 工作流 · 高级' : `${node.data.kind.startsWith('qwen21_') ? 'Qwen Image 2.1' : node.data.kind === 'krea' ? 'Krea 2' : 'SDXL'} · 本地推理`));
+        const summary = el('div', 'generation-summary');
+        const stats = node.data.kind === 'api' ? [['工作流', '已导入 API'], ['节点', Object.keys(node.data.apiPrompt || {}).length], ['执行', '本地引擎'], ['编辑', '原始 JSON']] : [['尺寸', `${node.data.width} × ${node.data.height}`], ['模式', node.data.kind.startsWith('h3') ? `${node.data.seconds}s · ${node.data.fps}fps` : '静态图像'], ['采样步数', node.data.steps], ['种子', node.data.seed]];
+        stats.forEach(([name, value]) => { const stat = el('div', 'stat'); stat.append(el('span', '', name), el('strong', '', value)); summary.append(stat); });
+        body.append(summary);
+        let prompt = ''; try { prompt = generationPayload(graph, node.id).positive; } catch { /* API import has no prompt yet. */ }
+        body.append(el('p', 'node-prompt-summary', node.data.kind === 'api' ? '保留原始 ComfyUI API 节点与参数，按完整工作流执行。' : prompt || '连接提示词节点，或在右侧填写画面描述。'));
+        body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => openNodeWorkflow(node)), editorMediaSyncButton(node));
       }
-      if (node.data.editor_id && !pack) {
-        body.append(button('提取外层参数', 'button primary prepare-workflow', () => nativeEditor.prepare(node)), button('复用已保存配置', 'button quiet reuse-workflow', () => workflowConfigurations.choose(node)));
-      }
-      body.append(button('↗  进入工作流', 'button quiet enter-workflow', () => openNodeWorkflow(node)));
-      if (node.data.editor_id && pack) body.append(button('配置外层参数与输出', 'button quiet', () => configureNativePanel(node)));
-      const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || node.data.kind==='package' && !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id;
+      const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary run-node', () => runNode(node.id)); run.disabled = submitting.has(node.id) || workflowCanvas?.isRunning() || node.data.kind==='package' && !node.data.package_id; run.dataset.runNode = node.id;
       const live = el('div','node-live-progress'); live.dataset.liveNode = node.id; live.hidden = true;
-      const detail = el('p','live-detail'); const bar = el('progress'); bar.max = 100; bar.setAttribute('aria-label','当前节点采样进度'); const img = el('img','live-preview'); img.alt = '采样中间预览，尚未完成'; img.hidden = true;
-      live.append(detail,bar,img); body.append(run,live); card.append(body);
+      const detail = el('p','live-detail'); const bar = el('progress'); bar.max = 100; bar.setAttribute('aria-label','当前节点执行进度'); const img = el('img','live-preview'); img.alt = '节点中间预览，尚未完成'; img.hidden = true;
+      live.append(detail,bar,img,el('small','live-preview-status')); body.append(run,live); card.append(body);
       const footer = el('div', 'node-footer');
       const status = el('span', 'node-status', '○ 等待提交'); status.dataset.nodeStatus = node.id;
       footer.append(status, button('检查环境', 'node-action', () => runDiagnostics(node))); card.append(footer, ...(node.data.kind==='package'||generationInputPorts(node,graph).length ? [] : [port(node,'input')]), port(node, 'output'));
     } else if (node.type === 'reference') {
       const pending = referenceImports.get(node.id);
-      if (pending?.previewURL) { const media = el(pending.mediaType === 'video' ? 'video' : 'img', 'reference-media'); media.src = pending.previewURL; media.draggable = false; if (pending.mediaType === 'video') { media.controls = true; media.preload = 'metadata'; } body.append(media); }
-      else if (node.data.url) { const media = outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.localFilename || node.data.name }, 'reference-media', node.data.mediaType === 'video'); media.draggable = false; body.append(media); }
-      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '点击选素材，或拖到这里'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此素材' : '图片 / 视频 · 无需启动推理引擎')); body.append(drop); }
-      body.append(el('div', 'reference-name', node.data.localFilename || node.data.name || '图片 20 MiB · 视频 200 MiB'));
+      if (pending?.previewURL) { const media = el(['video','audio'].includes(pending.mediaType) ? pending.mediaType : 'img', 'reference-media'); media.src = pending.previewURL; media.draggable = false; if (['video','audio'].includes(pending.mediaType)) { media.controls = true; media.preload = 'metadata'; } body.append(media); }
+      else if (node.data.url) { const media = outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.localFilename || node.data.name }, 'reference-media', ['video','audio'].includes(node.data.mediaType)); media.draggable = false; body.append(media); }
+      else { const drop = button('', 'reference-drop', () => chooseReference(node.id)); drop.append(el('span', 'large', node.data.name ? '▧' : '＋'), el('span', '', node.data.name ? '已复用素材引用 · 点击更换' : '点击选素材，或拖到这里'), el('span', 'field-help', node.data.name ? '运行前确认原引擎仍保留此素材' : '图片 / 视频 / 音频 · 可离线预览')); body.append(drop); }
+      body.append(el('div', 'reference-name', node.data.localFilename || node.data.name || '图片 / 音频 20 MiB · 视频 200 MiB'));
       const importState = referenceImports.get(node.id);
       if (importState?.message) body.append(el('p', `reference-import-state${importState.error ? ' error' : ''}`, importState.message));
-      else if (node.data.localAssetId) body.append(el('p', 'reference-import-state', '素材已保存在客户端 · 生成时自动传入引擎'));
+      else if (node.data.localAssetId) body.append(el('p', 'reference-import-state', node.data.name && node.data.uploadBackend === settings.backend_url
+        ? '本地副本已保存 · 已传入当前引擎' : '素材已保存在客户端 · 生成时自动传入引擎'));
+      if (importState?.error && (node.data.localAssetId || node.data.name)) body.append(button('保留原素材', 'button quiet', () => { referenceImportTickets.delete(node.id); referenceImports.delete(node.id); renderNodes(); }));
       card.append(body);
-      const footer = el('div', 'node-footer'); footer.append(el('span', '', { start: '首帧参考', end: '尾帧参考', reference: '角色 / 场景参考' }[node.data.role] || '参考素材'), button('更换素材', 'node-action', () => chooseReference(node.id))); card.append(footer, port(node, 'output'));
+      const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.mediaType === 'audio' ? '音频参考' : node.data.mediaType === 'video' ? '视频参考' : { start: '首帧参考', end: '尾帧参考', reference: '角色 / 场景参考' }[node.data.role] || '参考素材'), button('更换素材', 'node-action', () => chooseReference(node.id))); card.append(footer, port(node, 'output'));
     } else {
       const outputs = Array.isArray(node.data.outputs) ? node.data.outputs : [];
       if (outputs.length) {
-        body.append(outputMedia(outputs[0], outputs[0].type === 'video' ? 'output-video' : 'output-image'));
-        const caption = el('div', 'output-caption'); caption.append(el('span', '', outputs[0].type === 'video' ? 'VIDEO · 本地输出' : 'IMAGE · 本地输出'), button('大图预览 ↗', 'node-action', () => preview(outputs[0]))); body.append(caption);
+        body.append(outputMedia(outputs[0], {video:'output-video',audio:'output-audio',image:'output-image'}[outputs[0].type] || 'output-image'));
+        const caption = el('div', 'output-caption'); caption.append(el('span', '', `${{video:'VIDEO',audio:'AUDIO',image:'IMAGE'}[outputs[0].type] || 'MEDIA'} · 本地输出`), button(outputs[0].type === 'image' ? '大图预览 ↗' : '播放预览 ↗', 'node-action', () => preview(outputs[0]))); body.append(caption);
         if (outputs[0].type === 'image') {
           const edit = el('div','inspector-actions'); edit.append(button('接入 Qwen 多图编辑','button quiet compact',()=>editOutput(node,outputs[0],'qwen21_edit')),button('接入重绘','button quiet compact',()=>editOutput(node,outputs[0],'sdxl_i2i'))); body.append(edit);
         }
+        body.append(button('传入工作流…', 'button quiet compact', () => passResultToWorkflow(node, outputs[0])));
         if (outputs.length > 1) body.append(button(`查看全部 ${outputs.length} 个输出 →`, 'node-action', () => switchTab('jobs')));
       } else {
-        const placeholder = el('div', 'output-placeholder'), headline = el('strong', '', '等待第一帧灵感'), detail = el('p', '', '连接生成节点并运行，实际图像与视频将在这里呈现。');
+        const placeholder = el('div', 'output-placeholder'), headline = el('strong', '', '等待生成产物'), detail = el('p', '', '连接生成节点并运行，图片、视频与音频将在这里呈现。');
         headline.dataset.resultHeadline = node.data.jobId; detail.dataset.resultDetail = node.data.jobId;
         placeholder.append(el('span', 'empty-icon', '▻'), headline, detail); body.append(placeholder);
         const caption = el('div', 'output-caption'), state = el('span', '', '未生成'); state.dataset.resultStatus = node.data.jobId;
         caption.append(el('span', '', 'OUTPUT / 本地媒体'), state); body.append(caption);
       }
-      card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', 'IMAGE / VIDEO')); card.append(footer, port(node, 'input'), port(node, 'output'));
+      card.append(body); const footer = el('div', 'node-footer'); footer.append(el('span', '', node.data.jobId ? `任务 ${node.data.jobId.slice(0, 8)}` : '结果会自动保存到本机'), el('span', '', '图片 / 视频 / 音频')); card.append(footer, port(node, 'input'), port(node, 'output'));
     }
     if (previous) { releaseMedia(previous); previous.replaceWith(card); }
     if (nodesLayer.children[index] !== card) nodesLayer.insertBefore(card, nodesLayer.children[index] || null);
@@ -598,6 +1102,7 @@ function renderNodes() {
   updateCanvasActions();
   updateNodeJobStatus();
   workflowCanvas?.refresh();
+  contentLayout?.rendered();
   requestAnimationFrame(renderEdges);
 }
 function renderSelection() {
@@ -623,7 +1128,7 @@ function field(label, value, onChange, options = {}) {
   const input = el(options.multiline ? 'textarea' : options.select ? 'select' : 'input');
   input.setAttribute('aria-label', label);
   if (options.select) {
-    options.select.forEach(option => { const item = el('option', '', typeof option === 'string' ? option : option.label); item.value = typeof option === 'string' ? option : option.value; input.append(item); });
+    options.select.forEach(option => { const item = el('option', '', typeof option === 'string' ? option : option.label); item.value = typeof option === 'string' ? option : option.value; item.disabled = typeof option === 'object' && !!option.disabled; input.append(item); });
   } else if (!options.multiline) input.type = options.number ? 'number' : 'text';
   if (options.multiline) input.rows = options.rows || 4;
   if (options.readonly) input.readOnly = true;
@@ -647,7 +1152,7 @@ function field(label, value, onChange, options = {}) {
   };
   if (!options.select && options.live !== false) bindDraft(input, commit, !!options.number);
   input.addEventListener('change', () => {
-    if (input.readOnly) return;
+    if (input.readOnly || input.disabled) return;
     const next = options.number ? Number(input.value) : input.value;
     if (options.number && (input.value.trim() === '' || !Number.isFinite(next) || !input.checkValidity())) { toast(`「${label}」请输入范围内的数字，已恢复上次有效值`, true); input.value = acceptedValue; return; }
     commit(next);
@@ -692,8 +1197,122 @@ function modelField(node, label, key) {
   if (current && !values.includes(current)) values.unshift(current);
   return field(label, current, value => mutate(() => { node.data.models = { ...node.data.models, [key]: value }; }, { inspector: false }), { select: [{ value: '', label: key === 'lora' ? '不使用 LoRA' : '自动匹配可用模型' }, ...values.map(value => ({ value, label: key === 'lora' ? `${/turbo|lightning|lcm|hyper|\d[_-]?step/i.test(value) ? '加速' : '风格 / 适配'} · ${value}` : value }))], help: values.length ? `${values.length} 个可选模型` : '连接引擎后读取模型目录' });
 }
+const interfaceViews = new WeakMap();
+function interfaceViewState(owner, name) {
+  let views = interfaceViews.get(owner);
+  if (!views) { views = new Map(); interfaceViews.set(owner, views); }
+  if (!views.has(name)) views.set(name, { page: 0, query: '' });
+  return views.get(name);
+}
+function appendInterfacePager(container, page, name, onPage) {
+  if (page.pages <= 1) return;
+  const controls = el('div', 'inspector-actions');
+  const previous = button(`${name}上一页`, 'button quiet compact', () => onPage(page.page - 1)); previous.disabled = page.page === 0;
+  const next = button(`${name}下一页`, 'button quiet compact', () => onPage(page.page + 1)); next.disabled = page.page === page.pages - 1;
+  controls.append(previous, el('span', 'field-help', `${page.page + 1}/${page.pages} 页 · ${page.total} 项`), next);
+  container.append(controls);
+}
+function renderInterfaceList(container, items, state, name, renderItem, extraActions = null) {
+  const toolbar = el('div');
+  const search = el('input', 'field-input'); search.type = 'search'; search.value = state.query;
+  search.placeholder = '搜索名称、ID、节点或输入…'; search.setAttribute('aria-label', `搜索${name}`);
+  const count = el('p', 'form-note'), rows = el('div');
+  const refresh = () => {
+    rows.replaceChildren();
+    const matching = interfaceSearch(items, state.query), page = interfacePage(matching, state.page); state.page = page.page;
+    count.textContent = `筛选 ${matching.length}/${items.length} 项 · 每页最多 ${INTERFACE_PAGE_SIZE} 项`;
+    appendInterfacePager(rows, page, name, number => { state.page = number; refresh(); });
+    if (!matching.length) rows.append(el('p', 'form-note', '没有匹配的输入。'));
+    for (const item of page.items) renderItem(item, rows);
+  };
+  search.addEventListener('input', () => { state.query = search.value; state.page = 0; refresh(); });
+  if (items.length > INTERFACE_PAGE_SIZE) toolbar.append(search, count);
+  if (extraActions) extraActions(toolbar, () => interfaceSearch(items, state.query), refresh);
+  container.append(toolbar, rows); refresh();
+}
+function renderInputPortSettings(wrap, node) {
+  const connectedPorts = graph.edges.filter(edge => edge.target === node.id).map(edge => edgeInputField(graph, edge));
+  const ports = inputPortCandidates(generationInputPorts(node,graph), connectedPorts);
+  if (!ports.length) return;
+  const details=el('details','input-port-settings'); details.append(el('summary','',`输入端口用途与连接 · ${ports.length} 项`));
+  renderInterfaceList(details, ports, interfaceViewState(node, 'purposes'), '输入用途', (port, area) => {
+    const edges = graph.edges.filter(e=>e.target===node.id&&edgeInputField(graph,e)===port.id);
+    const row=field(port.label,port.label,value=>mutate(()=>{node.data.inputLabels={...(node.data.inputLabels||{})};if(value.trim())node.data.inputLabels[port.id]=value.trim().slice(0,80);else delete node.data.inputLabels[port.id];}),{help:edges.length?`来自 ${edges.map(edge=>`${getNode(edge.source)?.data.title || '来源已缺失'}${edge.sourceField === 'negative' ? '（负向）' : ''}${Number.isSafeInteger(edge.sourceOccurrence) && edge.sourceOccurrence > 0 ? `（第${edge.sourceOccurrence + 1}次引用）` : ''}`).join('、')}；此名称只说明用途，不会改变工作流本身的输入顺序。`:port.type==='text'?'可为文本入口命名；只改变显示名称，不改变内部绑定。':'可命名为场景参考、人物参考等；请在提示词中明确各素材用途。'});
+    if(edges.length) row.append(button(edges.length>1?'断开此输入的全部连接':'断开此输入','node-action',()=>mutate(()=>removeEdges(graph,edges.map(edge=>edge.id)))));area.append(row);
+  });
+  wrap.append(details);
+}
+function packageMediaPreview(node, definition, value) {
+  const owner = node.data.packageMediaBackends?.[definition.id], type = fieldType(definition);
+  if (!['image', 'audio', 'video'].includes(type) || !owner || owner.name !== value ||
+      owner.backend !== settings.backend_url || !/^\/api\/media\/[a-f0-9]{32}$/.test(owner.preview_url || '')) return null;
+  const url = mediaURL(owner.preview_url);
+  return url ? { type, url, filename: value } : null;
+}
+function watchPackageSidebar(panel) {
+  let guard = sidebarRefreshGuards.get(panel);
+  if (guard) return guard;
+  guard = { pressed: null, pending: new Map() }; sidebarRefreshGuards.set(panel, guard);
+  panel.addEventListener('pointerdown', event => { if (event.button === 0) guard.pressed = event.pointerId; }, true);
+  const release = event => {
+    if (guard.pressed === null || event?.pointerId != null && event.pointerId !== guard.pressed) return;
+    guard.pressed = null;
+    // Native click follows pointerup synchronously; do not rebuild its target in a microtask.
+    requestAnimationFrame(() => {
+      const pending = [...guard.pending]; guard.pending.clear();
+      for (const [node, loading] of pending) refreshPackageSidebar(node, loading);
+    });
+  };
+  document.addEventListener('pointerup', release, true);
+  document.addEventListener('pointercancel', release, true);
+  window.addEventListener('blur', () => release(), true);
+  return guard;
+}
+function refreshPackageSidebar(node, loading) {
+  if (sidebarPackageLoads.get(node) !== loading || currentCanvasIdentity() !== loading.identity ||
+      getNode(node.id) !== node || node.data.package_id !== loading.packageId || singleSelected() !== node) return;
+  const panel = $('#properties-panel'), active = document.activeElement;
+  const guard = watchPackageSidebar(panel);
+  if (guard.pressed !== null) { guard.pending.set(node, loading); return; }
+  if (panel.contains(active) && active?.matches?.('input,textarea,select,[contenteditable=true]')) {
+    if (!loading.refreshDeferred) {
+      loading.refreshDeferred = true;
+      panel.addEventListener('focusout', () => {
+        loading.refreshDeferred = false;
+        requestAnimationFrame(() => refreshPackageSidebar(node, loading));
+      }, { once: true });
+    }
+    return;
+  }
+  renderInspector();
+}
 function renderPackageInputs(wrap, node) {
-  const pack = packages.find(item => item.id === node.data.package_id);
+  const identity = currentCanvasIdentity(), packageId = node.data.package_id;
+  if (activeSidebarPackage && (activeSidebarPackage.node !== node || activeSidebarPackage.identity !== identity || activeSidebarPackage.packageId !== packageId)) activeSidebarPackage = null;
+  const pack = packageCatalog.peek(packageId) || activeSidebarPackage?.full;
+  if (!pack && packageId) {
+    watchPackageSidebar($('#properties-panel'));
+    let loading = sidebarPackageLoads.get(node);
+    if (!loading || loading.identity !== identity || loading.packageId !== packageId || loading.status === 'ready') {
+      loading = { identity, packageId, status: 'loading', error: '' }; sidebarPackageLoads.set(node, loading);
+      ensurePackageDefinition(packageId).then(full => {
+        if (sidebarPackageLoads.get(node) !== loading) return;
+        loading.status = 'ready';
+        if (currentCanvasIdentity() === identity && getNode(node.id) === node && node.data.package_id === packageId && singleSelected() === node) {
+          if (!packageCatalog.peek(packageId)) activeSidebarPackage = { node, identity, packageId, full };
+          refreshPackageSidebar(node, loading);
+        }
+      }).catch(error => {
+        if (sidebarPackageLoads.get(node) !== loading) return;
+        loading.status = 'error'; loading.error = error.message || '读取失败';
+        refreshPackageSidebar(node, loading);
+      });
+    }
+    wrap.append(el('p', 'model-note', loading.status === 'error' ? `无法读取完整工作流定义：${loading.error}` : '正在按需读取完整工作流参数…已有画布接口仍保留。'));
+    if (loading.status === 'error') wrap.append(button('重试读取工作流参数', 'button quiet', () => { sidebarPackageLoads.delete(node); renderInspector(); }));
+    wrap.append(button('进入工作流 · 修复', 'button quiet', () => openNodeWorkflow(node)), button('导入对应工作流包', 'button quiet', openPackages));
+    return;
+  }
   const tools = el('details', 'workflow-configuration-tools');
   tools.append(el('summary', '', '工作流结构 · 保存与复用配置'));
   if (node.data.editor_id) {
@@ -717,20 +1336,27 @@ function renderPackageInputs(wrap, node) {
   section(wrap, '工作流输入', `${pack.fields.length} / INPUTS`);
   if (!pack.fields.length) wrap.append(el('p', 'form-note', '此包使用固定参数，可以直接检查环境并运行。'));
   const values = { ...defaultValues(pack.fields), ...(node.data.packageValues || {}) };
-  for (const definition of pack.fields) {
+  renderInterfaceList(wrap, pack.fields, interfaceViewState(node, 'package-inputs'), '工作流参数', (definition, area) => {
     const type = fieldType(definition), value = values[definition.id];
     const label = `${definition.label || definition.input}${definition.required ? ' *' : ''}`;
-    const change = (raw, mediaBackend = '') => {
+    const owner = packageMediaOwner(node);
+    const change = (raw, mediaBackend = '', previewURL = '') => {
       try {
         const next = coerceFieldValue(definition, raw);
         mutate(() => {
           node.data.packageValues = { ...(node.data.packageValues || {}), [definition.id]: next };
-          if (type === 'image' || type === 'audio') {
+          if (['image', 'audio', 'video'].includes(type)) {
             node.data.packageMediaBackends = { ...(node.data.packageMediaBackends || {}) };
-            if (mediaBackend) node.data.packageMediaBackends[definition.id] = { name: next, backend: mediaBackend };
+            if (mediaBackend) {
+              const record = { name: next, backend: mediaBackend };
+              if (mediaBackend === settings.backend_url && /^\/api\/media\/[a-f0-9]{32}$/.test(previewURL) && mediaURL(previewURL)) record.preview_url = previewURL;
+              node.data.packageMediaBackends[definition.id] = record;
+            }
             else delete node.data.packageMediaBackends[definition.id];
           }
         }, { inspector: false });
+        packageMediaTransfers.discard(packageMediaOwner(node), definition.id);
+        return true;
       } catch (error) { if (!draftEditing) { reportError(error); renderInspector(); } return false; }
     };
     let control;
@@ -739,70 +1365,101 @@ function renderPackageInputs(wrap, node) {
       const input = el('input'); input.type = 'checkbox'; input.checked = value === true; input.setAttribute('aria-label', label); input.addEventListener('change', () => change(input.checked));
       control.append(input, el('span', '', label));
     } else if (type === 'select') {
-      control = field(label, String((definition.options || []).findIndex(option => Object.is(option, value))), selectedIndex => change(definition.options[Number(selectedIndex)]), { select: (definition.options || []).map((option, index) => ({ value: String(index), label: String(option) })) });
-    } else if (type === 'video') {
-      control = field(label,value,change,{help:'可从画布的视频素材节点连接，或选择 MP4 / WebM / MOV（最大 200 MiB）。'});
-      const input=el('input');input.type='file';input.accept='.mp4,.webm,.mov';input.hidden=true;
-      const upload=button('选择参考视频','button quiet compact',()=>input.click());
+      const selection = selectFieldState(definition, value);
+      if (selection.state === 'empty' || selection.state === 'unproven') {
+        control = field(label, selection.currentLabel, () => false, { readonly: true, live: false, help: selection.help });
+      } else {
+        const choices = selection.state === 'stale'
+          ? [{ value: 'preserved', label: `${selection.currentLabel} · 当前名称不可用`, disabled: true }, ...selection.choices]
+          : selection.choices;
+        control = field(label, selection.selectedIndex < 0 ? 'preserved' : String(selection.selectedIndex), selectedIndex => {
+          if (!/^(0|[1-9]\d*)$/.test(selectedIndex) || Number(selectedIndex) >= definition.options.length) return false;
+          return change(definition.options[Number(selectedIndex)]);
+        }, { select: choices, help: selection.help });
+      }
+    } else if (type === 'video' || type === 'audio') {
+      const mediaName = type === 'audio' ? '音频' : '视频';
+      control = field(label,value,change,{help:type === 'audio' ? '可连接画布的音频素材，或选择 WAV / MP3 / FLAC / OGG（最大 20 MiB）。' : '可从画布的视频素材节点连接，或选择 MP4 / WebM / MOV（最大 200 MiB）。'});
+      const input=el('input');input.type='file';input.accept=type === 'audio' ? '.wav,.mp3,.flac,.ogg' : '.mp4,.webm,.mov';input.hidden=true;
+      const upload=button(`选择参考${mediaName}`,'button quiet compact',()=>input.click());
       input.addEventListener('change',()=>{
         const file=input.files?.[0];input.value='';if(!file)return;upload.disabled=true;
         const identity=currentCanvasIdentity(), packageId=node.data.package_id, backend=settings.backend_url;
-        (async()=>{const asset=await storeLocalMedia(file);if(asset.media_type!=='video')throw new Error('请选择视频素材');
+        const ticket=packageMediaTransfers.start(owner,definition.id,label);renderInspector();
+        (async()=>{const asset=await storeLocalMedia(file);if(asset.media_type!==type)throw new Error(`请选择${mediaName}素材`);
           const uploaded=await api(`/api/assets/media/${asset.asset_id}/backend-input`,{package_id:packageId,field_id:definition.id});
-          if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||node.data.package_id!==packageId||backend!==settings.backend_url||uploaded.backend!==backend)throw new Error('工作流或引擎已变化，本次视频已保存在本地，请重新选择');
-          change(uploaded.name,uploaded.backend);renderInspector();toast('视频已接入此工作流输入');
-        })().catch(reportError).finally(()=>{upload.disabled=false;});
+          if(!packageMediaTransfers.current(ticket))return;
+          if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||node.data.package_id!==packageId||backend!==settings.backend_url||uploaded.backend!==backend)throw new Error('工作流或引擎已变化，本次素材已保存在本地，请重新选择');
+          if(change(uploaded.name,uploaded.backend,uploaded.url)===false)throw new Error('媒体字段校验未通过，请重新选择或保留原值');renderInspector();toast(`${mediaName}已接入此工作流输入`);
+        })().catch(error=>{packageMediaTransfers.fail(ticket,error);reportError(error);renderInspector();}).finally(()=>{upload.disabled=false;});
       });control.append(upload,input);
-    } else if (type === 'image' || type === 'audio') {
-      control = field(label, value, change, { help: type === 'audio' ? '上传 WAV / MP3 / FLAC / OGG，最大 20 MiB。' : '上传 PNG / JPG / WebP，或使用后端已有的相对文件名。' });
-      const input = el('input'); input.type = 'file'; input.accept = type === 'audio' ? '.wav,.mp3,.flac,.ogg' : 'image/png,image/jpeg,image/webp'; input.hidden = true;
-      const upload = button(type === 'audio' ? '选择参考音频' : '选择本地参考图', 'button quiet compact', () => input.click());
+    } else if (type === 'image') {
+      control = field(label, value, change, { help: '上传 PNG / JPG / WebP，或使用后端已有的相对文件名。' });
+      const input = el('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'; input.hidden = true;
+      const upload = button('选择本地参考图', 'button quiet compact', () => input.click());
       input.addEventListener('change', () => {
         const file = input.files?.[0]; input.value = ''; if (!file) return;
         upload.disabled = true;
-        const operation = type === 'audio' ? (async () => {
-          if (file.size > 20 * 1024 * 1024) throw new Error('参考音频最大 20 MiB');
-          const bytes = new Uint8Array(await file.arrayBuffer()); let raw = '';
-          for (let i = 0; i < bytes.length; i += 8192) raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
-          const uploadBackend = settings.backend_url;
-          const uploaded = await api('/api/upload-audio', { data: btoa(raw) });
-          if (!uploaded?.name || !uploaded.backend || uploaded.backend !== uploadBackend || settings.backend_url !== uploadBackend) throw new Error('上传期间推理引擎发生了切换，或服务未确认音频来源。本次音频不会写入工作流，请在目标引擎下重新上传。');
-          return uploaded;
-        })() : uploadImage(file);
-        operation.then(uploaded => {
-          if (!getNode(node.id)) return;
-          if (settings.backend_url !== uploaded.backend) throw new Error('上传期间推理引擎发生了切换，本次媒体来源无法确认。请在目标引擎下重新上传。');
-          change(uploaded.name, uploaded.backend); renderInspector(); toast('参考素材已保存到本地推理服务');
-        }).catch(reportError).finally(() => { upload.disabled = false; });
+        const identity=currentCanvasIdentity(), packageId=node.data.package_id, backend=settings.backend_url;
+        const ticket=packageMediaTransfers.start(owner,definition.id,label);renderInspector();
+        uploadImage(file).then(uploaded => {
+          if (!packageMediaTransfers.current(ticket)) return;
+          if (identity!==currentCanvasIdentity() || getNode(node.id)!==node || node.data.package_id!==packageId || settings.backend_url!==backend || backend!==uploaded.backend) throw new Error('上传期间工作流或引擎发生了变化，本次媒体未应用。请重新选择。');
+          if(change(uploaded.name, uploaded.backend, uploaded.url)===false)throw new Error('媒体字段校验未通过，请重新选择或保留原值'); renderInspector(); toast('参考素材已保存到本地推理服务');
+        }).catch(error => { packageMediaTransfers.fail(ticket,error);reportError(error);renderInspector(); }).finally(() => { upload.disabled = false; });
       });
       control.append(upload, input);
     } else {
       control = field(label, value, change, { multiline: type === 'text', rows: 3, number: ['integer', 'number'].includes(type), min: definition.min, max: type === 'integer' ? Math.min(Number.MAX_SAFE_INTEGER, definition.max ?? Number.MAX_SAFE_INTEGER) : definition.max, step: type === 'integer' ? 1 : 'any' });
     }
     control.dataset.packageField = definition.id;
+    const uploadedPreview = packageMediaPreview(node, definition, value);
+    if (uploadedPreview) {
+      const media = outputMedia(uploadedPreview, 'reference-image', true);
+      media.style.maxWidth = '100%'; media.style.maxHeight = '180px'; media.style.objectFit = 'contain';
+      const success = el('small', 'field-help', '已上传并接入工作流 · 可预览当前素材'); success.setAttribute('role', 'status');
+      control.append(media, success);
+    }
     const mapping = el('span', 'field-help package-mapping', `节点 ${definition.node_id} · ${definition.input}`); control.append(mapping);
-    if (['text', 'image', 'video'].includes(type)) {
+    let textOptions;
+    if (['text', 'image', 'video', 'audio'].includes(type)) {
       const connected = workflowCanvas?.describeInput(node.id, definition), connections = el('div', 'workflow-field-link');
+      const composition = type === 'text' && node.data.packageTextCompositions?.[definition.id];
       if (connected) {
-        control.querySelectorAll('input,textarea,select,button').forEach(input => { input.disabled = true; });
-        connections.append(el('span', '', `已连接：${connected.text}；运行时使用连线值`), button('断开', 'button quiet', () => mutate(() => { graph.edges = graph.edges.filter(e => e.id !== connected.edge.id); })));
+        if (!composition) control.querySelectorAll('input,textarea,select,button').forEach(input => { input.disabled = true; });
+        const edges = connected.edges || [connected.edge];
+        connections.append(el('span', '', `已连接：${connected.text}；${composition ? '依次拼接连线文字，再追加上方自身文本' : '运行时使用连线值'}`), button(edges.length > 1 ? '断开全部' : '断开', 'button quiet', () => mutate(() => removeEdges(graph,edges.map(edge => edge.id)))));
       } else connections.append(el('span', '', '可从画布连接输入'), button('连接来源', 'button quiet', () => workflowCanvas.connectNodes('', node.id, definition.id)));
       control.append(connections);
+      if (type === 'text') {
+        const options = el('details', 'text-composition-options'); options.append(el('summary', '', '连线文本处理'));
+        options.append(field(`${label} · 合并方式`, composition || 'replace', mode => {
+          if (mode === 'replace' && (connected?.edges || (connected ? [connected.edge] : [])).length > 1) { toast('此字段有多个文本来源，请先保留一条连接，再改为替换模式', true); renderInspector(); return; }
+          mutate(() => {
+            node.data.packageTextCompositions = { ...(node.data.packageTextCompositions || {}) };
+            if (mode === 'replace') delete node.data.packageTextCompositions[definition.id];
+            else { node.data.packageTextCompositions[definition.id] = mode; node.data.packageValues = { ...(node.data.packageValues || {}), [definition.id]: value }; }
+          }); renderInspector();
+        }, { select: [{value:'replace',label:'连线替换自身文本'}, {value:'paragraphs',label:'按段落拼接 + 自身文本'}, {value:'comma',label:'按逗号拼接 + 自身文本'}], help:'拼接按连接顺序进行，跳过空文本，自身文本最后加入；多条线分别可在画布选中后删除。' }));
+        textOptions = options;
+      }
     }
-    wrap.append(control);
-  }
+    const transfer = packageMediaTransfers.state(owner, definition.id);
+    if (transfer) {
+      control.append(el('small', 'field-help', transfer.status === 'pending' ? '正在上传，完成前不会提交旧素材。' : `上传失败：${transfer.error}`));
+      control.append(button(transfer.status === 'pending' ? '取消应用，保留原值' : '保留原值', 'button quiet', () => { packageMediaTransfers.discard(owner,definition.id);renderInspector(); }));
+    }
+    area.append(control);
+    if (textOptions) area.append(textOptions);
+  });
 }
-async function loadPackages() {
-  const [result, editors] = await Promise.all([api('/api/packages'), api('/api/editor-workflows')]);
+async function loadPackages({ force = false } = {}) {
+  const [summaries, editors] = await Promise.all([packageCatalog.refresh({ force }), api('/api/editor-workflows')]);
   editorLibrary = editors.workflows || [];
-  packages = Array.isArray(result.packages) ? result.packages : [];
+  packages = packageCatalog.summaries();
   packagesLoaded = true;
-  let changed = false;
-  for (const node of graph.nodes.filter(n => n.data.kind === 'package')) {
-    const pack = packages.find(p => p.id === node.data.package_id);
-    if (pack) { const fields = pack.fields.map(({ id, label, type }) => ({ id, label, type })); if (JSON.stringify(node.data.packageFields) !== JSON.stringify(fields)) { node.data.packageFields = fields; changed = true; } }
-  }
-  if (changed) save();
+  activeSidebarPackage = null;
+  // Summary refresh never replaces cached canvas fields or writes the user's graph.
   renderPackageLibrary(); renderNodes();
   if (singleSelected()?.data?.kind === 'package' && !$('#properties-panel').contains(document.activeElement)) renderInspector();
 }
@@ -813,8 +1470,9 @@ function renderPackageLibrary() {
   $('#package-library-count').textContent = `${filtered.length} / ${packages.length} 个工作流包 · ${editorLibrary.length} 个原生工作流`;
   for (const entry of editorLibrary.filter(item => $('#package-scope').value === 'library' && item.name.toLowerCase().includes($('#package-search').value.toLowerCase()))) {
     const card = el('article', 'package-card'); card.append(el('span', 'eyebrow', 'NATIVE WORKFLOW'), el('h3', '', entry.name), el('p', 'muted', `${entry.nodes} 个节点 · 保留内部控件、分组和旁路状态`));
-    card.append(button('添加到画布 · 提取参数', 'button primary', async () => {
-      const node = addPackageNode({ name: entry.name, id: '', fields: [] });
+    card.append(button('添加到画布 · 提取参数', 'button primary', async event => {
+      if (event?.detail > 1) return;
+      const node = await addPackageNode({ name: entry.name, id: '', fields: [] });
       mutate(() => { node.data.editor_id = entry.id; });
       await nativeEditor.prepare(node);
     })); list.append(card);
@@ -828,8 +1486,8 @@ function renderPackageLibrary() {
     favorite.setAttribute('aria-pressed', String(pack.favorite === true)); favorite.disabled = organizingPackages.has(pack.id);
     heading.append(el('span', 'eyebrow', pack.archived ? 'ARCHIVED WORKFLOW' : 'LOCAL WORKFLOW'), favorite);
     card.append(heading, el('h3', '', pack.name), el('p', 'muted', pack.description || '可复用的本地图片 / 视频工作流'));
-    const meta = el('div', 'package-card-meta'); meta.append(el('span', '', `${pack.fields?.length || 0} 个可填输入`), el('span', 'inline-code', String(pack.id).slice(0, 14))); card.append(meta);
-    const actions = el('div', 'inspector-actions'); actions.append(button('添加到画布', 'button primary', () => addPackageNode(pack)), button('导出包', 'button quiet', () => exportPackage(pack.id))); card.append(actions);
+    const meta = el('div', 'package-card-meta'); meta.append(el('span', '', `${pack.field_count ?? '待确认'} 个可填输入`), el('span', 'inline-code', String(pack.id).slice(0, 14))); card.append(meta);
+    const actions = el('div', 'inspector-actions'); actions.append(button('添加到画布', 'button primary', event => event?.detail > 1 ? null : addPackageNode(pack)), button('导出包', 'button quiet', () => exportPackage(pack.id))); card.append(actions);
     const archive = button(pack.archived ? '恢复到包库' : '归档', 'text-link package-archive', () => organizePackage(pack.id, { archived: !pack.archived }), pack.archived ? '恢复到常规包库' : '归档只隐藏包库中的条目，不影响已有画布节点');
     archive.disabled = organizingPackages.has(pack.id); card.append(archive); list.append(card);
   }
@@ -840,7 +1498,7 @@ async function organizePackage(id, metadata) {
   try {
     const result = await api(`/api/packages/${encodeURIComponent(id)}/metadata`, metadata);
     if (!result.package?.id) throw new Error('服务没有返回工作流包整理结果');
-    packages = packages.map(pack => pack.id === id ? { ...pack, ...result.package } : pack);
+    rememberPackageDefinition(result.package);
     if ('archived' in metadata) toast(metadata.archived ? '已归档；已有画布节点仍可使用' : '已恢复到工作流包库');
   } finally { organizingPackages.delete(id); renderPackageLibrary(); }
 }
@@ -849,10 +1507,30 @@ async function openPackages() {
   renderPackageLibrary();
   try { await loadPackages(); } catch (error) { $('#package-list').replaceChildren(el('p', 'model-note', error.message)); throw error; }
 }
-function addPackageNode(pack) {
+async function addPackageNode(pack, { nodeData = {}, ensureCurrent = null } = {}) {
+  const identity = currentCanvasIdentity(), targetGraph = graph;
+  const check = () => {
+    ensureCurrent?.();
+    if (identity !== currentCanvasIdentity() || graph !== targetGraph) throw new Error('画布已切换，工作流未放入新画布；包仍保留在本机库');
+  };
+  check();
+  if (!pack.id) return placePackageNode(pack, nodeData);
+  const key = JSON.stringify([identity, pack.id]);
+  const existing = packageNodeAdds.get(key);
+  const dataSignature = JSON.stringify(nodeData);
+  if (existing?.graph === targetGraph && existing.guard === ensureCurrent && existing.dataSignature === dataSignature) return existing.promise;
+  const pending = (async () => {
+    pack = Array.isArray(pack.fields) && pack.prompt ? rememberPackageDefinition(pack) : await ensurePackageDefinition(pack.id);
+    check();
+    return placePackageNode(pack, nodeData);
+  })();
+  const entry = { graph: targetGraph, guard: ensureCurrent, dataSignature, promise: pending }; packageNodeAdds.set(key, entry);
+  try { return await pending; } finally { if (packageNodeAdds.get(key) === entry) packageNodeAdds.delete(key); }
+}
+function placePackageNode(pack, nodeData = {}) {
   studio?.open('canvas');
   const box = bounds(), origin = { x: graph.nodes.length ? box.maxX + 72 : 80, y: singleSelected()?.y ?? 80 };
-  const node = addNode('generation', { title: pack.name, kind: 'package', package_id: pack.id, packageValues: defaultValues(pack.fields || []), packageFields: (pack.fields || []).map(({ id, label, type }) => ({ id, label, type })) }, origin);
+  const node = addNode('generation', { title: pack.name, kind: 'package', package_id: pack.id, packageValues: defaultValues(pack.fields || []), packageFields: (pack.fields || []).map(cachedPackageField), ...nodeData }, origin);
   viewport.x = canvas.clientWidth / 2 - (node.x + 152) * viewport.scale;
   viewport.y = 150 - node.y * viewport.scale; applyViewport(); save();
   $('#packages-dialog').close(); $('#package-editor-dialog').close();
@@ -870,7 +1548,7 @@ function renderPackageDraft() {
   const list = $('#package-field-list'); list.replaceChildren();
   if (!packageDraft) return;
   $('#package-field-count').textContent = `${packageDraft.fields.filter(item => item.selected).length} / ${packageDraft.fields.length} 个输入`;
-  for (const item of packageDraft.fields) {
+  renderInterfaceList(list, packageDraft.fields, interfaceViewState(packageDraft, 'draft-inputs'), '包输入', (item, area) => {
     const row = el('div', `package-field-row${item.selected ? ' included' : ''}`);
     const select = el('input'); select.type = 'checkbox'; select.checked = item.selected; select.disabled = ['image', 'audio', 'video'].includes(fieldType(item)); select.setAttribute('aria-label', `暴露 ${item.label || item.input}`);
     if (select.disabled) select.title = '图像输入必须开放，使用者运行时需上传自己的参考图';
@@ -879,14 +1557,22 @@ function renderPackageDraft() {
     const input = el('input'); input.type = 'text'; input.maxLength = 100; input.value = item.label; input.setAttribute('aria-label', `输入名称 ${item.node_id}.${item.input}`); input.addEventListener('change', () => { item.label = input.value.trim() || item.input; input.value = item.label; });
     body.append(input, el('span', 'package-mapping', `节点 ${item.node_id} → ${item.input} · ${fieldType(item)}${item.recommended ? ' · 推荐' : ''}`));
     const preview = ['image', 'audio', 'video'].includes(item.type) ? '运行时选择参考媒体' : item.default === undefined ? '没有默认值' : String(item.default).slice(0, 120);
-    body.append(el('span', 'field-help package-default', `默认：${preview}`)); row.append(select, body); list.append(row);
-  }
+    body.append(el('span', 'field-help package-default', `默认：${preview}`)); row.append(select, body); area.append(row);
+  }, (toolbar, matching, refresh) => {
+    for (const [selected, label] of [[true, '勾选筛选结果'], [false, '取消筛选结果']]) toolbar.append(button(label, 'button quiet compact', () => {
+      for (const item of matching()) if (selected || !['image', 'audio', 'video'].includes(fieldType(item))) item.selected = selected;
+      $('#package-field-count').textContent = `${packageDraft.fields.filter(item => item.selected).length} / ${packageDraft.fields.length} 个输入`; refresh();
+    }));
+  });
   if (!packageDraft.fields.length) list.append(el('p', 'model-note', '没有可暴露的基础输入。仍可保存为使用固定参数的工作流包。'));
 }
-async function inspectPackageDocument(document, name = '', sourceJSON = '') {
+async function inspectPackageDocument(document, name = '', sourceJSON = '', ensureCurrent = () => {}, checkBackend = async () => {}) {
+  ensureCurrent();
   const result = await api('/api/packages/inspect', sourceJSON ? { source_json: sourceJSON } : { document });
+  await checkBackend(); ensureCurrent();
   if (!result.prompt || !Array.isArray(result.fields)) throw new Error('本地服务未返回有效的工作流输入定义');
-  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: ['image', 'audio', 'video'].includes(fieldType(item)) || document.format === 'frameweave-workflow' || item.recommended !== false })) };
+  const selectedIds = new Set(initialEditorFieldIds(result.fields));
+  packageDraft = { ...result, fields: result.fields.map(item => ({ ...item, selected: document.format === 'frameweave-workflow' || selectedIds.has(item.id) })) };
   $('#package-name').value = name || result.name || '新建工作流包'; $('#package-description').value = result.description || '';
   if (sourceJSON && document.format === 'frameweave-workflow') {
     packageDraft.sourceJSON = sourceJSON;
@@ -896,45 +1582,139 @@ async function inspectPackageDocument(document, name = '', sourceJSON = '') {
   renderPackageDraft(); $('#packages-dialog').close(); $('#package-editor-dialog').showModal();
 }
 async function inspectPackageFile(file) {
-  if (file.size > EDITOR_LIMIT) throw new Error('原生工作流最大为 16 MiB');
-  const sourceJSON = await file.text();
+  const identity = currentCanvasIdentity(), targetGraph = graph;
+  const ensureCanvas = () => { if (currentCanvasIdentity() !== identity || graph !== targetGraph) throw new Error('导入期间画布已切换，未添加到新画布；已保存的工作流仍保留在本机库。请在目标画布重新导入。'); };
+  const imported = await readWorkflowFile(file, choosePngWorkflow);
+  if (!imported) return;
+  ensureCanvas();
+  const { sourceJSON, name } = imported;
   const native = editorDocument(sourceJSON);
   if (native) {
-    const record = await api('/api/editor-workflows', { name: file.name.replace(/\.json$/i, ''), source_json: sourceJSON });
-    const node = addPackageNode({ name: record.name, id: '', fields: [] });
+    const record = await api('/api/editor-workflows', { name, source_json: sourceJSON });
+    ensureCanvas();
+    const node = await addPackageNode({ name: record.name, id: '', fields: [] });
     mutate(() => { node.data.editor_id = record.id; });
     toast(`已保存完整工作流（${record.nodes} 个节点），正在提取外层参数`);
     await nativeEditor.prepare(node);
     return;
   }
   const document = parsePackageDocument(sourceJSON.replace(/^\uFEFF/, ''));
-  await inspectPackageDocument(document, document.format === 'frameweave-workflow' ? '' : file.name.replace(/\.json$/i, ''), sourceJSON);
+  if (document.format !== 'frameweave-workflow') {
+    await importApiInterface(document, name);
+    return;
+  }
+  const result = await api('/api/packages', { source_json: sourceJSON });
+  rememberPackageDefinition(result.package);
+  await loadPackages();
+  ensureCanvas();
+  // Prepare all derived defaults off canvas: one import must be one complete undo.
+  // A package already contains the author's interface choices. Keep its identity.
+  const backend = settings.backend_url;
+  let nodeData = {};
+  try {
+    const info = await api('/api/interfaces/inspect', { package_id: result.package.id, values: defaultValues(result.package.fields || []) });
+    ensureCanvas();
+    if (settings.backend_url !== backend) throw new Error('推理引擎已切换，请在当前引擎重新检查输出');
+    if (!Array.isArray(info.outputs)) throw new Error('服务未返回有效的输出定义');
+    nodeData = { editor_outputs: info.outputs.map(item => item.id), editor_output_fields: info.outputs };
+  } catch (error) { ensureCanvas(); toast(`工作流包已导入；输出识别待连接正确后端：${error.message}`, true); }
+  ensureCanvas();
+  await addPackageNode(result.package, { nodeData, ensureCurrent: ensureCanvas });
 }
+const canvasInspection = createCanvasInspection({ api, graph: () => graph, backend: () => settings.backend_url,
+  canvasIdentity: currentCanvasIdentity, assertMediaReady: assertCanvasMediaReady });
 async function packageCurrentNode() {
   const node = selectedGeneration();
   if (!node) throw new Error('请先在画布选择一个图片 / 视频生成节点');
   if (node.data.kind === 'package') throw new Error('当前节点已经是工作流包，可以直接导出此包');
-  const result = await api('/api/compile', generationPayload(graph, node.id));
-  await inspectPackageDocument({ prompt: result.prompt }, node.data.title);
+  const inspection = await canvasInspection.compile(node.id);
+  inspection.ensureCurrent();
+  await inspectPackageDocument({ prompt: inspection.result.prompt }, node.data.title, '', inspection.ensureCurrent, inspection.checkBackend);
 }
 async function openNodeWorkflow(node) {
-  if(node.data.editor_id) return nativeEditor.open(node);
-  const identity=currentCanvasIdentity();
-  await prepareWorkflowBackend([node.id]);
-  if(!engine.online) throw new Error('请先连接推理引擎，读取预设对应的真实节点与模型');
-  await prepareCanvasImages([node.id]);
-  const compiledSnapshot=serializeGraph(graph), signature=stableStringify(node.data), backend=settings.backend_url;
-  const prompt=(await api('/api/compile',generationPayload(graph,node.id))).prompt;
-  if((await api('/api/status')).backend_url!==backend)throw new Error('编译期间引擎已切换，请重新进入工作流');
-  const saved=await api('/api/editor-workflows',{name:node.data.title,document:{version:0.4,nodes:[],links:[],last_node_id:0,last_link_id:0}});
-  if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||compiledSnapshot!==serializeGraph(graph)) throw new Error('画布已改变，未替换原节点');
-  const draft=clone(node);draft.data.editor_id=saved.id;draft.data.editor_backend=settings.backend_url;
-  await nativeEditor.openApiPrompt(draft,prompt,()=>{
-    if(identity!==currentCanvasIdentity()||getNode(node.id)!==node||signature!==stableStringify(node.data))throw new Error('原节点已更改，内部草稿已另存；未替换当前节点');
-    mutate(()=>{node.data.editor_id=saved.id;node.data.editor_backend=draft.data.editor_backend;});
-  });
+  if (node.data.kind === 'package' && !node.data.package_id && !node.data.editor_id) return openPackages();
+  if(node.data.editor_id) {
+    beginNativeEditorContext(node);
+    try { return await nativeEditor.open(node); } catch (error) { endNativeEditorSession(node); throw error; }
+  }
+  if (['package', 'api'].includes(node.data.kind)) {
+    const context = beginNativeEditorContext(node);
+    try {
+      await prepareEditorRootBackend(context);
+      await loadNativeEditorFields(context); context.assertCurrent();
+      const own = nativeEditorProjection(context, node, true);
+      const source = context.package ? { package_id: context.package.id } : { document: { prompt: node.data.apiPrompt }, fields: context.fields };
+      const baseline = await api('/api/editor-prepare', { ...source, backend_url: settings.backend_url, overrides: own.overrides, pending: own.pending });
+      context.assertCurrent();
+      if (baseline.backend_url !== settings.backend_url || context.package && baseline.source_revision !== context.package.id) throw new Error('完整来源的后端或版本已变化，请重新进入');
+      context.baselineBackend = settings.backend_url;
+      context.baselineDocument = baseline.source_document;
+      const saved = await api('/api/editor-workflows', { name: node.data.title, source_kind: 'api', document: { version: 0.4, nodes: [], links: [], last_node_id: 0, last_link_id: 0 } });
+      context.assertCurrent();
+      const draft = clone(node); draft.data.editor_id = saved.id; draft.data.editor_backend = settings.backend_url;
+      aliasNativeEditorContext(context, draft);
+      await nativeEditor.openApiPrompt(draft, baseline.prompt, () => {
+        context.assertCurrent();
+        mutate(() => { node.data.editor_id = draft.data.editor_id; node.data.editor_backend = draft.data.editor_backend; });
+        context.rebaseTarget();
+      });
+      return;
+    } catch (error) { endNativeEditorSession(node); throw error; }
+  }
+  const context = beginNativeEditorContext(node);
+  try {
+    await prepareEditorRootBackend(context); context.assertCurrent();
+    const collected = collectPresetEditRequest(graph, node.id, { backend: settings.backend_url,
+      canvasId: currentCanvasIdentity(), referenceImports, mediaTransfers: packageMediaTransfers });
+    const prepared = await api('/api/editor-prepare', { backend_url: settings.backend_url,
+      preset_request: collected.preset_request, reference_slots: collected.reference_slots,
+      input_intents: collected.input_intents, model_intents: collected.model_intents, pending: collected.pending });
+    context.assertCurrent();
+    if (prepared.backend_url !== settings.backend_url || prepared.source_kind !== 'preset') throw new Error('预设编辑来源或引擎不一致；请更新本机客户端后重试');
+    if (prepared.status === 'blocked') throw new Error(`完整预设尚不能装配：${(prepared.blocked || []).map(item => item.message).join('；') || '缺少可验证的节点声明'}。原参数和连线已保留。`);
+    if (!prepared.receipt_complete) throw new Error('预设内部输入尚不能唯一映射到外层；原节点与连线已保留，请检查当前节点版本');
+    const shadow = preparePresetEditGraph(graph, node.id, prepared, collected);
+    context.fields = shadow.fields; context.sessionGraph = shadow.graph;
+    context.baselineBackend = settings.backend_url; context.baselineDocument = prepared.source_document;
+    const saved = await api('/api/editor-workflows', { name: node.data.title, source_kind: 'api',
+      document: { version: 0.4, nodes: [], links: [], last_node_id: 0, last_link_id: 0 } });
+    context.assertCurrent();
+    const draft = clone(shadow.target); draft.data.editor_id = saved.id; draft.data.editor_backend = settings.backend_url;
+    aliasNativeEditorContext(context, draft);
+    await nativeEditor.openApiPrompt(draft, prepared.source_document.prompt,
+      converted => bindPreparedPreset(context, draft, prepared, collected, converted));
+  } catch (error) { endNativeEditorSession(node); throw error; }
+}
+async function bindPreparedPreset(context, draft, prepared, collected, converted) {
+  context.assertCurrent();
+  if (!converted?.output) throw new Error('原生转换没有返回已验证的完整执行图');
+  const target = context.target, guard = captureNativeInterfaceTarget(target);
+  const info = await api('/api/interfaces/inspect', { document: { prompt: converted.output } });
+  assertNativeInterfaceTarget(guard);
+  const fresh = { ...prepared, source_document: { prompt: converted.output }, fields: info.fields, outputs: info.outputs };
+  // Validate the complete connection migration before creating a package.
+  preparePresetEditGraph(graph, target.id, fresh, collected);
+  const result = await api('/api/interfaces/apply', { prompt: converted.output, fields: info.fields,
+    output_nodes: info.outputs.map(item => item.id), backend_url: settings.backend_url, name: target.data.title });
+  assertNativeInterfaceTarget(guard);
+  if (result.requires_resolution || result.backend_url !== settings.backend_url || !result.package?.id) throw new Error('首次外层绑定尚未完成，原节点已保留；请重新进入核对');
+  const shadow = preparePresetEditGraph(graph, target.id, { ...fresh, fields: result.package.fields }, collected);
+  shadow.target.data.editor_id = draft.data.editor_id;
+  const updated = applyEditorInterfaceGraph(shadow.graph, target.id, { ...result, outputs: info.outputs,
+    controls: converted.controls || [], rebindings: {}, output_rebindings: shadow.output_rebindings || {} }, { preserveOutputIndices: true });
+  const next = updated.nodes.find(item => item.id === target.id);
+  rememberPackageDefinition(result.package);
+  assertNativeInterfaceTarget(guard);
+  mutate(() => { target.data = clone(next.data); graph.edges = updated.edges; draft.data = clone(next.data); });
+  // The preceding guarded migration is the only authorized graph change here.
+  context.package = result.package; context.fields = clone(result.package.fields);
+  context.sourceRevision = result.package.id; context.sessionGraph = null; context.baselineDocument = null;
+  context.guard = captureEditorPreparationTarget(graph, target.id, { canvasId: currentCanvasIdentity(), backend: settings.backend_url,
+    sourceRevision: context.sourceRevision, referenceImports, mediaTransfers: packageMediaTransfers });
+  toast('预设已建立外层参数与命名接口，已有输入连接已同步');
 }
 function renderInspector() {
+  if (activeSidebarPackage && (singleSelected() !== activeSidebarPackage.node || currentCanvasIdentity() !== activeSidebarPackage.identity || activeSidebarPackage.node.data.package_id !== activeSidebarPackage.packageId)) activeSidebarPackage = null;
   const content = $('#inspector-content'); releaseMedia(content); content.replaceChildren();
   if (selectedEdge) {
     const wrap = el('div', 'inspector-empty'); wrap.append(el('span', 'eyebrow', 'CONNECTION'), el('h2', '', '工作流连接'), el('p', '', '连接将提示词、参考素材和生成结果传递给下一个节点。'), button('删除此连接', 'button quiet', () => deleteSelection())); content.append(wrap); return;
@@ -953,16 +1733,7 @@ function renderInspector() {
   wrap.append(el('p', 'inspector-description', { prompt: '写下画面、光线与运动，将文字连接到生成节点。', reference: '角色、场景或首尾帧，让每一次生成有据可循。', generation: '精确设定每一帧，让创作保持可控。', result: '实际输出与任务记录，完整保存在本地。' }[node.type]));
   wrap.append(field('节点名称', node.data.title, value => editNode(node.id, 'title', value || '未命名节点')));
   if (node.type === 'generation') {
-    const ports = generationInputPorts(node,graph);
-    if (ports.length) {
-      const details=el('details','input-port-settings'); details.append(el('summary','',`输入端口用途与连接 · ${ports.length} 项`));
-      for(const port of ports) {
-        const edge = graph.edges.find(e=>e.target===node.id&&edgeInputField(graph,e)===port.id);
-        const row=field(port.id,port.label,value=>mutate(()=>{node.data.inputLabels={...(node.data.inputLabels||{})};if(value.trim())node.data.inputLabels[port.id]=value.trim().slice(0,80);else delete node.data.inputLabels[port.id];}),{help:edge?`来自 ${getNode(edge.source)?.data.title}；此名称只说明用途，不会改变工作流本身的输入顺序。`:'可命名为场景参考、人物参考等；请在提示词中明确各图用途。'});
-        if(edge) row.append(button('断开此输入','node-action',()=>mutate(()=>{graph.edges=graph.edges.filter(e=>e.id!==edge.id);})));details.append(row);
-      }
-      wrap.append(details);
-    }
+    renderInputPortSettings(wrap, node);
     section(wrap, '生成模式', '01 / MODEL');
     wrap.append(field('模型与任务', node.data.kind, kind => {
       if (kind === 'package' && node.data.kind !== 'package') { renderInspector(); openPackages().catch(reportError); return; }
@@ -979,6 +1750,7 @@ function renderInspector() {
       });
     }, { select: Object.entries(KIND_NAMES).map(([value, label]) => ({ value, label })) }));
     if (node.data.kind === 'package') {
+      if (node.data.package_id) wrap.append(button('管理外部接口', 'button quiet inspector-interface', () => configurePackageInterface(node)));
       renderPackageInputs(wrap, node);
     } else if (node.data.kind === 'api') {
       wrap.append(el('p', 'model-note', '导入 ComfyUI「Save (API Format)」JSON。工作流完整保留，模型与路径仍需在你的推理引擎中可用。'));
@@ -1038,20 +1810,21 @@ function renderInspector() {
       renderLoraFields(wrap, node);
     }
     const actions = el('div', 'inspector-actions'); actions.append(button('检查缺失项', 'button quiet', () => runDiagnostics(node)), button('导出执行 JSON', 'button quiet', () => compileNode(node))); wrap.append(actions);
-    wrap.append(button('↗ 进入工作流 · 内部调参','button quiet inspector-run',()=>openNodeWorkflow(node)));
-    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || node.data.kind==='package' && !!node.data.editor_id && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
+    wrap.append(button('↗ 进入工作流 · 内部调参','button quiet inspector-run',()=>openNodeWorkflow(node)), editorMediaSyncButton(node));
+    const run = button(submitting.has(node.id) ? '正在提交…' : '▷  开始生成', 'button primary inspector-run', () => runNode(node.id)); run.disabled = submitting.has(node.id) || workflowCanvas?.isRunning() || node.data.kind==='package' && !node.data.package_id; run.dataset.runNode = node.id; wrap.append(run);
     wrap.append(el('p', 'form-note', '速度与质量取决于后端、模型、显存和参数。生成任务通过本机服务执行，可在队列中查看耗时与取消。'));
   } else if (node.type === 'prompt') {
     wrap.append(field('正向提示词', node.data.text, value => editNode(node.id, 'text', value), { multiline: true, rows: 9 }), field('负向提示词', node.data.negative, value => editNode(node.id, 'negative', value), { multiline: true, rows: 3 }));
     wrap.append(button('复制提示词', 'button primary inspector-run', () => copyText(node.data.text)));
   } else if (node.type === 'reference') {
     if (node.data.url) wrap.append(outputMedia({ url: node.data.url, type: node.data.mediaType, filename: node.data.name }, 'reference-media'));
-    wrap.append(field('参考角色', node.data.role, value => editNode(node.id, 'role', value), { select: [{ value: 'reference', label: '角色 / 场景参考' }, { value: 'start', label: '首帧' }, { value: 'end', label: '尾帧' }] }));
+    if (!['audio', 'video'].includes(node.data.mediaType)) wrap.append(field('参考角色', node.data.role, value => editNode(node.id, 'role', value), { select: [{ value: 'reference', label: '角色 / 场景参考' }, { value: 'start', label: '首帧' }, { value: 'end', label: '尾帧' }] }));
+    else wrap.append(el('p', 'form-note', '用途由连接的工作流接口决定；可将同一素材连接到多个命名输入。'));
     wrap.append(el('p', 'form-note', node.data.localFilename || node.data.name || '还未导入素材。'));
-    wrap.append(button('选择图片 / 视频素材', 'button quiet inspector-run', () => chooseReference(node.id)));
+    wrap.append(button('选择图片 / 视频 / 音频', 'button quiet inspector-run', () => chooseReference(node.id)));
     wrap.append(el('p', 'form-note', '素材先保存在客户端，生成时自动传入对应引擎。导出画布只记录引用，不打包原始媒体；迁移设备时需同时保留客户端素材目录。'));
   } else {
-    if (node.data.outputs?.length) node.data.outputs.forEach(output => { wrap.append(outputMedia(output, 'output-image'), button('打开大预览', 'button quiet inspector-run', () => preview(output))); });
+    if (node.data.outputs?.length) node.data.outputs.forEach(output => { wrap.append(outputMedia(output, output.type === 'audio' ? 'output-audio' : 'output-image'), button('打开预览', 'button quiet inspector-run', () => preview(output)), button('传入工作流…', 'button quiet inspector-run', () => passResultToWorkflow(node, output))); });
     else wrap.append(el('p', 'model-note', '尚无真实生成结果。连接生成节点，检查环境后提交任务。'));
   }
   wrap.append(el('hr', 'divider'));
@@ -1064,7 +1837,7 @@ function revealInspector() {
   document.body.classList.add('inspector-open');
   $('#toggle-inspector')?.setAttribute('aria-pressed', 'true');
 }
-function addNode(type, data = {}, position = null, anchored = false) {
+function addNode(type, data = {}, position = null, anchored = false, center = !anchored) {
   if (graph.nodes.length >= 500) throw new Error('当前画布已满，请先导出或整理节点。');
   const point = viewPoint(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2);
   const node = createNode(type, position?.x ?? point.x - 145, position?.y ?? point.y - 115, data);
@@ -1072,7 +1845,7 @@ function addNode(type, data = {}, position = null, anchored = false) {
   if (!anchored) placeNewNodes([node]);
   mutate(() => { graph.nodes.push(node); selected = new Set([node.id]); selectedEdge = null; });
   revealInspector();
-  if (!anchored) centerOnNode(node);
+  if (center) centerOnNode(node);
   return node;
 }
 function renderLoraFields(wrap, node) {
@@ -1113,7 +1886,7 @@ function renderLoraFields(wrap, node) {
 function deleteSelection() {
   if (!selected.size && !selectedEdge) return;
   mutate(() => {
-    if (selectedEdge) graph.edges = graph.edges.filter(edge => edge.id !== selectedEdge);
+    if (selectedEdge) removeEdges(graph, [selectedEdge]);
     removeNodes(graph, selected); selected.clear(); selectedEdge = null;
   });
   toast('已删除，可使用 Ctrl+Z 撤销');
@@ -1202,7 +1975,7 @@ function openNodeMenu(clientX, clientY, nodeId = null) {
   };
   if (!nodeId) {
     item('文本 / 提示词', () => addNode('prompt', {}, point, true));
-    item('参考图片', () => addNode('reference', {}, point, true));
+    item('参考素材 · 图片 / 视频 / 音频', () => addNode('reference', {}, point, true));
     item('H3 视频生成', () => addNode('generation', {}, point, true));
     item('图片生成', () => addNode('generation', { title: 'SDXL 图片生成', kind: 'sdxl', width: 1024, height: 1024, steps: 25, cfg: 7 }, point, true));
     item('结果预览', () => addNode('result', {}, point, true));
@@ -1251,11 +2024,41 @@ function downloadJSON(value, filename) {
   const blob = new Blob([typeof value === 'string' ? value : stableStringify(value)], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob); const link = el('a'); link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
-function exportProject() { downloadJSON(serializeGraph(graph, viewport), `frameweave-canvas-${new Date().toISOString().slice(0, 10)}.json`); save(true); toast('已导出画布 JSON（不包含模型与原始素材）'); }
+const CANVAS_FILE_LIMIT = 24 * 1024 * 1024;
+function checkedCanvasFile(source) {
+  if (typeof source !== 'string' || new TextEncoder().encode(source).length > CANVAS_FILE_LIMIT) throw new Error('画布 JSON 最大为 24 MiB，请拆分画布');
+  const document = parseJSONWithSafeNumbers(source.replace(/^\uFEFF/, ''));
+  validateCanvasStructure(document);
+  return document;
+}
+function exportProject() {
+  const source = serializeGraph(graph, viewport);
+  checkedCanvasFile(source);
+  parseGraph(source);
+  downloadJSON(source, `frameweave-canvas-${new Date().toISOString().slice(0, 10)}.json`);
+  save(true); toast('已导出画布 JSON（不包含模型与原始素材）');
+}
+async function importCanvasFile(file) {
+  if (workflowCanvas.isRunning()) throw new Error('请先停止后续调度或等待导入完成，再导入其他画布');
+  if (file.size > CANVAS_FILE_LIMIT) throw new Error('画布 JSON 最大为 24 MiB，请拆分画布');
+  const identity = currentCanvasIdentity(), openingGraph = graph, before = serializeGraph(graph, viewport), title = projectTitle;
+  const source = await file.text();
+  if (workflowCanvas.isRunning() || currentCanvasIdentity() !== identity || graph !== openingGraph || serializeGraph(graph, viewport) !== before || projectTitle !== title) {
+    throw new Error('导入期间画布已变化，未替换当前内容，请重新导入');
+  }
+  const document = checkedCanvasFile(source);
+  if (document?.schema === 'prismcanvas.project.v1') {
+    return workflowCanvas.importBundle({ name: file.name, size: new TextEncoder().encode(source).length, text: async () => source.replace(/^\uFEFF/, '') });
+  }
+  const incoming = parseGraph(document);
+  mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(file.name)); });
+  applyViewport(); save(true); toast('画布已导入。原画布可通过撤销恢复。');
+}
 async function compileNode(node) {
-  const result = await api('/api/compile', generationPayload(graph, node.id));
-  downloadJSON(result.prompt, `frameweave-${node.data.kind}-api.json`);
-  toast(typeof result.summary === 'string' ? result.summary : '已校验并导出执行工作流 JSON');
+  const inspection = await canvasInspection.compile(node.id);
+  inspection.ensureCurrent();
+  downloadJSON(inspection.result.prompt, `frameweave-${node.data.kind}-api.json`);
+  toast(typeof inspection.result.summary === 'string' ? inspection.result.summary : '已按所选输出校验并导出执行工作流 JSON');
 }
 async function refreshEngine(showToast = false) {
   try {
@@ -1274,8 +2077,8 @@ function knownLocalPaths() {
   return [...(settings.model_roots || []), ...(settings.comfy_roots || []), ...(environment?.installations || []).flatMap(item => [item.root, typeof item.python === 'string' ? item.python : item.python?.path, ...(item.model_roots || [])])].filter(value => typeof value === 'string');
 }
 function renderDiagnosticChecks() {
-  const categoryNames = { hardware: '硬件与驱动', gpu: '硬件与驱动', runtime: '运行环境', python: 'Python 环境', packages: 'Python 依赖', backend: '推理服务', nodes: '工作流节点', custom_nodes: '自定义节点', models: '模型文件', model: '模型文件', inputs: '工作流输入', workflow: '当前工作流', environment: '本地环境' };
-  diagnosticChecks = [...(environment?.checks || []).map(check => ({ category: 'environment', ...check })), ...workflowChecks.map(check => ({ category: 'workflow', ...check }))];
+  const categoryNames = { hardware: '硬件与驱动', gpu: '硬件与驱动', runtime: '运行环境', python: 'Python 环境', packages: 'Python 依赖', backend: '推理服务', node: '工作流节点', nodes: '工作流节点', custom_nodes: '自定义节点', models: '模型文件', model: '模型文件', inputs: '工作流输入', workflow: '当前工作流', environment: '本地环境' };
+  diagnosticChecks = mergeDiagnosticChecks(environment?.checks || [], workflowChecks);
   const counts = { ok: 0, missing: 0, error: 0, warning: 0, unknown: 0 };
   const groups = new Map();
   for (const check of diagnosticChecks) {
@@ -1298,10 +2101,11 @@ function renderDiagnosticChecks() {
   $('#repair-prompt').value = redactLocalText(prompt, knownLocalPaths());
   $('#copy-repair').disabled = !diagnosticChecks.length; $('#export-diagnostics').disabled = !diagnosticChecks.length;
 }
-function hasActiveJobs() { return submitting.size > 0 || jobs.some(job => ['queued', 'running'].includes(job.status)); }
+function hasActiveJobs() { return submitting.size > 0 || !!studio?.hasPending() || jobs.some(isJobActive); }
+function canUseBackend(url) { return !submitting.size && !studio?.hasPending() && canSwitchJobBackend(jobs, url, settings.backend_url); }
 async function useBackend(url) {
   await pollJobs();
-  if (hasActiveJobs()) throw new Error('仍有排队或运行中的任务。请等待任务完成或取消后，再切换推理服务。');
+  if (!canUseBackend(url)) throw new Error('仍有未结束或待确认的任务；只能恢复全部原任务所属的引擎，不能切到新引擎。');
   const result = await api('/api/settings', { ...settings, backend_url: url });
   settings = result.settings || { ...settings, backend_url: url };
   $('#backend-url').value = settings.backend_url;
@@ -1324,7 +2128,7 @@ function renderEnvironment() {
   if (!environment) return;
   const online = (environment.candidates || []).filter(item => item.online);
   const alternatives = online.filter(item => item.url !== settings.backend_url);
-  $('#environment-status').textContent = `发现 ${online.length} 个可用服务 · ${(environment.installations || []).length} 个安装目录 · ${Math.round(Number(environment.elapsed_ms) || 0)} ms${environment.scanned_at ? ` · ${String(environment.scanned_at).replace('T', ' ').slice(0, 19)}` : ''}`;
+  $('#environment-status').textContent = `发现 ${online.length} 个可用服务 · ${(environment.installations || []).length} 个安装目录 · ${Math.round(Number(environment.elapsed_ms) || 0)} ms${environment.scanned_at ? ` · ${new Date(environment.scanned_at).toLocaleString('zh-CN', { hour12: false })}` : ''}`;
   $('#discovery-banner').hidden = engine.online || !alternatives.length;
   if (!engine.online && alternatives.length) $('#discovery-message').textContent = `自动发现 ${alternatives.length} 个可用本地引擎，当前地址尚未连接`;
   const probes = el('details', 'environment-probes');
@@ -1337,8 +2141,8 @@ function renderEnvironment() {
     body.append(el('strong', '', title), el('span', 'inline-code', candidate.url), el('span', 'field-help', [candidate.source, candidate.version ? `ComfyUI ${candidate.version}` : ''].filter(Boolean).join(' · ')));
     if (!candidate.online) body.append(el('span', 'field-help', candidate.detail || ({refused:'此地址没有服务接受连接，请检查引擎是否启动与端口是否一致。',timeout:'服务响应超时，请查看引擎日志及启动状态。',non_comfy:'端口有响应，但不是可确认的 ComfyUI 接口。',identity_unknown:'端口有响应，尚不能确认服务身份。'}[candidate.offline_reason] || '此端口没有返回可确认的推理服务。')));
     if (optional) body.append(el('span', 'field-help', '仅用于自动发现；当前引擎可用时，无需安装或启动此端口。'));
-    const action = button(active ? '当前地址' : '使用此后端', 'button quiet compact', () => useBackend(candidate.url)); action.disabled = active || !candidate.online || hasActiveJobs();
-    if (hasActiveJobs() && !active) action.title = '有活动任务，完成或取消后可切换'; row.append(body); if (!optional) row.append(action); (optional ? probes : target).append(row);
+    const action = button(active ? '当前地址' : '使用此后端', 'button quiet compact', () => useBackend(candidate.url)); action.disabled = active || !candidate.online || !canUseBackend(candidate.url);
+    if (!canUseBackend(candidate.url) && !active) action.title = '有未结束或待确认任务，只能恢复原任务所属引擎'; row.append(body); if (!optional) row.append(action); (optional ? probes : target).append(row);
   }
   if (probes.children.length > 1) target.append(probes);
   for (const installation of environment.installations || []) {
@@ -1375,15 +2179,22 @@ async function runDiagnostics(node = selectedGeneration(), scan = false) {
   $('#diagnostic-summary').textContent = `正在检查${node ? `「${node.data.title}」的` : ''}节点、模型与输入…`;
   $('#diagnostic-refresh').disabled = true; workflowChecks = []; workflowRepair = ''; renderDiagnosticChecks();
   try {
-    const payload = !canvasIsActive() ? studio.diagnosticsRequest?.() : node ? generationPayload(graph, node.id) : null;
-    const discovery = scan || !environment ? scanEnvironment() : Promise.resolve(environment);
-    const [inspection, discoveryResult] = await Promise.allSettled([payload ? api('/api/diagnostics', payload) : Promise.resolve({ checks: [], summary: '已检查本地服务与硬件。选择生成方式或工作流后，可继续检查对应的节点、模型和输入。', repair_prompt: '' }), discovery]);
+    const empty = { checks: [], summary: '已检查本地服务与硬件。选择生成方式或工作流后，可继续检查对应的节点、模型和输入。', repair_prompt: '' };
+    const inspect = !canvasIsActive() ? async () => {
+      const context = captureRequestInspection({ api, backend: () => settings.backend_url,
+        context: () => ({ workspace: document.body.dataset.workspace, request: studio.diagnosticsRequest?.() }) });
+      const payload = studio.diagnosticsRequest?.();
+      await context.checkBackend();
+      return { ...context, result: payload ? await api('/api/diagnostics', payload) : empty };
+    } : node ? () => canvasInspection.diagnose(node.id) : () => ({ result: empty });
+    const [inspection, discoveryResult] = await inspectWithDiscovery(inspect, () => scan || !environment ? scanEnvironment() : environment);
+    if (discoveryResult.status === 'rejected') $('#environment-status').textContent = `自动发现未完成：${discoveryResult.reason.message}`;
     if (inspection.status === 'rejected') throw inspection.reason;
-    const result = inspection.value;
+    await refreshEngine(); await inspection.value.checkBackend?.(); inspection.value.ensureCurrent?.();
+    const result = inspection.value.result;
     workflowChecks = Array.isArray(result.checks) ? result.checks : []; workflowRepair = result.repair_prompt || '';
     $('#diagnostic-summary').textContent = typeof result.summary === 'string' ? result.summary : `已检查${node ? `「${node.data.title}」` : '当前工作流'}，未知项仍需人工确认。`;
-    if (discoveryResult.status === 'rejected') $('#environment-status').textContent = `自动发现未完成：${discoveryResult.reason.message}`;
-    renderDiagnosticChecks(); await refreshEngine(); renderEnvironment();
+    renderDiagnosticChecks(); renderEnvironment();
     if (!$('#properties-panel').contains(document.activeElement)) renderInspector();
   } catch (error) {
     workflowChecks = [{ category: 'workflow', status: 'unknown', name: '当前工作流检查未完成', detail: error.message }];
@@ -1415,26 +2226,24 @@ function duration(seconds) { seconds = Math.max(0, Math.floor(Number(seconds) ||
 function updateNodeJobStatus() {
   document.querySelectorAll('[data-live-node]').forEach(element => {
     const job = jobs.find(item=>jobNodes[item.id]===element.dataset.liveNode);
-    element.hidden = !job || !['queued','running'].includes(job.status);
-    if (element.hidden) return;
-    element.querySelector('.live-detail').textContent = liveProgressText(job);
-    const bar = element.querySelector('progress'), progress = progressPercent(job.progress);
-    if (progress === null) bar.removeAttribute('value'); else bar.value = progress;
-    const img = element.querySelector('.live-preview'); img.hidden = !job.preview_url;
-    if (job.preview_url && img.getAttribute('src') !== job.preview_url) img.src = job.preview_url;
+    element.hidden = !isJobActive(job);
+    // Clear retained sampling text and preview callbacks even after hiding the
+    // live section; terminal jobs must not leave pending status in the DOM.
+    if (!job) return;
+    updateLiveProgress({detail:element.querySelector('.live-detail'),bar:element.querySelector('progress'),image:element.querySelector('.live-preview'),caption:element.querySelector('.live-preview-status')}, job);
   });
   document.querySelectorAll('[data-node-status]').forEach(element => {
     const job = jobs.find(item => jobNodes[item.id] === element.dataset.nodeStatus);
     element.classList.toggle('error', job?.status === 'failed');
-    element.textContent = job ? `${job.status === 'completed' ? '✓' : job.status === 'failed' ? '!' : '○'} ${STATUS_NAMES[job.status] || job.status} · ${duration(job.elapsed)}` : '○ 等待提交';
+    element.textContent = job ? `${job.status === 'completed' ? '✓' : job.status === 'failed' ? '!' : '○'} ${jobStatusLabel(job)} · ${duration(job.elapsed)}` : '○ 等待提交';
   });
   document.querySelectorAll('[data-result-status],[data-result-headline],[data-result-detail]').forEach(element => {
     const id = element.dataset.resultStatus ?? element.dataset.resultHeadline ?? element.dataset.resultDetail;
     if (!id) return;
     const job = jobs.find(item => item.id === id);
-    if ('resultStatus' in element.dataset) element.textContent = job ? STATUS_NAMES[job.status] || job.status : '等待同步';
-    else if ('resultHeadline' in element.dataset) element.textContent = { queued: '任务已排队', running: '正在生成', failed: '生成失败', cancelled: '任务已取消', completed: '任务已完成' }[job?.status] || '正在同步任务';
-    else element.textContent = { queued: '引擎开始执行后，生成状态会自动更新。', running: '图像与视频生成完成后会自动出现在这里。', failed: '在任务列表查看错误详情，修复后可再次生成。', cancelled: '原始参数仍保留，可在任务列表复用或再次生成。', completed: '此任务没有可预览的图像或视频输出，请检查工作流输出节点。' }[job?.status] || '请保持本地服务运行，或在任务列表查看记录。';
+    if ('resultStatus' in element.dataset) element.textContent = job ? jobStatusLabel(job) : '等待同步';
+    else if ('resultHeadline' in element.dataset) element.textContent = job ? jobStatusLabel(job) : '正在同步任务';
+    else element.textContent = jobStateDetail(job) || { queued: '引擎开始执行后，生成状态会自动更新。', running: '图像与视频生成完成后会自动出现在这里。', failed: '在任务列表查看错误详情，修复后可再次生成。', cancelled: '原始参数仍保留，可在任务列表复用或再次生成。', completed: '此任务没有可预览的图像或视频输出，请检查工作流输出节点。' }[job?.status] || '请保持本地服务运行，或在任务列表查看记录。';
   });
 }
 
@@ -1480,15 +2289,30 @@ function installRecipe(recipe) {
 }
 async function reuseJob(id) {
   if (reusing.has(id)) return;
-  reusing.add(id); renderJobs();
+  const source = jobs.find(job => job.id === id);
+  if (!source || !source.backend) throw new Error('原任务不在当前队列或缺少后端身份，请刷新后重试');
+  const sourceKind = source.kind, sourceBackend = source.backend;
+  const startedGraph = graph, startedIdentity = currentCanvasIdentity(), startedSnapshot = snapshot();
+  const startedWorkspace = document.body.dataset.workspace;
+  reusing.add(id);
   try {
+    renderJobs();
     const recipe = await api(`/api/jobs/${encodeURIComponent(id)}/recipe`);
-    installRecipe(recipe);
+    if (graph !== startedGraph || currentCanvasIdentity() !== startedIdentity || snapshot() !== startedSnapshot
+      || document.body.dataset.workspace !== startedWorkspace
+      || !jobs.some(job => job.id === id && job.kind === sourceKind && job.backend === sourceBackend)) {
+      throw new Error('读取期间画布、选择、页面或原任务已变化，未添加节点；请重新复用');
+    }
+    if ((recipe.job_id && recipe.job_id !== id) || (recipe.backend && recipe.backend !== sourceBackend)) {
+      throw new Error('参数记录与原任务身份不一致，请刷新后重试');
+    }
+    installRecipe({ ...recipe, backend: sourceBackend });
     toast('已添加独立生成节点，可修改参数后再生成');
     for (const warning of recipe.warnings || []) toast(warning);
   } finally { reusing.delete(id); renderJobs(); }
 }
 async function retryJob(id) {
+  if (isJobActive(jobs.find(job => job.id === id))) throw new Error('原任务尚未确认结束，请查询原任务，不能换请求再次生成。');
   if (retrying.has(id)) return;
   retrying.add(id);
   if (!retryRequests.has(id)) { retryRequests.set(id, crypto.randomUUID()); saveRetryRequests(); }
@@ -1507,23 +2331,48 @@ function saveRetryRequests() {
   try { localStorage.setItem(RETRY_REQUESTS_KEY, JSON.stringify([...retryRequests].slice(-200))); }
   catch { /* The current page still retains retry identities when browser storage is full. */ }
 }
+async function controlJob(id, operation) {
+  if (!['cancel', 'refresh'].includes(operation)) throw new Error('任务操作无效');
+  if (controllingJobs.has(id)) return;
+  const original = jobs.find(job => job.id === id);
+  if (!original || !(operation === 'cancel' ? canCancelJob(original) : canRefreshJob(original))) throw new Error('请先查询原任务，当前不能执行此操作。');
+  const owner = original.backend;
+  controllingJobs.add(id);
+  try {
+    renderJobs(); studio?.refresh();
+    const result = await api(`/api/jobs/${encodeURIComponent(id)}/${operation}`, {});
+    if (result?.id !== id || result.backend && result.backend !== owner || typeof result.status !== 'string') throw new Error('原任务响应身份不一致，请重新查询；不会创建新任务。');
+    const current = jobs.findIndex(job => job.id === id && job.backend === owner);
+    if (current >= 0 && !(isJobTerminal(jobs[current]) && !isJobTerminal(result))
+        && !(Number(jobs[current].cancellation?.updated_at) > Number(result.cancellation?.updated_at))) jobs[current] = { ...jobs[current], ...result };
+    const visible = current >= 0 ? jobs[current] : result;
+    toast(operation === 'cancel' ? jobStateDetail(visible) || jobStatusLabel(visible) : `原任务：${jobStatusLabel(visible)}`);
+    await pollJobs();
+  } catch (error) {
+    await pollJobs();
+    throw new Error(`${operation === 'cancel' ? '取消结果请以原任务状态为准，可点击“查询原任务”。' : '原任务查询未完成。'} ${error.message}`);
+  } finally { controllingJobs.delete(id); renderJobs(); studio?.refresh(); }
+}
+
 function newJobView(id) {
   const card = el('article', 'job-card'); card.dataset.jobId = id;
   const heading = el('div', 'job-heading'), title = el('span', 'job-title'), status = el('span', 'job-tag'); heading.append(title, status);
   const time = el('div', 'job-time'), elapsed = el('span'); time.append(elapsed, el('span', '', id.slice(0, 8)));
-  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '生成进度');
+  const track = el('div', 'progress-track'), bar = el('div', 'progress-bar'); track.append(bar); track.setAttribute('role', 'progressbar'); track.setAttribute('aria-label', '当前节点执行进度');
   const state = el('div', 'progress-state'), error = el('p', 'job-error'), warning = el('p', 'job-warning'), provenance = el('p', 'job-provenance'), thumbs = el('div', 'job-thumbs');
-  const livePreview = el('img', 'live-preview'); livePreview.alt = '采样中间预览，尚未完成'; livePreview.hidden = true;
+  const livePreview = el('img', 'live-preview'); livePreview.alt = '节点中间预览，尚未完成'; livePreview.hidden = true;
+  const previewStatus = el('small', 'live-preview-status');
   const actions = el('div', 'job-actions');
   const reuse = button('复用参数', 'job-action', () => reuseJob(id), '把原任务参数添加为独立节点，不会自动开始生成');
   const locate = button('放入画布', 'job-action', () => placeJobOnCanvas(id), '在当前画布中查看任务结果，不会重新提交生成');
   const retry = button('再次生成', 'job-action', () => retryJob(id), '以原任务参数和随机种子再提交一次，由当前引擎重新校验');
-  const cancel = button('取消任务', 'job-action job-cancel', async () => { cancel.disabled = true; try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, {}); toast('已发送取消请求'); await pollJobs(); } finally { cancel.disabled = false; } });
-  actions.append(locate, reuse, retry, cancel); card.append(heading, time, track, state, error, warning, provenance, livePreview, thumbs, actions);
-  return { card, title, status, elapsed, track, bar, state, error, warning, provenance, livePreview, thumbs, locate, reuse, retry, cancel, outputSignature: '' };
+  const cancel = button('取消任务', 'job-action job-cancel', () => controlJob(id, 'cancel'));
+  const refresh = button('查询原任务', 'job-action job-refresh', () => controlJob(id, 'refresh'));
+  actions.append(locate, reuse, retry, cancel, refresh); card.append(heading, time, track, state, error, warning, provenance, livePreview, previewStatus, thumbs, actions);
+  return { card, title, status, elapsed, track, bar, state, error, warning, provenance, livePreview, previewStatus, thumbs, locate, reuse, retry, cancel, refresh, outputSignature: '' };
 }
 function renderJobs() {
-  $('#job-count').textContent = String(jobs.filter(job => ['queued', 'running'].includes(job.status)).length);
+  $('#job-count').textContent = String(jobs.filter(isJobActive).length);
   const list = $('#jobs-list');
   const filtered = filterJobs(jobs, $('#job-status-filter').value, $('#job-search').value, jobTitle);
   const unattached = jobs.filter(job => !resultForJob(job.id)).length;
@@ -1541,20 +2390,22 @@ function renderJobs() {
     let view = jobViews.get(job.id);
     if (!view) { view = newJobView(job.id); jobViews.set(job.id, view); }
     view.card.hidden = false;
-    write(view.title, jobTitle(job)); write(view.status, STATUS_NAMES[job.status] || job.status); view.status.className = `job-tag ${job.status}`;
-    write(view.elapsed, `耗时 ${duration(job.elapsed)}`);
-    const progress = progressPercent(job.progress); view.bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`;
-    const active = ['queued', 'running'].includes(job.status);
+    write(view.title, jobTitle(job)); write(view.status, jobStatusLabel(job)); view.status.className = `job-tag ${job.status}`;
+    write(view.elapsed, elapsedText(job));
+    const progress = job.status === 'unknown' ? null : progressPercent(job.progress); view.bar.style.width = `${job.status === 'completed' ? 100 : progress ?? 0}%`;
+    const active = isJobActive(job);
     view.track.classList.toggle('indeterminate', active && progress === null);
     view.livePreview.hidden = !active || !job.preview_url;
     if (active && job.preview_url && view.livePreview.getAttribute('src') !== job.preview_url) view.livePreview.src = job.preview_url;
+    view.previewStatus.hidden = !active; write(view.previewStatus, previewStatusText(job));
+    view.track.classList.toggle('is-stale', active && Boolean(job.progress_stale || job.progress_connected === false || job.client_connection_lost));
     const progressValue = job.status === 'completed' ? 100 : progress;
     if (progressValue === null) view.track.removeAttribute('aria-valuenow'); else view.track.setAttribute('aria-valuenow', String(Math.round(progressValue)));
-    view.track.setAttribute('aria-valuetext', progressValue === null ? STATUS_NAMES[job.status] || job.status : `${Math.round(progressValue)}%`);
+    view.track.setAttribute('aria-valuetext', active ? liveProgressText(job) : STATUS_NAMES[job.status] || job.status);
     view.state.hidden = !active;
     write(view.state, liveProgressText(job));
     write(view.error, String(job.error || '')); view.error.hidden = !job.error;
-    const warnings = [job.retry_warning, job.storage_warning].filter(Boolean).join('\n'); write(view.warning, warnings); view.warning.hidden = !warnings;
+    const warnings = [jobStateDetail(job), job.retry_warning, job.storage_warning].filter(Boolean).join('\n'); write(view.warning, warnings); view.warning.hidden = !warnings;
     const attached = !!resultForJob(job.id);
     const provenance = [job.retry_of ? `来自任务 ${String(job.retry_of).slice(0, 8)} · 保留原始参数` : '', !attached ? '尚未放入当前画布，可直接添加结果或复用参数' : ''].filter(Boolean).join('\n');
     write(view.provenance, provenance); view.provenance.hidden = !provenance;
@@ -1567,8 +2418,10 @@ function renderJobs() {
     view.thumbs.hidden = !job.outputs?.length;
     write(view.locate, attached ? '定位画布' : '放入画布'); view.locate.setAttribute('aria-label', attached ? '定位画布' : '放入画布'); view.locate.disabled = !attached && graph.nodes.length >= 500;
     view.reuse.disabled = !job.can_reuse || reusing.has(job.id); write(view.reuse, reusing.has(job.id) ? '正在读取…' : '复用参数');
-    view.retry.hidden = active; view.retry.disabled = !job.can_retry || retrying.has(job.id); write(view.retry, retrying.has(job.id) ? '正在提交…' : retryRequests.has(job.id) ? '查询 / 重试请求' : '再次生成');
+    view.retry.hidden = active; view.retry.disabled = active || !job.can_retry || retrying.has(job.id); write(view.retry, retrying.has(job.id) ? '正在提交…' : retryRequests.has(job.id) ? '查询 / 重试请求' : '再次生成');
     view.cancel.hidden = !active;
+    view.cancel.disabled = !canCancelJob(job) || controllingJobs.has(job.id); write(view.cancel, cancelActionLabel(job));
+    view.refresh.hidden = !canRefreshJob(job); view.refresh.disabled = controllingJobs.has(job.id);
     if (list.children[index] !== view.card) list.insertBefore(view.card, list.children[index] || null);
   });
   updateNodeJobStatus();
@@ -1588,7 +2441,13 @@ async function pollJobs() {
     }
     renderJobs();
     if (outputsChanged) { renderNodes(); if (singleSelected()?.type === 'result') renderInspector(); save(); }
-  } catch { /* Keep the last known task list on a transient disconnect. Status shows connection health. */ }
+  } catch {
+    for (const job of jobs) if (isJobActive(job)) {
+      job.progress_connected = false; job.progress_stale = Boolean(job.stage);
+      job.preview_stale = Boolean(job.preview_url); job.client_connection_lost = true;
+    }
+    renderJobs();
+  }
   finally { pollBusy = false; studio?.refresh(); }
 }
 function switchTab(tab) {
@@ -1599,19 +2458,45 @@ function switchTab(tab) {
   $('#properties-panel').hidden = !properties; $('#jobs-panel').hidden = properties;
 }
 function chooseReference(id = null) { uploadTarget = {id, identity: currentCanvasIdentity()}; $('#reference-input').click(); }
-async function editOutput(source, output, kind) {
+let resultReferenceDialog = null, resultReferenceOpening = false;
+async function passResultToWorkflow(source, output) {
+  if (resultReferenceOpening) return;
+  resultReferenceOpening = true;
   const identity = currentCanvasIdentity();
-  if (graph.nodes.length > 498) throw new Error('画布容量不足，请整理节点后再接入编辑');
-  const url = mediaURL(output.url); if (!url || output.type !== 'image') throw new Error('请选择有效的本地图片结果');
-  const response = await fetch(url); if (!response.ok) throw new Error('原生成图片暂不可读取，请检查对应引擎和输出文件');
-  const blob = await response.blob(); const file = new File([blob],output.filename || 'generated.png',{type:blob.type});
-  const asset = await storeLocalMedia(file);
-  if (identity !== currentCanvasIdentity() || getNode(source.id) !== source) throw new Error('画布已变化，原图片已保留，请重新选择');
-  const ref = createNode('reference',source.x+nodeSize(source).width+64,source.y,{title:'编辑素材 · '+source.data.title,localAssetId:asset.asset_id,localMedia:true,localFilename:file.name,url:`/api/assets/media/${asset.asset_id}`,mediaType:'image'});
-  const gen = createNode('generation',ref.x+360,ref.y,{kind,title:KIND_NAMES[kind],width:1024,height:1024,steps:kind==='qwen21_edit'?40:25,denoise:kind==='qwen21_edit'?1:.65});
-  placeNewNodes([ref,gen]);
-  mutate(()=>{graph.nodes.push(ref,gen);connect(graph,ref.id,gen.id,{targetField:'image_1'});selected=new Set([gen.id]);});
-  centerOnNode(gen);revealInspector();switchTab('properties');toast('已连接现有图片，可继续调参；不会重新生成原图');
+  try {
+    resultReferenceDialog?.close();
+    resultReferenceDialog = await openResultReferenceDialog({ source, initialOutputId: output?.output_id, api,
+      current: () => {
+        if (currentCanvasIdentity() !== identity || getNode(source.id) !== source) throw new Error('画布或结果节点已变化，请重新选择产物');
+        return { graph, canvasId: identity, backend: settings.backend_url };
+      },
+      apply: ({ reference, edge }, ticket) => {
+        placeNewNodes([reference]);
+        mutate(() => { graph.nodes.push(reference); graph.edges.push(edge); selected = new Set([ticket.target.id]); });
+        revealInspector(); switchTab('properties'); centerOnNode(ticket.target);
+        toast('参考素材已连接，可进入工作流查看或继续调参；尚未开始生成');
+      },
+    });
+  } finally { resultReferenceOpening = false; }
+}
+let resultEditBusy = false;
+async function editOutput(source, output, kind) {
+  if (resultEditBusy) { toast('正在接入图片，请稍候…'); return; }
+  resultEditBusy = true;
+  const identity = currentCanvasIdentity();
+  try {
+    toast('正在把图片接入编辑…');
+    const { reference, target, edge, assertCurrent } = await prepareResultEdit({ source, outputId: output?.output_id, kind, api,
+      position: { x: source.x + nodeSize(source).width + 444, y: source.y },
+      current: () => {
+        if (currentCanvasIdentity() !== identity || getNode(source.id) !== source) throw new Error('画布或结果节点已变化，请重新选择产物');
+        return { graph, canvasId: identity, backend: settings.backend_url };
+      },
+    });
+    assertCurrent(); placeNewNodes([reference, target]);
+    mutate(() => { graph.nodes.push(reference, target); graph.edges.push(edge); selected = new Set([target.id]); });
+    centerOnNode(target); revealInspector(); switchTab('properties'); toast('图片已接入编辑目标，可继续添加参考和调参；尚未开始生成');
+  } finally { resultEditBusy = false; }
 }
 async function uploadImage(file) {
   if (!/^image\/(png|jpeg|webp)$/.test(file.type)) throw new Error('参考素材支持 PNG、JPG、WebP 图片。视频输出可在生成后预览。');
@@ -1632,7 +2517,7 @@ async function importReferenceFiles(files, targetId = null, point = null, identi
   const origin = point || (target ? {x: target.x + 360, y: target.y} : viewPoint(canvas.getBoundingClientRect().left + 60, canvas.getBoundingClientRect().top + 120));
   const ticket = Symbol('media import');
   if (target) referenceImportTickets.set(targetId,ticket);
-  let count = 0;
+  let count = 0, lastImported = null;
   for (let index = 0; index < files.length; index++) {
     const file = files[index];
     let destination = null, previewURL = null;
@@ -1640,7 +2525,9 @@ async function importReferenceFiles(files, targetId = null, point = null, identi
       if (target && (getNode(targetId) !== target || referenceImportTickets.get(targetId) !== ticket)) break;
       if (currentCanvasIdentity() !== identity) throw new Error('画布已切换，素材未放入新画布');
       const mediaType = validateMediaFile(file);
-      destination = index === 0 && target ? target : addNode('reference', {title:file.name.replace(/\.[^.]+$/, '').slice(0,50),mediaType}, importPosition(origin,index-(target?1:0)),true);
+      // Reuse collision-aware placement, reserving space for media that loads
+      // later. Preserve the viewport during drops and multi-file preparation.
+      destination = index === 0 && target ? target : addNode('reference', {title:file.name.replace(/\.[^.]+$/, '').slice(0,50),mediaType}, importPosition(origin,index-(target?1:0)),false,false);
       referenceImportTickets.set(destination.id,ticket);
       previewURL = URL.createObjectURL(file);
       referenceImports.set(destination.id,{ticket,previewURL,mediaType,message:'预览已就绪 · 正在保存到客户端…'}); renderNodes();
@@ -1653,39 +2540,52 @@ async function importReferenceFiles(files, targetId = null, point = null, identi
       const candidate=clone(graph);Object.assign(candidate.nodes.find(n=>n.id===destination.id).data,values);
       try{parseGraph(serializeGraph(candidate));}catch(error){throw new Error(`素材与现有输入端口不匹配，请先断开对应连线：${error.message}`);}
       referenceImports.delete(destination.id); mutate(() => Object.assign(destination.data, values));
-      count++;
+      count++; lastImported = destination;
     } catch(error) {
       if (destination && getNode(destination.id) === destination && referenceImports.get(destination.id)?.ticket === ticket) { referenceImports.set(destination.id, {ticket,message:`保存失败：${error.message}。请重新选择素材。`,error:true}); renderNodes(); }
       reportError(new Error(`${file.name}：${error.message}`));
       if (currentCanvasIdentity() !== identity) break;
     } finally { if (previewURL) URL.revokeObjectURL(previewURL); }
   }
-  if (count) toast(`已将 ${count} 个素材保存到客户端，推理引擎未启动也可预览`);
+  if (count) {
+    if (!point && !target && lastImported && getNode(lastImported.id) === lastImported && currentCanvasIdentity() === identity) centerOnNode(lastImported);
+    toast(`已将 ${count} 个素材保存到客户端，推理引擎未启动也可预览`);
+  }
 }
 async function storeLocalMedia(file) {
   validateMediaFile(file);
-  const inferred={png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',mp4:'video/mp4',webm:'video/webm',mov:'video/quicktime'}[file.name.split('.').pop().toLowerCase()];
-  const response = await fetch(`/api/assets/media?name=${encodeURIComponent(file.name)}`, {method:'POST',headers:{'Content-Type':file.type || inferred || 'application/octet-stream','X-FW-Token':csrf},body:file});
+  const response = await fetch(`/api/assets/media?name=${encodeURIComponent(file.name)}`, {method:'POST',headers:{'Content-Type':mediaFileContentType(file),'X-FW-Token':csrf},body:file});
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || `保存素材失败（${response.status}）`);
   return result;
 }
-async function prepareCanvasImages(targets) {
-  const before = serializeGraph(graph), identity = currentCanvasIdentity(), backend = settings.backend_url;
-  const updates = await prepareLocalImages(clone(graph), targets, backend, api);
-  if (identity !== currentCanvasIdentity() || backend !== settings.backend_url || before !== serializeGraph(graph)) throw new Error('准备图片期间画布或引擎已变化，未提交生成，请重新运行');
+async function prepareCanvasImages(targets, options = {}) {
+  const frozen = clone(options.graph || graph), projection = options.projection || frozen;
+  const before = serializeGraph(frozen), identity = options.canvasId || currentCanvasIdentity(), backend = options.backend || settings.backend_url;
+  const guard = () => { if (identity !== currentCanvasIdentity() || backend !== settings.backend_url || before !== serializeGraph(graph)) throw new Error('准备素材期间画布或引擎已变化，未提交生成，请重新运行'); };
+  guard(); assertCanvasMediaReady(targets, projection, !!options.execution);
+  const updates = await prepareLocalImages(projection, targets, backend, async (...args) => {
+    guard(); const result = await api(...args); guard(); return result;
+  });
+  guard(); assertCanvasMediaReady(targets, projection, !!options.execution);
+  for (const update of updates) Object.assign(frozen.nodes.find(node => node.id === update.id).data, {name:update.name,uploadBackend:update.uploadBackend});
   if (updates.length) mutate(() => { for (const update of updates) Object.assign(getNode(update.id).data, {name:update.name,uploadBackend:update.uploadBackend}); });
+  return frozen;
 }
 
 canvas.addEventListener('dblclick', event => {
-  if (event.button !== 0 || event.target.closest('.node,button,input,textarea,select,video,a,[data-edge-id],.edge-line')) return;
+  if (event.button !== 0 || event.target.closest('.node,button,input,textarea,select,video,audio,a,[data-edge-id],.edge-line')) return;
   event.preventDefault(); cancelConnection(); openNodeMenu(event.clientX, event.clientY);
 });
 canvas.addEventListener('contextmenu', event => {
-  if (event.target.closest('input,textarea,select,[contenteditable=true],video,a')) return;
+  if (event.target.closest('input,textarea,select,[contenteditable=true],video,audio,a')) return;
   event.preventDefault(); openNodeMenu(event.clientX, event.clientY, event.target.closest('.node')?.dataset.nodeId || null);
 });
 document.addEventListener('pointerdown', event => { if (nodeMenu && !nodeMenu.contains(event.target)) closeNodeMenu(); }, true);
+document.addEventListener('pointerdown', () => { if (nodeActionPress.cancel()) requestAnimationFrame(renderNodes); }, true);
+document.addEventListener('pointerup', event => { if (nodeActionPress.release(event.pointerId, event.target)) renderNodes(); }, true);
+document.addEventListener('pointercancel', event => { if (nodeActionPress.cancel(event.pointerId)) renderNodes(); }, true);
+window.addEventListener('blur', () => { if (nodeActionPress.cancel()) renderNodes(); });
 window.addEventListener('resize', () => closeNodeMenu());
 canvas.addEventListener('wheel', event => {
   if (event.target.closest('textarea,select') && !event.ctrlKey) return;
@@ -1697,7 +2597,7 @@ canvas.addEventListener('pointerdown', event => {
   finishKeyboardMove();
   if (event.button !== 0 && event.button !== 1) return;
   const card = event.target.closest('.node');
-  const interactive = event.target.closest('button,input,textarea,select,video,a');
+  const interactive = event.target.closest('button,input,textarea,select,video,audio,a');
   if (event.button === 0 && !spaceDown && tool !== 'hand' && event.target.closest('[data-edge-id],.edge-line')) return;
   if (card && event.button === 0 && !spaceDown && tool !== 'hand') {
     revealInspector();
@@ -1760,6 +2660,7 @@ function finishPointer(event) {
   if (pointer.mode === 'drag') pushHistory(pointer.before);
   if (pointer.mode === 'pan') save();
   pointer = null; $('#selection-box').hidden = true; canvas.classList.remove('panning'); renderInspector();
+  contentLayout?.resume();
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 }
 canvas.addEventListener('pointerup', finishPointer);
@@ -1777,7 +2678,7 @@ canvas.addEventListener('drop', event => {
   const card = event.target.closest('.node'), id = card?.dataset.nodeId;
   importReferenceFiles(Array.from(event.dataTransfer?.files || []), getNode(id)?.type === 'reference' ? id : null, viewPoint(event.clientX,event.clientY)).catch(reportError);
 });
-function finishKeyboardMove() { if (keyboardMoveBefore !== null) { pushHistory(keyboardMoveBefore); keyboardMoveBefore = null; } }
+function finishKeyboardMove() { if (keyboardMoveBefore !== null) { pushHistory(keyboardMoveBefore); keyboardMoveBefore = null; contentLayout?.resume(); } }
 document.addEventListener('keydown', event => {
   const editing = event.target.closest('input,textarea,select,[contenteditable=true]');
   if (event.defaultPrevented) return;
@@ -1820,6 +2721,31 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) { save(true); if ($('#preview-dialog').open) $('#preview-dialog').close(); clearPreview(); document.querySelectorAll('video,audio').forEach(media => media.pause()); }
 });
 new ResizeObserver(() => { applyViewport(); }).observe(canvas);
+contentLayout = createContentLayout({
+  identity: ensureCanvasIdentity,
+  read: () => graph.nodes.flatMap(node => {
+    const element = document.getElementById(`fw-node-${node.id}`);
+    return element ? [{ id: node.id, node, x: node.x, y: node.y, width: element.offsetWidth, height: element.offsetHeight, element }] : [];
+  }),
+  busy: () => !!pointer || keyboardMoveBefore !== null || !!draftEditing ||
+    !!document.activeElement?.matches('input,textarea,select,[contenteditable=true]'),
+  apply: positions => {
+    for (const position of positions) {
+      const node = getNode(position.id); Object.assign(node, position);
+      const card = document.getElementById(`fw-node-${node.id}`);
+      if (card) { card.style.left = `${node.x}px`; card.style.top = `${node.y}px`; }
+    }
+    renderEdges();
+  },
+  commit: positions => {
+    history.push(layoutHistoryEntry(positions)); if (history.length > 80) history.shift();
+    future = []; save(); updateHistory();
+  },
+  onError: reportError,
+  schedule: requestAnimationFrame,
+  observe: callback => new ResizeObserver(callback),
+});
+document.addEventListener('focusout', () => requestAnimationFrame(() => contentLayout.resume()));
 document.querySelectorAll('[data-close]').forEach(element => element.addEventListener('click', () => element.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); } }));
 $('#preview-dialog').addEventListener('close', clearPreview);
@@ -1844,9 +2770,9 @@ bind('#engine-status', () => runDiagnostics()); bind('#diagnostics-button', () =
 bind('#discovery-open', () => runDiagnostics());
 bind('#export-diagnostics', () => { downloadJSON(publicChecksReport(diagnosticChecks, knownLocalPaths(), { mode: getNode(diagnosticNodeId)?.data.kind, repair_prompt: workflowRepair }), `frameweave-environment-${new Date().toISOString().slice(0, 10)}.json`); toast('已导出脱敏状态摘要，不包含本机路径或原始检查明细'); });
 bind('#settings-button', () => openSettings());
-bind('#packages-button', openPackages); bind('#import-package', () => $('#package-input').click()); bind('#refresh-packages', loadPackages);
+bind('#packages-button', openPackages); bind('#import-package', () => $('#package-input').click()); bind('#refresh-packages', () => loadPackages({ force: true }));
 bind('#package-current-node', packageCurrentNode);
-bind('#package-select-recommended', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = ['image', 'audio', 'video'].includes(fieldType(item)) || item.recommended !== false; }); renderPackageDraft(); } });
+bind('#package-select-recommended', () => { if (packageDraft) { const ids = new Set(initialEditorFieldIds(packageDraft.fields)); packageDraft.fields.forEach(item => { item.selected = ids.has(item.id); }); renderPackageDraft(); } });
 bind('#package-select-all', () => { if (packageDraft) { packageDraft.fields.forEach(item => { item.selected = true; }); renderPackageDraft(); } });
 $('#package-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
@@ -1855,6 +2781,11 @@ $('#package-input').addEventListener('change', event => {
 $('#package-editor-form').addEventListener('submit', event => {
   event.preventDefault(); if (!packageDraft) return;
   (async () => {
+    const openingDraft = packageDraft, identity = currentCanvasIdentity(), targetGraph = graph;
+    const ensureCurrent = () => {
+      if (identity !== currentCanvasIdentity() || targetGraph !== graph) throw new Error('画布已切换，工作流未放入新画布；已保存的包仍保留在本机库');
+      if (openingDraft !== packageDraft) throw new Error('工作流编辑对象已切换；已保存的包仍保留在本机库');
+    };
     const fields = packageDraft.fields.filter(item => item.selected).map(({ selected: _selected, recommended: _recommended, ...definition }) => definition);
     $('#save-package').disabled = true;
     try {
@@ -1862,7 +2793,8 @@ $('#package-editor-form').addEventListener('submit', event => {
       const unchanged = packageDraft.sourceJSON && packageDraft.originalEditor === stableStringify({ name, description, fields: packageDraft.fields });
       const result = await api('/api/packages', unchanged ? { source_json: packageDraft.sourceJSON } : { name, description, prompt: packageDraft.prompt, fields });
       if (!result.package?.id) throw new Error('本地服务没有返回有效的工作流包');
-      await loadPackages(); addPackageNode(result.package); packageDraft = null;
+      rememberPackageDefinition(result.package); await loadPackages(); ensureCurrent();
+      await addPackageNode(result.package, { ensureCurrent }); if (packageDraft === openingDraft) packageDraft = null;
     } finally { $('#save-package').disabled = false; }
   })().catch(reportError);
 });
@@ -1870,7 +2802,7 @@ $('#settings-form').addEventListener('submit', event => {
   event.preventDefault();
   (async () => {
     const next = { performance_profile: $('#performance-profile').value, auto_update: $('#auto-update').checked, auto_start_engine: $('#engine-autostart').checked, backend_url: $('#backend-url').value.trim(), model_roots: $('#model-roots').value.split('\n').map(line => line.trim()).filter(Boolean), comfy_roots: $('#comfy-roots').value.split('\n').map(line => line.trim()).filter(Boolean) };
-    await pollJobs(); if (next.backend_url !== settings.backend_url && hasActiveJobs()) throw new Error('有活动任务，完成或取消后才能切换推理服务。');
+    await pollJobs(); if (next.backend_url !== settings.backend_url && !canUseBackend(next.backend_url)) throw new Error('有未结束或待确认任务，只能恢复原任务所属引擎。');
     const result = await api('/api/settings', next);
     settings = result.settings || next;
     $('#settings-dialog').close(); await refreshEngine(true); renderInspector();
@@ -1879,14 +2811,7 @@ $('#settings-form').addEventListener('submit', event => {
 });
 $('#project-input').addEventListener('change', event => {
   const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
-  (async () => {
-    if (workflowCanvas.isRunning()) throw new Error('请先停止后续调度，再导入其他画布');
-    if (file.size > 8 * 1024 * 1024) throw new Error('画布 JSON 最大为 8 MiB。');
-    const incoming = parseGraph(await file.text());
-    if (workflowCanvas.isRunning()) throw new Error('画布正在运行或导入，请等待当前操作完成');
-    mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(file.name)); });
-    applyViewport(); save(true); toast('画布已导入。原画布可通过撤销恢复。');
-  })().catch(reportError);
+  importCanvasFile(file).catch(reportError);
 });
 $('#reference-input').addEventListener('change', event => {
   const files = [...(event.target.files || [])]; const target = uploadTarget; event.target.value = ''; uploadTarget = null;
@@ -1897,10 +2822,8 @@ $('#workflow-input').addEventListener('change', event => {
   (async () => {
     if (file.size > 8 * 1024 * 1024) throw new Error('API 工作流最大为 8 MiB。');
     const parsed = parseJSONWithSafeNumbers(await file.text());
-    const prompt = parsed.prompt && !parsed.class_type ? parsed.prompt : parsed;
-    if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt) || prompt.nodes || !Object.values(prompt).length || !Object.values(prompt).every(node => node && typeof node.class_type === 'string' && node.inputs && typeof node.inputs === 'object')) throw new Error('请导入 ComfyUI 的 API 格式 JSON，普通画布 JSON 不包含可执行节点。');
-    if (getNode(target)) editNode(target, 'apiPrompt', prompt, true);
-    toast('API 工作流已导入，原始节点与参数完整保留');
+    const prompt = apiPromptFromDocument(parsed);
+    if (getNode(target)) await importApiInterface({ prompt }, file.name.replace(/\.json$/i, ''), getNode(target));
   })().catch(reportError);
 });
 
@@ -1914,6 +2837,13 @@ async function initialize() {
   try {
     const cached = localStorage.getItem(STORAGE_KEY);
     if (cached) { const parsed = parseGraph(cached); graph = { nodes: parsed.nodes, edges: parsed.edges }; viewport = parsed.viewport; selected = new Set([graph.nodes.find(node => node.type === 'generation')?.id].filter(Boolean)); restored = true; }
+    try {
+      const ports = JSON.parse(localStorage.getItem(PORT_VIEW_STORAGE_KEY) || 'null');
+      if (restored && ports?.canvasIdentity === currentCanvasIdentity() && Array.isArray(ports.nodes)) {
+        for (const id of ports.nodes) if (typeof id === 'string' && getNode(id)) expandedInputs.add(id);
+        restorePortViews(ports.views);
+      }
+    } catch { /* Invalid presentation state never prevents graph recovery. */ }
     if (restored) { const cachedTitle = localStorage.getItem(TITLE_STORAGE_KEY); if (cachedTitle !== null) setProjectTitle(cachedTitle); }
     const cachedJobs = JSON.parse(localStorage.getItem(JOB_MAP_KEY) || '{}'); if (cachedJobs && typeof cachedJobs === 'object' && !Array.isArray(cachedJobs)) jobNodes = cachedJobs;
   } catch { toast('本地画布记录无效，已打开安全示例。可重新导入备份。', true); }
@@ -1934,10 +2864,20 @@ async function initialize() {
   setInterval(() => { api('/api/heartbeat').catch(() => {}); }, 30000);
 }
 const updateCenter = createUpdateCenter({ api, reportError, beforeExit: () => { if (hasActiveJobs() || workflowCanvas.isRunning() || studio.hasPending()) throw new Error('请等待生成与画布调度完成，并查询待确认提交后再退出。'); if (!save(true)) throw new Error('浏览器草稿保存失败，本次退出已取消。请先导出或保存本地画布版本，确认后再手动关闭窗口。'); } });
-const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError });
+const engineCenter = createEngineCenter({ api, settings: () => settings, connect: useBackend, toast, reportError, loadPackages });
+const hubCenter = createHubCenter({ api, reportError, downloadJSON, toast,
+  selectedRequest: () => selectedHubRequest({ graph: () => graph, selectedIds: () => [...selected],
+    backend: () => settings.backend_url, canvasIdentity: currentCanvasIdentity, ensurePackageDefinition }) });
+$('#hub-connection-open').addEventListener('click', () => hubCenter.open().catch(reportError));
 initializeCanvasActions();
-studio = createGenerationStudio({ api, engine: () => engine, jobs: () => jobs, refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, catalog, openSettings, copyText, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
-workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend, prepareInputs: prepareCanvasImages,
+const studioEditor = createStudioWorkflowEditor({ api, toast, openSettings, editor: nativeEditor, loadPackage: ensurePackageDefinition,
+  chooseSource: chooseStudioEditorSource,
+  registerTarget(target, adapter) { workspaceEditorTargets.set(target, adapter); return () => workspaceEditorTargets.delete(target); },
+  configure: (data, options) => configureWorkflowInterface({ api, toast, chooseEditorInterface, autoEditorInterfaceSelection,
+    resolveEditorConflicts, completeInterfaceInputs }, data, options),
+});
+studio = createGenerationStudio({ api, editWorkflow: context => studioEditor.open(context), engine: () => engine, jobs: () => jobs, controlJob, isJobControlling: id => controllingJobs.has(id), refreshEngine, refreshJobs: pollJobs, toast, reportError, preview, placeJob: placeJobOnCanvas, addRecipe: installRecipe, canvasIdentity: currentCanvasIdentity, canvasSnapshot: snapshot, prepareH3Package: (document, guard) => inspectPackageDocument(document, document.name, '', guard), catalog, openSettings, copyText, storeLocalMedia, packages: () => packages, loadPackages, openPackages, settings: () => settings, outputLocation: (id, index, open = false) => api(`/api/jobs/${encodeURIComponent(id)}/output-location`, { index, open }), performancePreset: () => settings.performance_profile || 'auto' });
+workflowCanvas = createWorkflowCanvas({ api, graph: () => graph, viewport: () => viewport, title: () => projectTitle, canvasIdentity: currentCanvasIdentity, selectedIds: () => [...selected], packages: () => packages, ensurePackageDefinition, rememberPackageDefinition, engine: () => engine, loadPackages, openPackages, downloadJSON, toast, reportError, prepareBackend: prepareWorkflowBackend, prepareInputs: prepareCanvasImages,
   connect: (source, target, options) => mutate(() => connect(graph, source, target, options)),
   setGraph: (incoming, title) => { studio.open('canvas'); mutate(() => { replaceCanvasIdentity(); graph = { nodes: incoming.nodes, edges: incoming.edges }; viewport = incoming.viewport; selected.clear(); selectedEdge = null; setProjectTitle(importedProjectTitle(title, '导入的工作流集合')); }); applyViewport(); save(true); },
   onJob: acceptCanvasWorkflowJob });
@@ -1952,19 +2892,20 @@ const workflowConfigurations = createWorkflowConfigurations({api, toast, bundle:
     const incoming = parseGraph(bundle.canvas).nodes[0];
     const entry = bundle.packages.find(item => item.id === incoming.data.package_id);
     const {package: pack} = await api('/api/packages', entry.source_json ? {source_json:entry.source_json} : entry.document);
+    rememberPackageDefinition(pack);
     let editorId = '';
     if (incoming.data.editor_id) {
       const editor = bundle.editors.find(item => item.id === incoming.data.editor_id);
-      editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json})).id;
+      editorId = (await api('/api/editor-workflows', {name:editor.name, source_json:editor.source_json, source_kind:editor.source_kind || 'unknown'})).id;
     }
     await loadPackages();
     if (identity !== currentCanvasIdentity()) throw new Error('画布已切换，配置未放入新画布；已登记的工作流仍在包库');
     checkCapacity();
     const replace = canReplace();
-    const node = replace ? target : addPackageNode(pack);
+    const node = replace ? target : await addPackageNode(pack);
     mutate(() => {
       node.data = {...structuredClone(incoming.data), package_id:pack.id,
-        packageFields:pack.fields.map(({id,label,type})=>({id,label,type})), ...(editorId ? {editor_id:editorId} : {})};
+        packageFields:pack.fields.map(cachedPackageField), ...(editorId ? {editor_id:editorId} : {})};
       selected = new Set([node.id]); selectedEdge = null;
     });
     revealInspector(); switchTab('properties');

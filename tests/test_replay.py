@@ -59,6 +59,62 @@ class ReplayHTTPTests(unittest.TestCase):
         self.assertIsInstance(recipe["warnings"], list)
         self.assertEqual(len(self.prompt_calls()), before)
 
+    def test_new_preset_submission_persists_resolved_refinement_defaults(self):
+        resolved = {"enabled": True, "width": 1024, "height": 1024, "steps": 8,
+                    "denoise": 0.3, "upscale_method": "bislerp"}
+        compiled = {"prompt": copy.deepcopy(service_fixture.API_JOB["prompt"]),
+                    "summary": {"kind": "sdxl", "width": 512, "height": 512, "steps": 8,
+                                "refine": resolved}}
+        with patch.object(self.app, "compile", return_value=compiled):
+            status, _, job = self.post("/api/jobs", {"kind": "sdxl", "positive": "test", "refine": {"enabled": True}})
+        self.assertEqual(status, 200, job)
+        status, recipe = self.recipe(job)
+        self.assertEqual(status, 200, recipe)
+        self.assertEqual(recipe["request"]["refine"], resolved)
+        self.assertEqual(recipe["request"]["width"], 512)
+        self.assertEqual(recipe["request"]["steps"], 8)
+
+    def test_recipe_returns_only_registered_input_previews_on_original_backend(self):
+        job = self.terminal_job()
+        path = self.app.data_dir / "runs" / f"{job['id']}.json"
+        run = json.loads(path.read_text(encoding="utf-8"))
+        run["request"] = {"kind": "sdxl_i2i", "references": ["refs/target.png", "missing.png"],
+                          "positive": "recorded", "width": 512, "height": 512, "seed": 42}
+        atomic_json(path, run)
+        own = self.app.register_media("target.png", "refs", "input")
+        self.app.register_media("target.png", "refs", "input", backend="http://127.0.0.1:8189")
+        self.app.register_media("missing.png", "", "output")
+        before_media = copy.deepcopy(self.app.media)
+        before_calls = len(self.backend.calls)
+        status, recipe = self.recipe(job)
+        self.assertEqual(status, 200, recipe)
+        self.assertEqual(recipe["job_id"], job["id"])
+        self.assertEqual(recipe["backend"], job["backend"])
+        self.assertEqual(recipe["request"], run["request"])
+        self.assertEqual(recipe["references"], [{"name": "refs/target.png", "backend": job["backend"], "url": own}])
+        self.assertEqual(self.app.media, before_media)
+        self.assertEqual(len(self.backend.calls), before_calls)
+
+    def test_recipe_reference_owner_does_not_change_when_current_backend_changes(self):
+        job = self.terminal_job()
+        path = self.app.data_dir / "runs" / f"{job['id']}.json"
+        run = json.loads(path.read_text(encoding="utf-8"))
+        run["request"] = {"kind": "h3_i2v", "references": ["first.png", "last.png"], "seed": 123}
+        atomic_json(path, run)
+        own = self.app.register_media("first.png", "", "input")
+        self.app.register_media("last.png", "", "input", backend="http://127.0.0.1:8189")
+        original = self.app.backend.url
+        self.app.backend.url = "http://127.0.0.1:8189"
+        try:
+            status, recipe = self.recipe(job)
+        finally:
+            self.app.backend.url = original
+        self.assertEqual(status, 200, recipe)
+        self.assertFalse(recipe["replayable"])
+        self.assertEqual(recipe["backend"], original)
+        self.assertEqual(recipe["references"], [{"name": "first.png", "backend": original, "url": own}])
+        self.assertEqual(recipe["request"]["references"], ["first.png", "last.png"])
+
     def test_recipe_and_retry_cannot_access_unowned_job(self):
         status, _ = self.recipe({"id": "foreign-job"})
         self.assertGreaterEqual(status, 400)
@@ -270,7 +326,18 @@ class ReplayHTTPTests(unittest.TestCase):
         self.backend.info["TestOutput"]["input"]["required"]["seed"] = ["INT", {"min": 0, "max": 2**64 - 1}]
         request = copy.deepcopy(service_fixture.API_JOB)
         request["prompt"]["1"]["inputs"]["seed"] = 2**64 - 1
-        source = self.terminal_job(request)
+        status, _, rejected = self.post("/api/jobs", request)
+        self.assertEqual(status, 400, rejected)
+        self.assertEqual(self.prompt_calls(), [])
+        safe_request = copy.deepcopy(request)
+        safe_request["prompt"]["1"]["inputs"]["seed"] = 1
+        source = self.terminal_job(safe_request)
+        run_path = self.app.data_dir / "runs" / f"{source['id']}.json"
+        run = json.loads(run_path.read_text(encoding="utf-8"))
+        run["request"] = request
+        run["prompt"] = copy.deepcopy(request["prompt"])
+        atomic_json(run_path, run)
+        self.restart_client()
         status, recipe = self.recipe(source)
         self.assertGreaterEqual(status, 400, recipe)
         status, _, child = self.retry(source)

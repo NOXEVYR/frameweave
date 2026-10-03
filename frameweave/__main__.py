@@ -29,6 +29,16 @@ def setup_logging(data: Path) -> None:
         pass
 
 
+def _idle_can_exit(app, port):
+    """An active optional worker defers idle shutdown without ending the watcher."""
+    try:
+        return app.prepare_exit(port)
+    except ValueError:
+        # The interactive exit endpoint returns the concrete reason. The idle
+        # watcher simply keeps serving and checks again on its normal interval.
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="棱光 PrismCanvas · 轻量本地 AI 画布")
     parser.add_argument("--port", type=int, default=None)
@@ -114,7 +124,7 @@ def main():
             def idle_exit():
                 while not app.closed.wait(15):
                     if time.monotonic() - app.last_seen > 180:
-                        if not app.prepare_exit(server.server_port):
+                        if not _idle_can_exit(app, server.server_port):
                             continue
                         app.closed.set()
                         server.shutdown()

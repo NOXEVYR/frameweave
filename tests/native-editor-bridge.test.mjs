@@ -17,7 +17,10 @@ function harness(options = {}) {
   const appPrototype = {};
   const app = Object.assign(Object.create(appPrototype), {
     graph: rootGraph,
-    registerExtension: value => { extension = value; },
+    registerExtension(value, ...args) {
+      if (value.name === 'PrismCanvas.NativeEditorBridge') extension = value;
+      return options.registerExtension?.call(this, value, ...args);
+    },
     async loadGraphData(value, ...args) { calls.push('load'); if (options.load) await options.load(value, ...args); current = value; },
     async graphToPrompt() { calls.push('compile'); return { workflow: current, output: { 1: { class_type: 'Known', inputs: {} } } }; },
   });
@@ -45,7 +48,7 @@ function harness(options = {}) {
   if (options.windowAppReadyAfter) Object.defineProperty(window, 'app', { get: () =>
     ++windowAppChecks >= options.windowAppReadyAfter ? app : undefined });
   const documentObject = { querySelector: selector => selector === '#splash-loader' && splashPresent ? { isConnected: true } : null };
-  vm.runInNewContext(source, { app, window, document: documentObject, setTimeout, clearTimeout, TextEncoder, createNativeEditorMedia,
+  vm.runInNewContext(`'use strict';\n${source}`, { app, window, document: documentObject, setTimeout, clearTimeout, TextEncoder, createNativeEditorMedia,
     createEditorMediaPreview: undefined,
     Date: { now: () => options.now ? options.now() : Date.now() } });
   const emit = (action, requestId, data = {}, overrides = {}) => listener({ source: parent, origin: window.__PRISM_EDITOR__.parentOrigin, data: { source: 'prism-parent', nonce: 'private-session', action, requestId, ...data }, ...overrides });
@@ -1562,20 +1565,321 @@ test('claimed editor blocks native file and API import before graph mutation, wh
   assert.equal(api.length, 2); assert.ok(h.replies.at(-1).message.result.output);
 });
 
-test('native document controls block tab lifecycle commands and direct close without blocking node editing commands', async () => {
-  const calls = [], command = {$id: 'command', execute(id, ...args) {calls.push([this, id, args]); return Promise.resolve();}},
-    workflow = {$id: 'workflow', closeWorkflow() {calls.push('close');}, deleteWorkflow() {calls.push('delete');}, renameWorkflow() {calls.push('rename');}};
-  const h = harness({extensionManager: {command, workflow}}); h.start();
+const blockedNativeCommandIds = ['Comfy.NewBlankWorkflow','Comfy.OpenWorkflow','Comfy.LoadDefaultWorkflow','Comfy.SaveWorkflow',
+  'Comfy.SaveWorkflowAs','Comfy.RenameWorkflow','Comfy.DuplicateWorkflow','Workspace.NextOpenedWorkflow',
+  'Workspace.PreviousOpenedWorkflow','Workspace.CloseWorkflow'];
+const documentSidebarIds = ['workflows', 'apps'];
+function nativeSidebarFixture() {
+  const fixture = nativeCommandFixture([]), calls = [];
+  const sidebar = {sidebarTabs: [], activeSidebarTabId: null};
+  // Match the official public store: command functions and core registration
+  // capture these original closures, rather than calling the public wrappers.
+  const toggle = function (id) { calls.push(['toggle', id]); sidebar.activeSidebarTabId = sidebar.activeSidebarTabId === id ? null : id; };
+  const register = function (tab, options) {
+    calls.push(['register', tab.id]);
+    sidebar.sidebarTabs = options?.prepend ? [tab, ...sidebar.sidebarTabs] : [...sidebar.sidebarTabs, tab];
+    fixture.store.registerCommand({id: `Workspace.ToggleSidebarTab.${tab.id}`, function: async () => toggle(tab.id)});
+  };
+  Object.assign(sidebar, {toggleSidebarTab: toggle, registerSidebarTab: register,
+    unregisterSidebarTab(id) {
+      calls.push(['unregister', id]);
+      const index = sidebar.sidebarTabs.findIndex(tab => tab.id === id);
+      if (index !== -1) {
+        sidebar.sidebarTabs.splice(index, 1);
+        if (sidebar.activeSidebarTabId === id) sidebar.activeSidebarTabId = null;
+      }
+    },
+    registerCoreSidebarTabs() {
+      for (const id of ['assets', 'node-library', 'model-library', ...documentSidebarIds]) register({id});
+    },
+  });
+  sidebar.registerCoreSidebarTabs(); fixture.extensionManager.sidebarTab = sidebar;
+  return {...fixture, sidebar, sidebarCalls: calls};
+}
+function nativeCommandFixture(definitions) {
+  // Match the official store: public commands and native getCommand share the
+  // same mutable implementation objects; re-registration replaces an object
+  // and invalidates the computed workspace facade (which has no $id).
+  const commandsById = Object.create(null);
+  let facade;
+  class Command {
+    constructor(command) { this.id = command.id; this.function = command.function; }
+  }
+  const store = {
+    registerCommand(command) { commandsById[command.id] = new Command(command); facade = null; },
+    getCommand(id) { return commandsById[id]; },
+    async execute(id, options) { await commandsById[id].function(options?.metadata); },
+  };
+  const extensionManager = { get command() { return facade ||= {commands: Object.values(commandsById), execute: store.execute}; } };
+  const registerExtension = function (extension) {
+    for (const command of extension.commands || []) store.registerCommand(command);
+  };
+  for (const command of definitions) store.registerCommand(command);
+  return {store, extensionManager, registerExtension};
+}
+
+test('unclaimed public sidebars keep registration, toggling, receivers, arguments and return semantics', async () => {
+  const fixture = nativeSidebarFixture(), {sidebar} = fixture;
+  const calls = [], result = {}, promise = Promise.resolve(result), error = new Error('sidebar failure'), receiver = {};
+  sidebar.registerSidebarTab = function (...args) { calls.push([this, args]); return args[0].id === 'apps' ? promise : result; };
+  sidebar.toggleSidebarTab = function (...args) { calls.push([this, args]); if (args[0] === 'failure') throw error; return result; };
+  sidebar.registerCoreSidebarTabs = function (...args) { calls.push([this, args]); return promise; };
+  const h = harness(fixture); h.start();
+  const tab = {id: 'workflows'}, options = {prepend: true};
+  assert.equal(sidebar.registerSidebarTab.call(receiver, tab, options), result);
+  assert.equal(sidebar.registerSidebarTab({id: 'apps'}), promise);
+  assert.equal(sidebar.toggleSidebarTab.call(receiver, 'workflows', options), result);
+  assert.equal(sidebar.registerCoreSidebarTabs.call(receiver, options), promise);
+  assert.deepEqual(calls[0], [receiver, [tab, options]]); assert.deepEqual(calls[2], [receiver, ['workflows', options]]);
+  assert.deepEqual(calls[3], [receiver, [options]]);
+  assert.throws(() => sidebar.toggleSidebarTab('failure'), value => value === error);
+  await fixture.store.execute('Workspace.ToggleSidebarTab.apps'); assert.equal(sidebar.activeSidebarTabId, 'apps');
+  assert.equal(h.replies.filter(reply => reply.message.action === 'notice').length, 0);
+});
+
+for (const active of documentSidebarIds) test(`claim removes the already-open ${active} sidebar before awaiting native load`, async () => {
+  const fixture = nativeSidebarFixture(), {sidebar} = fixture;
+  let release; const gate = new Promise(resolve => {release = resolve;});
+  const h = harness({...fixture, load: () => {
+    assert.equal(sidebar.activeSidebarTabId, null);
+    assert.deepEqual(sidebar.sidebarTabs.map(tab => tab.id), ['assets', 'node-library', 'model-library']);
+    return gate;
+  }}); h.start(); sidebar.toggleSidebarTab(active);
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  assert.equal(h.calls.length, 1);
+  for (const id of documentSidebarIds) {
+    assert.equal(sidebar.toggleSidebarTab(id), undefined);
+    await fixture.store.execute(`Workspace.ToggleSidebarTab.${id}`);
+    await fixture.extensionManager.command.execute(`Workspace.ToggleSidebarTab.${id}`);
+  }
+  assert.equal(sidebar.activeSidebarTabId, null);
+  assert.equal(h.replies.some(reply => reply.message.result?.code === 'native-sidebar-controls-unavailable'), false);
+  release(); await h.flush(); assert.deepEqual(copy(h.current()), document());
+  sidebar.toggleSidebarTab('assets'); assert.equal(sidebar.activeSidebarTabId, 'assets');
+  await fixture.store.execute('Workspace.ToggleSidebarTab.node-library'); assert.equal(sidebar.activeSidebarTabId, 'node-library');
+});
+
+test('public and core sidebar registration cannot restore document sidebars or replace guarded command functions', async () => {
+  const fixture = nativeSidebarFixture(), {sidebar} = fixture, h = harness(fixture); h.start();
+  const oldFacade = fixture.extensionManager.command, oldCommand = fixture.store.getCommand('Workspace.ToggleSidebarTab.workflows');
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  const registrations = fixture.sidebarCalls.filter(call => call[0] === 'register').length;
+  for (const id of documentSidebarIds) sidebar.registerSidebarTab({id}, {prepend: true});
+  assert.equal(fixture.sidebarCalls.filter(call => call[0] === 'register').length, registrations);
+  sidebar.registerSidebarTab({id: 'custom'}, {prepend: true});
+  await fixture.store.execute('Workspace.ToggleSidebarTab.custom'); assert.equal(sidebar.activeSidebarTabId, 'custom');
+  sidebar.registerCoreSidebarTabs();
+  assert.notEqual(fixture.store.getCommand('Workspace.ToggleSidebarTab.workflows'), oldCommand);
+  assert.deepEqual(sidebar.sidebarTabs.filter(tab => documentSidebarIds.includes(tab.id)), []);
+  assert.equal(sidebar.activeSidebarTabId, 'custom');
+  for (const id of documentSidebarIds) {
+    await oldFacade.execute(`Workspace.ToggleSidebarTab.${id}`);
+    await fixture.store.execute(`Workspace.ToggleSidebarTab.${id}`);
+  }
+  h.app.registerExtension({name: 'ReplaceSidebarCommand', commands: documentSidebarIds.map(id => ({
+    id: `Workspace.ToggleSidebarTab.${id}`, function() {throw new Error('replacement must be guarded');},
+  }))});
+  for (const id of documentSidebarIds) await fixture.store.execute(`Workspace.ToggleSidebarTab.${id}`);
+  assert.equal(sidebar.activeSidebarTabId, 'custom'); assert.equal(h.runNextTimer(), undefined);
+});
+
+test('sidebar controls remain idempotent and remove duplicate registrations at lifecycle boundaries', async () => {
+  const fixture = nativeSidebarFixture(), {sidebar} = fixture, h = harness(fixture); h.start();
+  const toggle = sidebar.toggleSidebarTab, register = sidebar.registerSidebarTab, core = sidebar.registerCoreSidebarTabs;
+  sidebar.registerSidebarTab({id: 'workflows'}); sidebar.registerCoreSidebarTabs(); h.start();
+  assert.equal(sidebar.toggleSidebarTab, toggle); assert.equal(sidebar.registerSidebarTab, register); assert.equal(sidebar.registerCoreSidebarTabs, core);
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  h.app.registerExtension({name: 'NoSidebarChanges'}); sidebar.registerCoreSidebarTabs();
+  assert.deepEqual(sidebar.sidebarTabs.filter(tab => documentSidebarIds.includes(tab.id)), []);
+  const notices = h.replies.filter(reply => reply.message.action === 'notice').length;
+  sidebar.toggleSidebarTab('workflows'); assert.equal(h.replies.filter(reply => reply.message.action === 'notice').length - notices, 1);
+  assert.equal(sidebar.toggleSidebarTab, toggle); assert.equal(sidebar.registerSidebarTab, register); assert.equal(sidebar.registerCoreSidebarTabs, core);
+});
+
+test('core sidebar registration enforces partial registrations even when the native action throws', async () => {
+  const fixture = nativeSidebarFixture(), {sidebar} = fixture, error = new Error('core registration failed');
+  const nativeCore = sidebar.registerCoreSidebarTabs;
+  sidebar.registerCoreSidebarTabs = function (...args) {nativeCore.apply(this, args); throw error;};
+  const h = harness(fixture); h.start();
+  assert.throws(() => sidebar.registerCoreSidebarTabs(), value => value === error);
+  assert.ok(sidebar.sidebarTabs.some(tab => tab.id === 'workflows'), 'unclaimed registration stays native');
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  assert.throws(() => sidebar.registerCoreSidebarTabs(), value => value === error);
+  assert.deepEqual(sidebar.sidebarTabs.filter(tab => documentSidebarIds.includes(tab.id)), []);
+  for (const id of documentSidebarIds) await fixture.store.execute(`Workspace.ToggleSidebarTab.${id}`);
+  assert.equal(sidebar.activeSidebarTabId, null);
+});
+
+test('late publicly exposed sidebar capability is guarded during extension registration', async () => {
+  const fixture = nativeSidebarFixture(), manager = {command: fixture.extensionManager.command};
+  const h = harness({extensionManager: manager, registerExtension(extension) {
+    fixture.registerExtension.call(this, extension);
+    if (extension.name === 'ExposeSidebar') manager.sidebarTab = fixture.sidebar;
+  }}); h.start(); h.emit('load', 'owned', {document: document()}); await h.flush();
+  fixture.sidebar.toggleSidebarTab('apps');
+  h.app.registerExtension({name: 'ExposeSidebar'});
+  assert.equal(fixture.sidebar.activeSidebarTabId, null);
+  fixture.sidebar.toggleSidebarTab('workflows'); await fixture.store.execute('Workspace.ToggleSidebarTab.apps');
+  assert.equal(fixture.sidebar.activeSidebarTabId, null); assert.equal(h.runNextTimer(), undefined);
+});
+
+test('unsupported sidebar interfaces report a bounded warning while document load and mutable guards stay usable', async () => {
+  for (const mode of ['absent', 'read-only', 'failed-unregister', 'no-op-unregister', 'missing-core', 'missing-unregister']) {
+    const fixture = nativeSidebarFixture();
+    if (mode === 'absent') delete fixture.extensionManager.sidebarTab;
+    else if (mode === 'read-only') Object.freeze(fixture.sidebar);
+    else if (mode === 'missing-core') delete fixture.sidebar.registerCoreSidebarTabs;
+    else if (mode === 'missing-unregister') delete fixture.sidebar.unregisterSidebarTab;
+    else fixture.sidebar.unregisterSidebarTab = () => {if (mode === 'failed-unregister') throw new Error('unavailable');};
+    const h = harness(fixture); assert.doesNotThrow(() => h.start()); assert.equal(h.replies.length, 1);
+    h.emit('load', 'owned', {document: document()}); await h.flush();
+    assert.deepEqual(copy(h.current()), document());
+    h.app.registerExtension({name: 'RepeatRefresh'}); h.emit('load', 'owned-again', {document: document()}); await h.flush();
+    assert.equal(h.replies.filter(reply => reply.message.result?.code === 'native-sidebar-controls-unavailable').length, 1);
+    await fixture.store.execute('Workspace.ToggleSidebarTab.workflows'); assert.equal(fixture.sidebar.activeSidebarTabId, null);
+    const before = copy(h.current()); await h.app.loadGraphData({nodes: [], links: []}); assert.deepEqual(copy(h.current()), before);
+  }
+});
+
+test('public command objects block native store and workspace facade paths without blocking node editing commands', async () => {
+  const calls = [], editable = ['Comfy.Undo','Comfy.Redo','Comfy.Canvas.FitView','Comfy.ExportWorkflow','Comfy.ClearWorkflow'];
+  const fixture = nativeCommandFixture([...blockedNativeCommandIds, ...editable].map(id => ({id,
+    function(...args) {calls.push([this, id, args]);}})));
+  const workflow = {$id: 'workflow', closeWorkflow() {calls.push('close');}, deleteWorkflow() {calls.push('delete');}, renameWorkflow() {calls.push('rename');}};
+  fixture.extensionManager.workflow = workflow;
+  const command = fixture.extensionManager.command, nativeExecute = fixture.store.execute;
+  const h = harness(fixture); h.start();
+  assert.equal(command.$id, undefined); assert.equal(command.execute, nativeExecute); assert.equal(fixture.store.execute, nativeExecute);
   await command.execute('Comfy.NewBlankWorkflow'); assert.equal(calls.length, 1);
   h.emit('load', 'owned', {document: document()}); await h.flush();
-  for (const id of ['Comfy.NewBlankWorkflow','Comfy.OpenWorkflow','Comfy.LoadDefaultWorkflow','Comfy.SaveWorkflow',
-    'Comfy.SaveWorkflowAs','Comfy.RenameWorkflow','Comfy.DuplicateWorkflow','Workspace.NextOpenedWorkflow',
-    'Workspace.PreviousOpenedWorkflow','Workspace.CloseWorkflow']) await command.execute(id);
+  const notices = h.replies.filter(reply => reply.message.action === 'notice').length;
+  for (const id of blockedNativeCommandIds) {
+    await command.execute(id); await fixture.store.execute(id);
+  }
   await workflow.closeWorkflow({}); await workflow.deleteWorkflow({}); await workflow.renameWorkflow({});
   assert.equal(calls.length, 1);
-  const metadata = {metadata: {node: 2}};
-  for (const id of ['Comfy.Undo','Comfy.Redo','Comfy.Canvas.FitView','Comfy.ExportWorkflow','Comfy.ClearWorkflow']) await command.execute(id, metadata);
-  assert.equal(calls.length, 6); assert.equal(calls[1][0], command); assert.deepEqual(calls[1][2], [metadata]);
+  assert.equal(h.replies.filter(reply => reply.message.action === 'notice').length - notices, 23);
+  const metadata = {node: 2};
+  for (const id of editable) {
+    await command.execute(id, {metadata}); await fixture.store.execute(id, {metadata});
+  }
+  assert.equal(calls.length, 11); assert.equal(calls[1][0], fixture.store.getCommand('Comfy.Undo')); assert.deepEqual(calls[1][2], [metadata]);
+});
+
+test('unclaimed command guards preserve receivers, arguments, sync returns, promise identity and failures', async () => {
+  const calls = [], receiver = {}, args = [{node: 2}, 'extra'], result = {}, promised = Promise.resolve(result), error = new Error('native failure');
+  const fixture = nativeCommandFixture([
+    {id: 'Comfy.SaveWorkflow', function(...values) {calls.push([this, values]); return result;}},
+    {id: 'Comfy.OpenWorkflow', function(...values) {calls.push([this, values]); return promised;}},
+    {id: 'Comfy.NewBlankWorkflow', function() {throw error;}},
+    {id: 'Comfy.SaveWorkflowAs', function() {return Promise.reject(error);}},
+  ]);
+  const h = harness(fixture); h.start();
+  assert.equal(fixture.store.getCommand('Comfy.SaveWorkflow').function.apply(receiver, args), result);
+  assert.equal(fixture.store.getCommand('Comfy.OpenWorkflow').function.apply(receiver, args), promised);
+  assert.deepEqual(calls, [[receiver, args], [receiver, args]]);
+  assert.throws(() => fixture.store.getCommand('Comfy.NewBlankWorkflow').function(), value => value === error);
+  await assert.rejects(fixture.store.getCommand('Comfy.SaveWorkflowAs').function(), value => value === error);
+  await fixture.store.execute('Comfy.SaveWorkflow', {metadata: args[0]});
+  assert.equal(calls.at(-1)[0], fixture.store.getCommand('Comfy.SaveWorkflow')); assert.deepEqual(calls.at(-1)[1], [args[0]]);
+  assert.equal(h.replies.filter(reply => reply.message.action === 'notice').length, 0);
+});
+
+test('document controls are idempotent across repeated setup and public extension registration', async () => {
+  const fixture = nativeCommandFixture([{id: 'Comfy.SaveWorkflow', function() {throw new Error('must remain blocked');}}]);
+  fixture.extensionManager.workflow = {$id: 'workflow', closeWorkflow() {throw new Error('must remain blocked');}};
+  const h = harness(fixture); h.start();
+  const commandFunction = fixture.store.getCommand('Comfy.SaveWorkflow').function;
+  const closeWorkflow = fixture.extensionManager.workflow.closeWorkflow, registerExtension = h.app.registerExtension;
+  h.start();
+  h.app.registerExtension({name: 'NoCommands'});
+  assert.equal(fixture.store.getCommand('Comfy.SaveWorkflow').function, commandFunction);
+  assert.equal(fixture.extensionManager.workflow.closeWorkflow, closeWorkflow); assert.equal(h.app.registerExtension, registerExtension);
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  const notices = h.replies.filter(reply => reply.message.action === 'notice').length;
+  await fixture.store.execute('Comfy.SaveWorkflow'); await fixture.extensionManager.workflow.closeWorkflow();
+  assert.equal(h.replies.filter(reply => reply.message.action === 'notice').length - notices, 2);
+});
+
+test('unclaimed workflow actions preserve their receiver, arguments and native return values', async () => {
+  const calls = [], result = {}, promise = Promise.resolve(result), receiver = {}, args = [{path: 'owned'}, 'extra'];
+  const workflow = {$id: 'workflow',
+    closeWorkflow(...values) {calls.push([this, values]); return result;},
+    deleteWorkflow(...values) {calls.push([this, values]); return promise;},
+    renameWorkflow(...values) {calls.push([this, values]); return 'renamed';},
+  };
+  const h = harness({extensionManager: {workflow}}); h.start();
+  assert.equal(workflow.closeWorkflow.apply(receiver, args), result);
+  assert.equal(workflow.deleteWorkflow.apply(receiver, args), promise);
+  assert.equal(workflow.renameWorkflow.apply(receiver, args), 'renamed');
+  assert.deepEqual(calls, [[receiver, args], [receiver, args], [receiver, args]]);
+});
+
+test('public extension registration protects late and replaced commands before returning', async () => {
+  const calls = [], fixture = nativeCommandFixture([{id: 'Comfy.SaveWorkflow', function() {calls.push('original');}}]);
+  const h = harness(fixture); h.start();
+  const original = fixture.store.getCommand('Comfy.SaveWorkflow'), oldFacade = fixture.extensionManager.command;
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  h.app.registerExtension({name: 'LateCommands', commands: [
+    {id: 'Comfy.SaveWorkflow', function() {calls.push('replacement');}},
+    {id: 'Workspace.CloseWorkflow', function() {calls.push('late');}},
+    {id: 'Comfy.Undo', function() {calls.push('undo');}},
+  ]});
+  assert.notEqual(fixture.store.getCommand('Comfy.SaveWorkflow'), original); assert.notEqual(fixture.extensionManager.command, oldFacade);
+  await oldFacade.execute('Comfy.SaveWorkflow'); await fixture.store.execute('Comfy.SaveWorkflow');
+  await fixture.extensionManager.command.execute('Workspace.CloseWorkflow'); await fixture.store.execute('Workspace.CloseWorkflow');
+  await fixture.store.execute('Comfy.Undo'); assert.deepEqual(calls, ['undo']);
+});
+
+test('public registration preserves its receiver, arguments, return value and thrown errors', async () => {
+  const calls = [], result = {}, promise = Promise.resolve(result), error = new Error('registration failed'), fixture = nativeCommandFixture([]);
+  const nativeRegister = fixture.registerExtension;
+  fixture.registerExtension = function (...args) {
+    nativeRegister.apply(this, args);
+    if (args[0].name === 'FailedRegistration') throw error;
+    calls.push([this, args]); return args[0].name === 'PromiseResult' ? promise : result;
+  };
+  const h = harness(fixture); h.start(); h.emit('load', 'owned', {document: document()}); await h.flush();
+  const extension = {name: 'SuccessfulRegistration'}, marker = {};
+  assert.equal(h.app.registerExtension(extension, marker), result); assert.equal(calls.at(-1)[0], h.app);
+  assert.deepEqual(calls.at(-1)[1], [extension, marker]);
+  assert.equal(h.app.registerExtension({name: 'PromiseResult'}), promise);
+  assert.throws(() => h.app.registerExtension({name: 'FailedRegistration', commands: [
+    {id: 'Comfy.OpenWorkflow', function() {throw new Error('partial registration must remain protected');}},
+  ]}), value => value === error);
+  await fixture.store.execute('Comfy.OpenWorkflow');
+});
+
+test('unsupported or unavailable public commands leave startup and the document load gate usable', async () => {
+  for (const extensionManager of [{}, {command: {commands: {}}}, {command: {commands: [null, 'invalid', {id: 'Comfy.SaveWorkflow'}]}},
+    {get command() {throw new Error('capability not ready');}}]) {
+    const h = harness({extensionManager}); assert.doesNotThrow(() => h.start());
+    assert.equal(h.replies[0].message.action, 'ready');
+    h.emit('load', 'owned', {document: document()}); await h.flush();
+    const before = copy(h.current()); await h.app.loadGraphData({nodes: [], links: []});
+    assert.deepEqual(copy(h.current()), before); assert.equal(h.replies.at(-1).message.action, 'notice');
+  }
+});
+
+test('read-only unsupported actions cannot prevent other mutable command protections', async () => {
+  const calls = [], frozen = Object.freeze({id: 'Comfy.SaveWorkflow', function() {calls.push('unsupported');}});
+  const mutable = {id: 'Comfy.OpenWorkflow', function() {calls.push('open');}};
+  const extensionManager = {command: {commands: [frozen, mutable]}, workflow: Object.freeze({$id: 'workflow', closeWorkflow() {}})};
+  const h = harness({extensionManager}); assert.doesNotThrow(() => h.start());
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  await mutable.function(); assert.deepEqual(calls, []); assert.equal(h.replies.at(-1).message.action, 'notice');
+});
+
+test('commands that become publicly available during registration are protected without retry timers', async () => {
+  const calls = [], fixture = nativeCommandFixture([]), manager = {};
+  const h = harness({extensionManager: manager, registerExtension(extension) {
+    fixture.registerExtension.call(this, extension);
+    if (extension.name === 'ExposeCommands') Object.defineProperty(manager, 'command', {get: () => fixture.extensionManager.command});
+  }}); h.start();
+  h.emit('load', 'owned', {document: document()}); await h.flush();
+  h.app.registerExtension({name: 'ExposeCommands', commands: [{id: 'Comfy.OpenWorkflow', function() {calls.push('open');}}]});
+  await fixture.store.execute('Comfy.OpenWorkflow'); assert.deepEqual(calls, []);
+  assert.equal(h.runNextTimer(), undefined); assert.equal(h.replies.at(-1).message.action, 'notice');
 });
 
 for (const loseOwner of [false, true]) test(`failed API import restores native tab identity; owner missing=${loseOwner}`, async () => {

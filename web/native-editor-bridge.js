@@ -258,30 +258,123 @@ async function restoreDocument(document, owner) {
   await app.loadGraphData(document, false, false, ...(owner ? [owner.workflow] : []));
 }
 
-function installNativeDocumentControls() {
-  const command = app.extensionManager?.command;
-  const blocked = new Set(['Comfy.NewBlankWorkflow', 'Comfy.OpenWorkflow', 'Comfy.LoadDefaultWorkflow',
-    'Comfy.SaveWorkflow', 'Comfy.SaveWorkflowAs', 'Comfy.RenameWorkflow', 'Comfy.DuplicateWorkflow',
-    'Workspace.NextOpenedWorkflow', 'Workspace.PreviousOpenedWorkflow', 'Workspace.CloseWorkflow']);
-  if (command?.$id === 'command' && typeof command.execute === 'function') {
-    const execute = command.execute;
-    command.execute = function (id, ...args) {
-      if (state.claimed && blocked.has(id)) { documentOwnershipNotice(); return Promise.resolve(); }
-      return execute.call(this, id, ...args);
+const blockedDocumentCommands = new Set(['Comfy.NewBlankWorkflow', 'Comfy.OpenWorkflow', 'Comfy.LoadDefaultWorkflow',
+  'Comfy.SaveWorkflow', 'Comfy.SaveWorkflowAs', 'Comfy.RenameWorkflow', 'Comfy.DuplicateWorkflow',
+  'Workspace.NextOpenedWorkflow', 'Workspace.PreviousOpenedWorkflow', 'Workspace.CloseWorkflow',
+  'Workspace.ToggleSidebarTab.workflows', 'Workspace.ToggleSidebarTab.apps']);
+const guardedDocumentActions = new WeakSet(), guardedExtensionRegistrations = new WeakSet();
+const documentSidebarIds = new Set(['workflows', 'apps']);
+const guardedSidebarActions = new WeakSet(), guardedCoreSidebarRegistrations = new WeakSet();
+let sidebarCapabilityWarningSent = false;
+function sidebarCapabilityWarning() {
+  if (!state.claimed || sidebarCapabilityWarningSent) return;
+  sidebarCapabilityWarningSent = true;
+  send({ action: 'notice', result: { code: 'native-sidebar-controls-unavailable',
+    message: '当前原生前端的公开侧栏接口无法完整限制工作流管理；请使用外层画布管理工作流，避免操作原生工作流或应用侧栏。' } });
+}
+function guardSidebarAction(sidebar, name, idOf) {
+  try {
+    const native = sidebar[name];
+    if (typeof native !== 'function') return false;
+    if (guardedSidebarActions.has(native)) return true;
+    const guarded = function (...args) {
+      if (state.claimed && documentSidebarIds.has(idOf(args[0]))) { documentOwnershipNotice(); return; }
+      try { return native.apply(this, args); }
+      finally { installNativeDocumentControls(); }
     };
-  }
-  // Tab context menus and the workflow sidebar also call these actions directly.
-  // Keep the active document registered, even if a native service already tried
-  // to close it after its graph replacement was refused by loadGraphData.
-  const workflow = app.extensionManager?.workflow;
-  if (workflow?.$id === 'workflow') for (const name of ['closeWorkflow', 'deleteWorkflow', 'renameWorkflow']) {
-    if (typeof workflow[name] !== 'function') continue;
-    const native = workflow[name];
-    workflow[name] = function (...args) {
+    sidebar[name] = guarded;
+    if (sidebar[name] !== guarded) return false;
+    guardedSidebarActions.add(guarded);
+    return true;
+  } catch { return false; }
+}
+function installNativeSidebarControls() {
+  try {
+    // Both core tabs expose whole-document actions whose service can discard
+    // drafts/previews before the guarded workflow-store action is reached.
+    // The public unregister API also clears an already-open active sidebar.
+    const sidebar = app.extensionManager?.sidebarTab;
+    if (!sidebar) { sidebarCapabilityWarning(); return; }
+    let supported = guardSidebarAction(sidebar, 'toggleSidebarTab', id => id);
+    supported = guardSidebarAction(sidebar, 'registerSidebarTab', tab => tab?.id) && supported;
+    try {
+      const native = sidebar.registerCoreSidebarTabs;
+      if (typeof native !== 'function') supported = false;
+      else if (!guardedCoreSidebarRegistrations.has(native)) {
+        // Core registration uses its internal closure, bypassing the public
+        // register wrapper. Re-enforce at this synchronous public boundary.
+        const guarded = function (...args) {
+          try { return native.apply(this, args); }
+          finally { installNativeDocumentControls(); }
+        };
+        sidebar.registerCoreSidebarTabs = guarded;
+        if (sidebar.registerCoreSidebarTabs === guarded) guardedCoreSidebarRegistrations.add(guarded);
+        else supported = false;
+      }
+    } catch { supported = false; }
+    if (state.claimed) {
+      if (typeof sidebar.unregisterSidebarTab !== 'function') supported = false;
+      else for (const id of documentSidebarIds) {
+        try {
+          // Public registration permits duplicate IDs; remove every current
+          // registration without touching other tabs or retrying on a timer.
+          const count = Array.isArray(sidebar.sidebarTabs) ? sidebar.sidebarTabs.filter(tab => tab?.id === id).length : 1;
+          for (let index = 0; index < count; index++) sidebar.unregisterSidebarTab(id);
+        } catch { supported = false; }
+      }
+      if (!Array.isArray(sidebar.sidebarTabs) || sidebar.sidebarTabs.some(tab => documentSidebarIds.has(tab?.id)) ||
+          documentSidebarIds.has(sidebar.activeSidebarTabId)) supported = false;
+      if (!supported) sidebarCapabilityWarning();
+    }
+  } catch { sidebarCapabilityWarning(); }
+}
+function guardDocumentAction(target, name) {
+  try {
+    const native = target[name];
+    if (typeof native !== 'function' || guardedDocumentActions.has(native)) return;
+    const guarded = function (...args) {
       if (state.claimed) { documentOwnershipNotice(); return Promise.resolve(); }
       return native.apply(this, args);
     };
-  }
+    target[name] = guarded;
+    guardedDocumentActions.add(guarded);
+  } catch { /* Unsupported/read-only public capabilities must not break startup. */ }
+}
+function installNativeDocumentControls() {
+  try {
+    // The public workspace facade has no $id, and native tabs/shortcuts call
+    // the command store directly. Both paths share these ComfyCommandImpl
+    // objects, so guard their functions rather than the facade's execute copy.
+    const commands = app.extensionManager?.command?.commands;
+    if (Array.isArray(commands)) for (const command of commands) {
+      try {
+        if (command && blockedDocumentCommands.has(command.id)) guardDocumentAction(command, 'function');
+      } catch { /* Ignore unsupported entries, while protecting other commands. */ }
+    }
+  } catch { /* The public command capability may be unavailable on this frontend. */ }
+  // Tab context menus and the workflow sidebar also call these actions directly.
+  // Keep the active document registered, even if a native service already tried
+  // to close it after its graph replacement was refused by loadGraphData.
+  try {
+    const workflow = app.extensionManager?.workflow;
+    if (workflow?.$id === 'workflow') for (const name of ['closeWorkflow', 'deleteWorkflow', 'renameWorkflow']) {
+      guardDocumentAction(workflow, name);
+    }
+  } catch { /* Keep the document load gate usable if this capability is absent. */ }
+  installNativeSidebarControls();
+  try {
+    // Public extension registration synchronously registers commands and can
+    // replace an existing command object. Re-scan at that supported lifecycle
+    // boundary to protect late/re-registered commands without polling Pinia.
+    const native = app.registerExtension;
+    if (typeof native !== 'function' || guardedExtensionRegistrations.has(native)) return;
+    const guarded = function (...args) {
+      try { return native.apply(this, args); }
+      finally { installNativeDocumentControls(); }
+    };
+    app.registerExtension = guarded;
+    guardedExtensionRegistrations.add(guarded);
+  } catch { /* Older frontends can keep their existing public registration API. */ }
 }
 
 function installDocumentGate() {
@@ -1103,6 +1196,7 @@ async function handle(message) {
       const document = clone(message.document);
       if (!document || !Array.isArray(document.nodes)) throw new Error('invalid-document');
       state.claimed = true;
+      installNativeDocumentControls();
       if (typeof globalThis.document !== 'undefined') globalThis.document.documentElement?.setAttribute('data-prism-bound-document', '');
       state.source = clone(document);
       resetMappings(); media.reset(); media.arm();

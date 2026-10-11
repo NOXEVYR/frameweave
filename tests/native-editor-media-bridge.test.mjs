@@ -10,7 +10,7 @@ const code = (await readFile(new URL('../web/native-editor-bridge.js', import.me
   .replace("import('/prism-editor-media.mjs')", 'loadMediaFactory()')
   .replace("import('/prism-editor-media-preview.mjs')", 'loadPreviewFactory()');
 const clone = value => JSON.parse(JSON.stringify(value));
-async function harness({ protocol = 1, failImport = false, native = '', callback = () => {} } = {}) {
+async function harness({ protocol = 1, failImport = false, native = '', callback = () => {}, decorateMedia } = {}) {
   const events = new Map(), replies = [], calls = []; let sequence = 0;
   class Node {
     constructor(values = [native, 42]) { this.id = 1; this.type = this.comfyClass = 'LoadImage';
@@ -35,7 +35,8 @@ async function harness({ protocol = 1, failImport = false, native = '', callback
     addEventListener: (event, callback) => events.set(event, callback), setTimeout: callback => callback() };
   const document = { querySelector: () => null };
   vm.runInNewContext(code, { app, window, document, TextEncoder, setTimeout,
-    loadMediaFactory() { calls.push('media-import'); return failImport ? Promise.reject(new Error('missing route')) : Promise.resolve({ createNativeEditorMedia }); },
+    loadMediaFactory() { calls.push('media-import'); return failImport ? Promise.reject(new Error('missing route')) : Promise.resolve({
+      createNativeEditorMedia: options => { const media = createNativeEditorMedia(options); return decorateMedia ? decorateMedia(media) : media; } }); },
     loadPreviewFactory() { calls.push('preview-import'); return Promise.resolve({ createEditorMediaPreview: undefined }); } });
   app.extension.setup(); await new Promise(setImmediate);
   async function request(action, data = {}) {
@@ -105,6 +106,40 @@ test('unexpected callback change to any sibling API input rolls the entire media
   const compiled = (await h.request('compile')).result;
   assert.equal(compiled.controls.find(c => c.input === 'image').media_receipt, undefined);
 });
+test('bridge media transactions start before assignment, finish after the native callback and rollback side state on compile failure', async () => {
+  const events = [], sideState = { filename: 'N.png' };
+  const h = await harness({ native: 'N.png', callback(value, _canvas, node) {
+    events.push('callback'); sideState.filename = value;
+    if (value === 'bad.png') node.widgets[1].value = 999;
+  }, decorateMedia(media) {
+    return { ...media, beginPatch(patch, target) {
+      assert(media.authorize(patch, target)); assert.equal(target.widget.value, patch.expected_value);
+      events.push('begin'); const before = sideState.filename;
+      return { complete() { assert.equal(sideState.filename, patch.value); events.push('complete'); },
+        rollback() { events.push('rollback'); sideState.filename = before; } };
+    } };
+  } });
+  let receipt = (await h.request('captureMedia', { bindings: [h.binding('C.png')] })).result.captured[0].receipt;
+  assert.equal((await h.request('patch', { patches: [h.patch(receipt, 'C.png', 'N.png')] })).error, undefined);
+  assert.deepEqual(events, ['begin', 'callback', 'complete']); assert.equal(sideState.filename, 'C.png');
+  assert.equal((await h.request('patch', { patches: [h.patch(receipt, 'N.png', 'C.png')] })).error, undefined);
+  receipt = (await h.request('captureMedia', { bindings: [h.binding('bad.png')] })).result.captured[0].receipt;
+  const before = h.root.serialize();
+  const failed = await h.request('patch', { patches: [h.patch(receipt, 'bad.png', 'N.png')] });
+  assert.equal(failed.result.rolled_back, true); assert.equal(events.at(-1), 'rollback');
+  assert.equal(sideState.filename, 'N.png'); assert.deepEqual(h.root.serialize(), before);
+});
+test('bridge refuses an asynchronous known-preview projection callback and rolls back its side transaction', async () => {
+  const events = [];
+  const h = await harness({ callback: async () => { events.push('callback'); }, decorateMedia(media) {
+    return { ...media, beginPatch() { events.push('begin'); return {
+      complete() { events.push('complete'); }, rollback() { events.push('rollback'); } }; } };
+  } });
+  const before = h.root.serialize(), receipt = (await h.request('captureMedia', { bindings: [h.binding('C.png')] })).result.captured[0].receipt;
+  const failed = await h.request('patch', { patches: [h.patch(receipt, 'C.png', '')] });
+  assert.equal(failed.result.rolled_back, true); assert.deepEqual(events, ['begin', 'callback', 'rollback']);
+  assert.deepEqual(h.root.serialize(), before);
+});
 test('own F then connected C recapture preserves current actual N and retires the previous capability', async () => {
   const h = await harness({ native: 'N.png' });
   const own = (await h.request('captureMedia', { bindings: [h.binding('F.png')] })).result.captured[0];
@@ -113,4 +148,24 @@ test('own F then connected C recapture preserves current actual N and retires th
   assert.equal(connected.native_value, 'F.png');
   const old = await h.request('patch', { patches: [h.patch(own.receipt, 'F.png', 'F.png')] }); assert(old.error);
   assert.equal((await h.request('patch', { patches: [h.patch(connected.receipt, 'C.png', 'F.png')] })).error, undefined);
+});
+
+test('rejected asynchronous preview callbacks remain handled after rollback, including later rejection', async () => {
+  for (const delayed of [false, true]) {
+    const events = [];
+    const h = await harness({ callback: () => delayed ? new Promise((_resolve, reject) => {
+      setImmediate(() => reject(new Error('late plugin failure')));
+    }) : Promise.reject(new Error('plugin failure')), decorateMedia(media) {
+      return { ...media, beginPatch() { return {
+        complete() { events.push('complete'); }, rollback() { events.push('rollback'); },
+      }; } };
+    } });
+    const before = h.root.serialize();
+    const receipt = (await h.request('captureMedia', { bindings: [h.binding('C.png')] })).result.captured[0].receipt;
+    const failed = await h.request('patch', { patches: [h.patch(receipt, 'C.png', '')] });
+    await new Promise(setImmediate);
+    assert(failed.error); assert.equal(failed.result.rolled_back, true);
+    assert.deepEqual(events, ['rollback']); assert.deepEqual(h.root.serialize(), before);
+    assert.equal((await h.request('compile')).error, undefined);
+  }
 });

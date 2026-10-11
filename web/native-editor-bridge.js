@@ -933,16 +933,27 @@ async function patchWidgets(patches, requestedMappings) {
         throw error;
       }
     }
+    for (const item of prepared) if (item.patch.media_receipt !== undefined) item.mediaTransaction = media.beginPatch?.(item.patch, item);
     wrote = true;
     for (const item of prepared) item.widget.value = item.value;
     for (const item of prepared) {
       if (typeof item.widget.callback === 'function') {
         const beforeCallback = findWidget(item.identity.node_id, item.identity.widget_name);
         if (needsProof(item) && (beforeCallback.reason || !sameMappingProof(item.mappingProof, beforeCallback.mappingProof))) throw new Error('mapping_changed_before_callback');
-        await item.widget.callback.call(item.widget, item.value, app.canvas, item.owner);
+        const callbackResult = item.widget.callback.call(item.widget, item.value, app.canvas, item.owner);
+        // The observed VHS file callback is synchronous. Do not attribute
+        // asynchronous extension/user edits to our temporary media overlay.
+        if (item.mediaTransaction && callbackResult && typeof callbackResult.then === 'function') {
+          // Reject this projection, but still own a later rejection from the
+          // callback that has already started. The patch error reports failure.
+          void Promise.resolve(callbackResult).catch(() => {});
+          throw new Error('async_vhs_media_callback');
+        }
+        item.mediaTransaction?.complete();
+        await callbackResult;
         const current = findWidget(item.identity.node_id, item.identity.widget_name);
         if (needsProof(item) && (current.reason || !sameMappingProof(item.mappingProof, current.mappingProof))) throw new Error('mapping_changed_during_callback');
-      }
+      } else item.mediaTransaction?.complete();
     }
     if (expectedOutput) {
       const compiled = await app.graphToPrompt(graph());
@@ -982,6 +993,7 @@ async function patchWidgets(patches, requestedMappings) {
     }
     let rolledBack = false;
     resetMappings();
+    for (const item of prepared) try { item.mediaTransaction?.rollback(); } catch { /* The document rollback remains authoritative. */ }
     // A projected widget setter can have been rebound to another store slot.
     // Restore directly only while its original ownership is still provable;
     // otherwise let the authorized document reload restore the saved graph.

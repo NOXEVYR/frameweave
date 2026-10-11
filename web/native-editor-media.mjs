@@ -552,6 +552,11 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       const entry = { ...binding, ...contract, receipt, graph: graph(), node: target.node, owner: target.owner, widget: target.widget,
         native_value: target.widget.value, observed_value: target.widget.value,
         ...(nested ? { mappingProof: target.mappingProof } : {}) };
+      const adapter = isolated.get(target.node)?.adapter;
+      if (adapter) {
+        entry.previewProjection = adapter.captureProjectionState();
+        if (!entry.previewProjection) { fail('vhs_preview_adapter_unsupported'); continue; }
+      }
       receipts.set(receipt, entry); byBinding.set(key, entry);
       captured.push({ field_id: binding.field_id, node_id: binding.node_id, input: binding.input, type: binding.type,
         receipt, native_value: entry.native_value, preview_state: 'pending' });
@@ -569,7 +574,10 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
       if (!target || actual?.class_type !== entry.class_type || actual.inputs?.[entry.input] !== entry.widget.value || !safeEditorMediaFilename(entry.widget.value, true)) continue;
       // N cleanup and C redisplay are transaction mechanics, not a new user I.
       // Retain the last proven I until it is restored after clean persistence.
-      if (!Object.is(entry.widget.value, entry.native_value) && !Object.is(entry.widget.value, entry.value)) entry.observed_value = entry.widget.value;
+      if (!Object.is(entry.widget.value, entry.native_value) && !Object.is(entry.widget.value, entry.value)) {
+        entry.observed_value = entry.widget.value;
+        if (entry.previewProjection) isolated.get(entry.node)?.adapter?.observeNativeState(entry.previewProjection);
+      }
       const matches = index.get(keyOf(entry)) || [];
       if (matches.length === 1) matches[0].media_receipt = entry.receipt;
     }
@@ -584,6 +592,13 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     const marker = isolated.get(entry.node);
     if (allowed && marker?.nested && !marker.promoted && (patch.value !== marker.nativeValue || target.widget.value !== marker.nativeValue)) marker.contaminated = true;
     return allowed;
+  }
+  function beginPatch(patch, target) {
+    if (!authorize(patch, target)) throw new Error('invalid_media_receipt');
+    const entry = receipts.get(patch.media_receipt), adapter = isolated.get(entry.node)?.adapter;
+    if (!entry.previewProjection) return null;
+    if (!adapter?.verify()) throw new Error('vhs_preview_state_changed');
+    return adapter.beginProjection(entry.previewProjection, Object.is(patch.value, entry.value));
   }
   function prune() {
     pruneIsolations();
@@ -639,6 +654,6 @@ export function createNativeEditorMedia({ app, window, document, graph, findWidg
     unavailable = true;
   }
   window.addEventListener?.('pagehide', destroy);
-  return { arm, isolateNode, prepareCapture, capture, observe, authorize, reset, refreshPreview, destroy,
+  return { arm, isolateNode, prepareCapture, capture, observe, authorize, beginPatch, reset, refreshPreview, destroy,
     get supportsNestedCapture() { return Boolean(nestedAvailable()); } };
 }

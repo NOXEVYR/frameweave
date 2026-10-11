@@ -53,6 +53,19 @@ export function isolateVhsPreviewSurface(profile, window) {
       if (descriptor) Object.defineProperty(owner, name, descriptor); else delete owner[name];
     }
   }
+  // Only these keys identify the file selected by the observed VHS callback.
+  // Timing/resizing/decoder parameters remain native user-owned state.
+  const identityKeys = ['filename', 'type', 'format'];
+  const snapshotIdentity = params => new Map(identityKeys.map(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(params, key);
+    if (descriptor && (!own(descriptor, 'value') || !descriptor.configurable || !descriptor.writable ||
+        descriptor.value !== undefined && typeof descriptor.value !== 'string')) throw new Error('unsupported_vhs_identity');
+    return [key, descriptor];
+  }));
+  const equalIdentity = (a, b) => Boolean(a) === Boolean(b) && (!a || Object.is(a.value, b.value));
+  function writeIdentity(params, key, descriptor) {
+    if (descriptor) Object.defineProperty(params, key, descriptor); else delete params[key];
+  }
   try {
     const suppress = () => undefined;
     define(widget, 'updateSource', { writable: true, value: suppress });
@@ -82,6 +95,48 @@ export function isolateVhsPreviewSurface(profile, window) {
         widget.parentEl === parentEl && widget.videoEl === videoEl && widget.imgEl === imgEl &&
         videoEl.parentElement === parentEl && imgEl.parentElement === parentEl &&
         installed.every(([owner, name, proof]) => same(Object.getOwnPropertyDescriptor(owner, name), proof));
+    },
+    captureProjectionState() {
+      const params = widget.value?.params;
+      if (!record(params) || !Object.isExtensible(params)) return null;
+      try { snapshotIdentity(params); return { params, owned: new Map(), display: null }; } catch { return null; }
+    },
+    observeNativeState(state) {
+      if (widget.value?.params !== state.params) throw new Error('vhs_preview_state_changed');
+      snapshotIdentity(state.params); state.owned.clear(); state.display = null;
+    },
+    beginProjection(state, connected) {
+      if (widget.value?.params !== state.params) throw new Error('vhs_preview_state_changed');
+      const before = snapshotIdentity(state.params), previousOwnership = new Map(state.owned), previousDisplay = state.display;
+      let after, completed = false;
+      return {
+        complete() {
+          if (completed || widget.value?.params !== state.params) throw new Error('vhs_preview_state_changed');
+          after = snapshotIdentity(state.params);
+          const next = new Map();
+          for (const key of identityKeys) {
+            const prior = previousOwnership.get(key), start = before.get(key), end = after.get(key);
+            const stillOurs = prior && equalIdentity(start, prior.projected);
+            if (connected) {
+              // Establish ownership only for an actual callback mutation; keep
+              // the persistent base across repeated display transactions.
+              if (!equalIdentity(start, end)) next.set(key, { base: stillOurs ? prior.base : start, projected: end });
+              else if (stillOurs) next.set(key, prior);
+            } else if (prior || previousDisplay && !equalIdentity(start, previousDisplay.get(key))) {
+              // A later user edit supersedes our projection even if cleanup's
+              // native callback would otherwise overwrite that edit again.
+              writeIdentity(state.params, key, stillOurs ? prior.base : start);
+            }
+          }
+          state.owned = next; after = snapshotIdentity(state.params); state.display = connected ? after : null; completed = true;
+        },
+        rollback() {
+          if (widget.value?.params !== state.params) return;
+          const current = snapshotIdentity(state.params), expected = after || current;
+          for (const key of identityKeys) if (equalIdentity(current.get(key), expected.get(key))) writeIdentity(state.params, key, before.get(key));
+          state.owned = previousOwnership; state.display = previousDisplay;
+        },
+      };
     },
     // Keep the barrier while the observed 100ms private debounce drains. A
     // removed node remains guarded until re-add, never just until onRemoved.

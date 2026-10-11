@@ -117,6 +117,60 @@ test('surface guard drains old debounce, blocks late src writes and retains genu
   guard.release(); f.flush(100); assert.deepEqual(f.calls, []); f.flush(110);
   f.widget.updateSource(); assert.deepEqual(f.calls, ['source']); assert.equal(f.videoEl.src, 'N.mp4');
 });
+function project(f, guard, state, value, connected) {
+  const transaction = guard.beginProjection(state, connected);
+  f.node.widgets[0].value = value;
+  if (value) f.node.updateParameters({ filename: value, type: 'input', format: `video/${value.split('.').at(-1)}` }, true);
+  transaction.complete(); return transaction;
+}
+test('VHS empty and nonempty N restore exact original preview identity after C1/C2 overlays', () => {
+  for (const native of ['', 'original.webm']) {
+    const f = fixture(); f.node.widgets[0].value = native;
+    f.widget.value.params = native ? { filename: native, type: 'input', format: 'video/webm', force_rate: 24, custom: 'preserved' } : { force_rate: 0, skip_first_frames: 0 };
+    const before = structuredClone(f.widget.value), guard = isolateVhsPreviewSurface(f.profile, f.window), state = guard.captureProjectionState();
+    project(f, guard, state, 'C1.mp4', true);
+    project(f, guard, state, 'C2.gif', true);
+    assert.equal(f.widget.value.params.filename, 'C2.gif');
+    project(f, guard, state, native, false);
+    assert.deepEqual(f.widget.value, before); assert.equal(state.owned.size, 0);
+    project(f, guard, state, 'C2.gif', true); project(f, guard, state, native, false);
+    assert.deepEqual(f.widget.value, before); guard.release(true);
+  }
+});
+test('VHS cleanup retains native parameter edits and independently changed preview identity keys', () => {
+  const f = fixture(), guard = isolateVhsPreviewSurface(f.profile, f.window), state = guard.captureProjectionState();
+  project(f, guard, state, 'C.mp4', true);
+  f.node.updateParameters({ skip_first_frames: 7, filename: 'user-preview.mp4', format: 'user/preview' }, false);
+  project(f, guard, state, 'N.mp4', false);
+  assert.equal(f.widget.value.params.filename, 'user-preview.mp4');
+  assert.equal(f.widget.value.params.format, 'user/preview'); assert.equal(f.widget.value.params.skip_first_frames, 7);
+  assert.equal(f.widget.value.params.type, 'input'); guard.release(true);
+});
+test('VHS proven internal I becomes the next persistent preview base instead of stale N', () => {
+  const f = fixture(), guard = isolateVhsPreviewSurface(f.profile, f.window), state = guard.captureProjectionState();
+  project(f, guard, state, 'C.mp4', true);
+  f.node.widgets[0].value = 'I.webm'; f.node.updateParameters({ filename: 'I.webm', type: 'input', format: 'video/webm', custom_width: 768 }, true);
+  guard.observeNativeState(state); const internal = structuredClone(f.widget.value);
+  project(f, guard, state, 'C.mp4', true); project(f, guard, state, 'I.webm', false);
+  assert.deepEqual(f.widget.value, internal); guard.release(true);
+});
+test('VHS preview transactions rollback their own identity changes and reject replacement state', () => {
+  const f = fixture(), guard = isolateVhsPreviewSurface(f.profile, f.window), state = guard.captureProjectionState();
+  const before = structuredClone(f.widget.value), first = project(f, guard, state, 'C.mp4', true);
+  first.rollback(); assert.deepEqual(f.widget.value, before); assert.equal(state.owned.size, 0);
+  project(f, guard, state, 'C.mp4', true); const overlay = structuredClone(f.widget.value);
+  const cleanup = project(f, guard, state, 'N.mp4', false); cleanup.rollback();
+  assert.deepEqual(f.widget.value, overlay);
+  f.widget.value.params = { filename: 'replacement.mp4' };
+  assert.throws(() => guard.beginProjection(state, false), /state_changed/); guard.release(true);
+});
+test('VHS projection capture fails closed for unowned accessors and immutable identity fields', () => {
+  for (const descriptor of [{ get: () => 'N.mp4', configurable: true }, { value: 'N.mp4', configurable: false, writable: false }]) {
+    const f = fixture(); Object.defineProperty(f.widget.value.params, 'filename', descriptor);
+    const guard = isolateVhsPreviewSurface(f.profile, f.window);
+    assert.equal(guard.captureProjectionState(), null); guard.release(true);
+  }
+});
 test('release restores exact descriptors after drain and preserves a concurrent replacement', () => {
   const f = fixture(), descriptor = Object.getOwnPropertyDescriptor(f.widget, 'updateSource'), update = Object.getOwnPropertyDescriptor(f.node, 'updateParameters');
   const guard = isolateVhsPreviewSurface(f.profile, f.window), replacement = () => 'new owner';
@@ -163,6 +217,38 @@ test('installed VHS functions: runtime capture, pending debounce, observer rollb
       async value => { network.push(value); return { json: async () => ({ source: {} }) }; }, f.window.setTimeout, f.window.clearTimeout);
     [f.node.updateParameters, f.widget.updateSource] = functions; f.widget.callback = f.widget.updateSource;
     return { ...f, network };
+  }
+  // Exercise the actual installed updater through the receipt API used by the
+  // bridge; neither a media capture nor cleanup may persist C's preview data.
+  for (const native of ['', 'native.webm']) {
+    const f = installed(), root = { _nodes: [f.node] }; f.node.graph = root;
+    f.node.widgets[0].value = native;
+    f.widget.value.params = native ? { filename: native, type: 'input', format: 'video/webm', force_rate: 24 } : { force_rate: 0, skip_first_frames: 0 };
+    f.window.LiteGraph = { registered_node_types: { VHS_LoadVideo: f.Node } }; f.window.crypto = webcrypto;
+    const target = { node: f.node, owner: f.node, widget: f.node.widgets[0] };
+    const media = createNativeEditorMedia({ app: { canvas: {} }, window: f.window, graph: () => root,
+      config: { backendUrl: 'http://127.0.0.1:8188' }, findWidget: () => target }); media.arm();
+    const binding = { field_id: 'ref', node_id: '7', input: 'video', type: 'video', class_type: 'VHS_LoadVideo', value: 'C.mp4',
+      media_owner: { name: 'C.mp4', media_type: 'video', backend: 'http://127.0.0.1:8188' } };
+    const output = () => ({ 7: { class_type: 'VHS_LoadVideo', inputs: { video: target.widget.value } } });
+    const captured = media.capture([binding], output()).captured[0]; assert(captured?.receipt);
+    const apply = value => {
+      const patch = { node_id: '7', widget_name: 'video', class_type: 'VHS_LoadVideo', media_receipt: captured.receipt, value };
+      assert(media.authorize(patch, target)); const transaction = media.beginPatch(patch, target);
+      target.widget.value = value;
+      if (value) f.node.updateParameters({ filename: value, type: 'input', format: `video/${value.split('.').at(-1)}` }, true);
+      transaction.complete(); return transaction;
+    };
+    const before = structuredClone(f.widget.value);
+    apply('C.mp4'); f.node.updateParameters({ skip_first_frames: 3 }, false);
+    apply(native); assert.deepEqual(f.widget.value, { ...before, params: { ...before.params, skip_first_frames: 3 } });
+    apply('C.mp4'); const overlay = structuredClone(f.widget.value);
+    apply(native).rollback(); assert.deepEqual(f.widget.value, overlay); target.widget.value = 'C.mp4';
+    apply(native);
+    target.widget.value = 'I.webm'; f.node.updateParameters({ filename: 'I.webm', type: 'input', format: 'video/webm', custom_width: 768 }, true);
+    media.observe(output(), [{ node_id: '7', input: 'video' }]); const internal = structuredClone(f.widget.value);
+    apply('C.mp4'); apply('I.webm'); assert.deepEqual(f.widget.value, internal);
+    f.flush(100); assert.deepEqual(f.network, []); media.destroy(); f.flush(110);
   }
   for (const failure of ['construct', 'observe']) {
     const f = installed(), root = { _nodes: [f.node] }; f.node.graph = root;

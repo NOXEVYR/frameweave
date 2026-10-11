@@ -41,15 +41,21 @@ for(const action of ['remove','add','set','clear'])test(`user ${action} sees ori
   if(action==='clear'){f.store.clearGraph('root');expected=[];}
   assert.equal(f.manager.allows(f.target),false);f.manager.reset();assert.deepEqual(f.store.getExposures('root','5'),expected);f.manager.destroy();
 });
-for(const mode of ['unknown-preview','other-leaf','extra-field','multiple-exposures','deep-host','nested-alias'])test(`${mode} never changes exposures or serializer`,async()=>{
+for(const mode of ['unknown-preview','other-leaf','extra-field','deep-host','nested-alias'])test(`${mode} never changes exposures or serializer`,async()=>{
   const f=fixture();let value=copy(f.original);
   if(mode==='unknown-preview')value[0].sourcePreviewName='customAudio';
   if(mode==='other-leaf')value[0].sourceNodeId='99';
   if(mode==='extra-field')value[0].future=true;
-  if(mode==='multiple-exposures')value.push({...value[0],name:'second'});
   if(mode==='deep-host')f.target.mappingProof.nodes.push({});
   if(mode==='nested-alias'){const middle={id:'middle',nodes:[{id:30,graph:null,subgraph:f.scope,isSubgraphNode:()=>true}]};middle.nodes[0].graph=middle;f.root.nodes.push({id:20,graph:f.root,subgraph:middle,isSubgraphNode:()=>true});}
   f.store.setExposures('root','5',value);assert.equal(await f.acquire(),false);assert.deepEqual(f.store.getExposures('root','5'),value);assert.deepEqual(Object.getOwnPropertyDescriptor(f.a,'serialize'),f.descriptor);f.manager.destroy();
+});
+
+test('multiple named aliases of the same proven audio surface are isolated and restored together',async()=>{
+  const f=fixture(),value=[...f.original,{...f.original[0],name:'Alternate audio'}];
+  f.store.setExposures('root','5',value);assert.equal(await f.acquire(),true);
+  assert.deepEqual(f.store.getExposures('root','5'),[]);assert.deepEqual(f.a.serialize().properties.previewExposures,value);
+  f.manager.reset();assert.deepEqual(f.store.getExposures('root','5'),value);f.manager.destroy();
 });
 test('a third shared instance is included and late instance addition revokes the whole lease',async()=>{
   const f=fixture(),third=f.makeHost(7,f.original);assert.equal(await f.acquire(),true);assert.deepEqual(f.store.getExposures('root','7'),[]);assert.deepEqual(third.serialize().properties.previewExposures,f.original);
@@ -83,4 +89,62 @@ test('reset during an in-flight acquisition prevents its late commit',async()=>{
 test('changing root identity cannot copy old preview configuration into the new graph key',async()=>{
   const f=fixture();assert.equal(await f.acquire(),true);f.root.id='replacement';assert.equal(f.manager.allows(f.target),false);
   f.manager.reset();assert.deepEqual(f.store.getExposures('replacement','5'),[]);f.manager.destroy();
+});
+
+function doubleFixture(aliases=false) {
+  const f=fixture(),outer={id:'outer',nodes:[]};
+  const middle={id:7,graph:outer,subgraph:f.scope,isSubgraphNode:()=>true,
+    serialize(){return{id:7,properties:{previewExposures:copy(f.store.getExposures('root','7'))},widgets_values:['native.wav']};}};
+  outer.nodes.push(middle);f.a.subgraph=outer;f.b.subgraph=outer;
+  const value=aliases?[{name:'Sound',sourceNodeId:'7',sourcePreviewName:'audioUI'}]:[];
+  f.store.setExposures('root','5',value);f.store.setExposures('root','6',value);f.store.setExposures('root','7',f.original);
+  f.target.mappingProof.nodes=[f.a,middle,f.leaf];
+  const image={id:2,type:'LoadImage',graph:f.scope},video={id:3,type:'LoadVideo',graph:f.scope};f.scope.nodes.push(image,video);
+  const target=(node,owner=f.a)=>({node,owner,mappingProof:{root:f.root,nodes:[owner,middle,node]}});
+  return{...f,middle,outer,image,video,targetFor:target,value};
+}
+
+for(const aliases of [false,true])test(`double shared audio routes isolate middle and both outer aliases: ${aliases}`,async()=>{
+  const f=doubleFixture(aliases),before=[f.a,f.b,f.middle].map(host=>host.serialize());
+  assert.equal(await f.acquire(),true);assert.equal(f.manager.allows(f.target),true);
+  for(const host of [f.a,f.b,f.middle])assert.deepEqual(f.store.getExposures('root',String(host.id)),[]);
+  assert.deepEqual([f.a,f.b,f.middle].map(host=>host.serialize()),before);
+  assert.equal(f.manager.allows(f.targetFor(f.image)),true);assert.equal(f.manager.allows(f.targetFor(f.video,f.b)),true);
+  f.app.canvas.graph=f.outer;f.observers.forEach(observer=>observer.fn());assert.equal(f.manager.allows(f.targetFor(f.leaf,f.b)),true);
+  f.manager.reset();assert.deepEqual([f.a,f.b,f.middle].map(host=>host.serialize()),before);
+  for(const node of [f.leaf,f.image,f.video])assert.ok(f.invalidations.some(item=>item.node===node));f.manager.destroy();
+});
+
+test('image and video with unrelated proven audio routes do not require suppressing that audio',()=>{
+  const f=doubleFixture(true),before=[f.a,f.b,f.middle].map(host=>host.serialize());
+  assert.equal(f.manager.allows(f.targetFor(f.image)),true);assert.equal(f.manager.allows(f.targetFor(f.video,f.b)),true);
+  assert.deepEqual([f.a,f.b,f.middle].map(host=>host.serialize()),before);
+  f.store.removeExposure('root','7','audioUI');
+  for(const node of [f.image,f.video])assert.ok(f.invalidations.some(item=>item.node===node));f.manager.destroy();
+});
+
+for(const mode of ['qualified-override','duplicate-local-key','unknown-alias','mixed-surface'])test(`unproven double preview ${mode} preserves tables and serializers`,async()=>{
+  const f=doubleFixture(true);
+  if(mode==='qualified-override')f.store.setExposures('root','6:7',f.original);
+  if(mode==='duplicate-local-key')f.root.nodes.push({id:7,graph:f.root,subgraph:{id:'other',nodes:[]},isSubgraphNode:()=>true});
+  if(mode==='unknown-alias')f.store.setExposures('root','6',[{name:'Sound',sourceNodeId:'7',sourcePreviewName:'missing'}]);
+  if(mode==='mixed-surface')f.store.setExposures('root','7',[...f.original,{name:'Image',sourceNodeId:'2',sourcePreviewName:'image'}]);
+  const before=copy([...f.table]),serializers=[f.a,f.b,f.middle].map(host=>host.serialize);
+  assert.equal(await f.acquire(),false);assert.deepEqual([...f.table],before);
+  assert.deepEqual([f.a,f.b,f.middle].map(host=>host.serialize),serializers);f.manager.destroy();
+});
+
+test('a native middle table edit revokes all dependent media and preserves the edited value',async()=>{
+  const f=doubleFixture(true);assert.equal(await f.acquire(),true);
+  assert.equal(f.manager.allows(f.targetFor(f.image)),true);assert.equal(f.manager.allows(f.targetFor(f.video)),true);
+  f.store.removeExposure('root','7','audioUI');assert.equal(f.manager.allows(f.target),false);
+  f.manager.reset();assert.deepEqual(f.store.getExposures('root','7'),[]);
+  assert.deepEqual(f.store.getExposures('root','5'),f.value);
+  for(const node of [f.leaf,f.image,f.video])assert.ok(f.invalidations.some(item=>item.node===node));f.manager.destroy();
+});
+
+test('an occurrence override cannot make an unrelated local audio table authorize image synchronization',()=>{
+  const f=doubleFixture();f.store.setExposures('root','6:7',[{name:'Image',sourceNodeId:'2',sourcePreviewName:'image'}]);
+  const before=copy([...f.table]);assert.equal(f.manager.allows(f.targetFor(f.image,f.b)),false);
+  assert.deepEqual([...f.table],before);f.manager.destroy();
 });

@@ -586,7 +586,7 @@ test('callback changes to enum constraints cannot report a now-invalid parameter
   assert.equal(h.node.widgets[0].value, 'model-a');
 });
 
-async function buttonHarness({ specification = { required: { text: ['STRING'] } }, importer = false } = {}) {
+async function buttonHarness({ specification = { required: { text: ['STRING'] } }, importer = false, load = undefined } = {}) {
   function RegisteredNode() {}
   RegisteredNode.nodeData = { input: specification };
   const node = Object.assign(Object.create(RegisteredNode.prototype), {
@@ -596,7 +596,7 @@ async function buttonHarness({ specification = { required: { text: ['STRING'] } 
   });
   const workflow = { nodes: [{ id: 1, type: 'Known', widgets_values: ['keep text', 'UI button value'],
     properties: { extension_state: { keep: true } } }], links: [] };
-  const h = harness(importer ? { loadApiJson: (_prompt, { set }) => set(workflow) } : {});
+  const h = harness({ ...(importer ? { loadApiJson: (_prompt, { set }) => set(workflow) } : {}), ...(load ? { load } : {}) });
   const backendSchema = { input: copy(specification) }, schemaRequests = [];
   h.window.AbortController = AbortController;
   h.window.fetch = async (url, options) => {
@@ -834,8 +834,8 @@ test('UI schema requests deduplicate repeated classes and refresh on each compil
 
 test('unproven linked shared ambiguous and changed promoted UI ownership is retained', async () => {
   for (const fault of ['host link', 'non IO link', 'wrong target', 'missing host widget',
-    'duplicate leaf widget', 'shared direct leaf', 'changed while fetching', 'leaf changed while fetching', 'serialized link']) {
-    const h = await promotedUIHarness({ promoted: fault !== 'shared direct leaf', shared: fault === 'shared direct leaf' });
+    'duplicate leaf widget', 'changed while fetching', 'leaf changed while fetching', 'serialized link']) {
+    const h = await promotedUIHarness();
     const compiled = h.output();
     h.app.graphToPrompt = async () => ({ workflow: h.serialize(), output: copy(compiled) });
     if (fault === 'host link') h.first.inputs[0].link = 77;
@@ -860,6 +860,619 @@ test('unproven linked shared ambiguous and changed promoted UI ownership is reta
     assert.equal(Object.hasOwn(result.output[h.path].inputs, h.name), true, fault);
     assert.deepEqual(result.ignored_ui_inputs, [], fault);
   }
+});
+
+// Current native convertToSubgraph removes a promoted action from leaf.widgets.
+// Only the real media/scalar input proceeds to each outer instance; the action
+// terminates on a middle host whose definition is reachable from both roots.
+async function sharedMiddleUIHarness() {
+  const h = await subgraphHarness({ deep: true, shared: true, promoted: true });
+  const name = 'choose_asset_action';
+  const slot = { name, widget: { name }, link: 50 };
+  h.leaf.inputs.push(slot);
+  h.inside.links.set(50, { originIsIoNode: true, origin_id: -10, origin_slot: 1,
+    target_id: h.leaf.id, target_slot: h.leaf.inputs.indexOf(slot) });
+  h.innerHost.inputs.push({ name: 'middle-action', widget: { name: 'middle-action' }, link: null });
+  h.innerHost.widgets.push({ name: 'middle-action', type: 'button', value: 'UI action', options: { serialize: false } });
+  h.leaf.constructor.nodeData.input.required[name] = ['ASSET_PICKER', {}];
+  const backendSchema = { input: { required: { fps: ['INT'], mode: [['a', 'b']] } } };
+  const schemaRequests = [];
+  h.window.AbortController = AbortController;
+  h.window.fetch = async url => {
+    schemaRequests.push(url);
+    return { ok: true, json: async () => ({ Known: copy(backendSchema) }) };
+  };
+  // Use the actual promoted IO route even when the leaf widget is absent.
+  const output = () => {
+    const result = h.output();
+    for (const id of ['6:2:4', '7:2:4']) result[id].inputs[name] = h.innerHost.widgets[1].value;
+    return result;
+  };
+  h.app.graphToPrompt = async () => ({ workflow: h.serialize(), output: output() });
+  return { ...h, name, backendSchema, schemaRequests, output };
+}
+
+test('shared middle UI routing removes derived actions after native promotion removed leaf widgets, without writable capability', async () => {
+  const h = await sharedMiddleUIHarness();
+  const before = copy(h.serialize()), compiled = h.output();
+  h.emit('compile', 'shared-middle'); await h.flush();
+  const result = h.replies.at(-1).message.result;
+  assert.deepEqual(result.ignored_ui_inputs, ['6:2:4', '7:2:4'].map(node_id =>
+    ({ node_id, input: h.name, reason: 'undeclared_button_widget' })));
+  for (const id of ['6:2:4', '7:2:4']) {
+    assert.equal(Object.hasOwn(result.output[id].inputs, h.name), false);
+    assert.equal(result.output[id].inputs.fps, 4);
+    assert.equal(result.controls.some(item => item.node_id === id && item.input === h.name), false);
+  }
+  assert.equal(h.schemaRequests.length, 1);
+  assert.deepEqual(h.output(), compiled); assert.deepEqual(h.serialize(), before);
+  h.emit('captureMappings', 'no-ui-capability', { bindings: [{ node_id: h.path, input: h.name, class_type: 'Known' }] }); await h.flush();
+  assert.equal(h.replies.at(-1).message.result.captured.length, 0);
+  assert.equal(h.replies.at(-1).message.result.unsupported[0].reason, 'shared_definition_widget');
+  h.emit('patch', 'no-ui-write', { patches: [{ node_id: h.path, widget_name: h.name, value: 'changed' }] }); await h.flush();
+  assert.equal(h.replies.at(-1).message.result.applied.length, 0);
+  assert.equal(h.replies.at(-1).message.result.unsupported[0].reason, 'shared_definition_widget');
+  h.emit('patch', 'scalar-write', { patches: [{ node_id: h.path, widget_name: 'fps', value: 8, expected_value: 4 }] }); await h.flush();
+  assert.equal(h.first.widgets[0].value, 8); assert.equal(h.second.widgets[0].value, 4);
+  assert.equal(h.leaf.widgets[0].value, 4);
+});
+
+test('shared direct nonsemantic actions permit only read-only cleanup while shared scalar writes remain blocked', async () => {
+  const h = await promotedUIHarness({ promoted: false, shared: true });
+  const before = copy(h.serialize());
+  h.emit('compile', 'shared-direct-ui'); await h.flush();
+  assert.equal(h.replies.at(-1).message.result.ignored_ui_inputs.length, 2);
+  h.emit('patch', 'shared-scalar', { patches: [{ node_id: h.path, widget_name: 'fps', value: 8 }] }); await h.flush();
+  assert.equal(h.replies.at(-1).message.result.unsupported[0].reason, 'shared_definition_widget');
+  assert.deepEqual(h.serialize(), before);
+});
+
+test('shared middle UI cleanup preserves authoritative declarations and original unknown API parameters', async () => {
+  for (const group of ['required', 'optional', 'hidden', 'original API']) {
+    const h = await sharedMiddleUIHarness();
+    if (group === 'original API') {
+      const prompt = h.output(), before = copy(prompt);
+      h.emit('importApi', 'original-unknown', { prompt }); await h.flush();
+      const reply = h.replies.at(-1).message;
+      assert.equal(reply.error, undefined);
+      assert.deepEqual(reply.result.output, before); assert.deepEqual(reply.result.ignored_ui_inputs, []);
+      assert.deepEqual(prompt, before);
+      h.emit('compile', 'original-unknown-recompile'); await h.flush();
+      assert.deepEqual(h.replies.at(-1).message.result.output, before);
+      assert.deepEqual(h.replies.at(-1).message.result.ignored_ui_inputs, []);
+      h.emit('load', 'replace-original-api', { document: h.serialize() }); await h.flush();
+      h.emit('compile', 'new-native-source'); await h.flush();
+      assert.equal(h.replies.at(-1).message.result.ignored_ui_inputs.length, 2);
+    } else {
+      h.backendSchema.input[group] = { [h.name]: ['STRING'] };
+      h.emit('compile', 'declared'); await h.flush();
+      assert.deepEqual(h.replies.at(-1).message.result.output, h.output(), group);
+      assert.deepEqual(h.replies.at(-1).message.result.ignored_ui_inputs, [], group);
+    }
+  }
+});
+
+test('shared middle UI cleanup retains missing conflicting connected and asynchronously changed routes', async () => {
+  for (const fault of ['non IO', 'missing link', 'wrong target', 'wrong slot', 'missing host slot', 'missing host widget',
+    'duplicate input', 'duplicate host widget', 'semantic leaf widget', 'semantic middle widget', 'real connection',
+    'serialized link', 'serialized mismatch', 'widget replaced', 'widget value changed', 'slot replaced', 'link changed', 'definition replaced']) {
+    const h = await sharedMiddleUIHarness(), before = h.output();
+    h.app.graphToPrompt = async () => ({ workflow: h.serialize(), output: copy(before) });
+    const link = h.inside.links.get(50);
+    if (fault === 'non IO') link.originIsIoNode = false;
+    if (fault === 'missing link') h.inside.links.delete(50);
+    if (fault === 'wrong target') link.target_id = 999;
+    if (fault === 'wrong slot') link.target_slot = 0;
+    if (fault === 'missing host slot') h.innerHost.inputs.pop();
+    if (fault === 'missing host widget') h.innerHost.widgets.pop();
+    if (fault === 'duplicate input') h.leaf.inputs.push({ ...h.leaf.inputs.at(-1) });
+    if (fault === 'duplicate host widget') h.innerHost.widgets.push({ ...h.innerHost.widgets.at(-1) });
+    if (fault === 'semantic leaf widget') h.leaf.widgets.push({ name: h.name, type: 'text', value: 'UI action' });
+    if (fault === 'semantic middle widget') { h.innerHost.widgets.at(-1).type = 'text'; delete h.innerHost.widgets.at(-1).options.serialize; }
+    if (fault === 'real connection') h.innerHost.inputs.at(-1).link = 99;
+    if (fault === 'serialized link') for (const value of Object.values(before)) value.inputs[h.name] = ['source', 0];
+    if (fault === 'serialized mismatch') for (const value of Object.values(before)) value.inputs[h.name] = 'stale UI action';
+    const fetch = h.window.fetch;
+    h.window.fetch = async (...args) => {
+      if (fault === 'widget replaced') h.innerHost.widgets[1] = { ...h.innerHost.widgets[1] };
+      if (fault === 'widget value changed') h.innerHost.widgets[1].value = 'changed';
+      if (fault === 'slot replaced') h.innerHost.inputs[1] = { ...h.innerHost.inputs[1] };
+      if (fault === 'link changed') link.origin_slot = 0;
+      if (fault === 'definition replaced') h.first.subgraph = { ...h.outer };
+      return fetch(...args);
+    };
+    h.emit('compile', fault); await h.flush();
+    const reply = h.replies.at(-1).message;
+    assert.equal(reply.error, undefined, fault);
+    assert.equal(Object.hasOwn(reply.result.output[h.path].inputs, h.name), true, fault);
+    if (fault !== 'definition replaced') assert.deepEqual(reply.result.ignored_ui_inputs, [], fault);
+  }
+});
+
+test('original API input protection survives failed import rollback and native undo but explicit load replaces the source', async () => {
+  const h = await buttonHarness({ importer: true });
+  const original = { 1: { class_type: 'Known', inputs: { text: 'keep text', open_picker: 'original unknown API data' } } };
+  h.app.graphToPrompt = async () => ({ workflow: h.current(), output: copy(original) });
+  h.emit('importApi', 'original', { prompt: original }); await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  const before = copy(h.current());
+  h.emit('importApi', 'failed-other-source', { prompt: { 1: { class_type: 'Known', inputs: { text: 'changed different source' } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /无损转换/);
+  assert.deepEqual(copy(h.current()), before);
+  await h.app.loadGraphData(copy(before), false, false); // Native undo keeps the claimed source session.
+  h.emit('compile', 'after-rollback-undo'); await h.flush();
+  assert.deepEqual(h.replies.at(-1).message.result.output, original);
+  assert.deepEqual(h.replies.at(-1).message.result.ignored_ui_inputs, []);
+  h.emit('load', 'new-document', { document: h.workflow }); await h.flush();
+  h.emit('compile', 'new-document-compile'); await h.flush();
+  assert.equal(Object.hasOwn(h.replies.at(-1).message.result.output[1].inputs, 'open_picker'), false);
+});
+
+test('a changed root or native workflow owner blocks API compilation and writes instead of dropping name protection', async () => {
+  for (const boundary of ['root', 'native workflow']) {
+    const h = await buttonHarness({ importer: true });
+    const first = { path: 'first' }, second = { path: 'second' };
+    const store = { $id: 'workflow', activeWorkflow: first,
+      getWorkflowByPath: path => path === 'first' ? first : path === 'second' ? second : undefined };
+    h.app.extensionManager = { workflow: store };
+    const original = { 1: { class_type: 'Known', inputs: { text: 'keep text', open_picker: 'original unknown data' } } };
+    h.app.graphToPrompt = async () => ({ workflow: h.workflow, output: copy(original) });
+    h.emit('importApi', 'original', { prompt: original }); await h.flush();
+    assert.equal(h.replies.at(-1).message.error, undefined);
+    h.emit('compile', 'same-source'); await h.flush();
+    assert.deepEqual(h.replies.at(-1).message.result.output, original);
+    if (boundary === 'root') h.app.rootGraph = { serialize: () => h.workflow, getNodeById: id => String(id) === '1' ? h.node : null };
+    else store.activeWorkflow = second;
+    h.emit('compile', 'other-source'); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /工作流或编辑会话已变化/, boundary);
+    h.emit('patch', 'invalid-context-write', { patches: [{ node_id: '1', widget_name: 'text', value: 'wrong document' }] }); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /重新载入/, boundary);
+    assert.equal(h.node.widgets[0].value, 'keep text');
+  }
+});
+
+async function originalInputMigrationHarness() {
+  let restore, normalizeRestore = data => data, afterRestore = () => {};
+  const h = await buttonHarness({ importer: true, load: async data => { restore?.(data); await afterRestore(); } });
+  const root = h.app.graph, lifecycles = [];
+  const scope = (id, nodes = []) => ({ id, nodes, links: new Map(),
+    getNodeById(id) { return this.nodes.find(node => String(node.id) === String(id)); }, getLink(id) { return this.links.get(id); } });
+  Object.assign(root, scope('root'));
+  const configureLeaf = (node, record) => {
+    Object.assign(node, { id: record.id, type: 'Known', comfyClass: 'Known', inputs: [],
+      properties: copy(record.properties || {}), widgets: [
+        { name: 'text', type: 'text', value: record.widgets_values[0] },
+        { name: 'open_picker', type: 'button', value: record.widgets_values[1] },
+        ...(record.widgets_values.length > 2 ? [{ name: 'frontend_upload', type: 'button', value: record.widgets_values[2] }] : [])],
+      onRemoved() { lifecycles.push(['remove', this]); }, onAdded() { lifecycles.push(['add', this]); },
+      serialize() { return { id: this.id, type: this.type, widgets_values: this.widgets.map(widget => widget.value), properties: copy(this.properties) }; } });
+    return node;
+  };
+  configureLeaf(h.node, { ...h.workflow.nodes[0], widgets_values: ['keep text', 'original API data'] });
+  root.nodes = [h.node]; h.node.graph = root;
+  const host = (id, child) => ({ id, type: child.id, subgraph: child, inputs: [], widgets: [], isSubgraphNode: () => true,
+    serialize() { return { id: this.id, type: this.type, widgets_values: [] }; } });
+  const visitLeaves = scope => scope.nodes.flatMap(node => node.subgraph ? visitLeaves(node.subgraph) : [node]);
+  const serialize = () => {
+    const definitions = [], seen = new Set();
+    const visit = scope => {
+      for (const node of scope.nodes) if (node.subgraph && !seen.has(node.subgraph)) {
+        seen.add(node.subgraph); definitions.push({ id: node.subgraph.id, nodes: node.subgraph.nodes.map(node => node.serialize()), links: [] }); visit(node.subgraph);
+      }
+    };
+    visit(root);
+    return { nodes: root.nodes.map(node => node.serialize()), links: [], definitions: { subgraphs: definitions } };
+  };
+  const output = () => {
+    const result = {};
+    const visit = (scope, parts = []) => {
+      for (const node of scope.nodes) {
+        const path = [...parts, node.id];
+        if (node.subgraph) visit(node.subgraph, path);
+        else result[path.join(':')] = { class_type: 'Known', inputs: Object.fromEntries(node.widgets.map(widget => [widget.name, widget.value])) };
+      }
+    };
+    visit(root); return result;
+  };
+  root.serialize = serialize;
+  h.app.graphToPrompt = async () => ({ workflow: serialize(), output: output() });
+  restore = data => {
+    data = normalizeRestore(copy(data));
+    for (const node of visitLeaves(root)) node.onRemoved?.();
+    const definitions = new Map((data.definitions?.subgraphs || []).map(record => [record.id, record]));
+    const build = (record, parent) => record.nodes.map(record => {
+      let node;
+      if (definitions.has(record.type)) {
+        const child = scope(record.type); child.nodes = build(definitions.get(record.type), child); node = host(record.id, child);
+      } else node = configureLeaf(Object.create(h.RegisteredNode.prototype), record);
+      node.graph = parent; node.onAdded?.(); return node;
+    });
+    root.nodes = build(data, root);
+  };
+  const move = depth => {
+    const leaves = visitLeaves(root), node = leaves.find(node => node.id === 1);
+    node.onRemoved?.();
+    let container = root;
+    if (depth) {
+      const inner = scope('origin-inner'); container = inner;
+      if (depth === 2) {
+        const outer = scope('origin-outer'); outer.nodes = [host(10, inner)]; outer.nodes[0].graph = outer;
+        root.nodes = [host(9, outer)];
+      } else root.nodes = [host(9, inner)];
+      root.nodes[0].graph = root;
+    }
+    container.nodes = [node]; node.graph = container; node.onAdded?.();
+  };
+  const newLeaf = (id, value = 'new UI action', freshUI = false) => configureLeaf(Object.create(h.RegisteredNode.prototype),
+    { id, widgets_values: ['keep text', value, ...(freshUI ? ['new upload action'] : [])], properties: copy(h.node.properties) });
+  h.setCurrent(serialize());
+  const original = output();
+  h.emit('importApi', 'import-original-input', { prompt: original }); await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  let sequence = 0;
+  const compile = async id => { h.emit('compile', `${id}-${++sequence}`); await h.flush(); const reply = h.replies.at(-1).message; assert.equal(reply.error, undefined); return reply.result; };
+  return { ...h, root, original, serialize, output, move, newLeaf, compile, visitLeaves, lifecycles,
+    setRestoreNormalization: callback => { normalizeRestore = callback; }, setAfterRestore: callback => { afterRestore = callback; } };
+}
+
+test('session-wide original API names survive grouping and ungrouping while UI names absent from the original still clean', async () => {
+  const h = await originalInputMigrationHarness(), original = copy(h.original);
+  for (const depth of [1, 2, 0, 2, 1, 0]) {
+    h.move(depth);
+    const fresh = h.newLeaf(2, 'new UI action', true); fresh.graph = h.root; h.root.nodes.push(fresh); fresh.onAdded?.();
+    const raw = h.serialize(), api = h.output();
+    const result = await h.compile(`moved-${depth}`), path = depth === 2 ? '9:10:1' : depth === 1 ? '9:1' : '1';
+    assert.equal(result.output[path].inputs.open_picker, 'original API data', `depth=${depth}`);
+    assert.equal(result.output[2].inputs.open_picker, 'new UI action');
+    assert.equal(Object.hasOwn(result.output[2].inputs, 'frontend_upload'), false);
+    assert.deepEqual(result.ignored_ui_inputs, [{ node_id: '2', input: 'frontend_upload', reason: 'undeclared_button_widget' }]);
+    assert.deepEqual(result.workflow, raw); assert.deepEqual(h.serialize(), raw); assert.deepEqual(h.output(), api);
+  }
+  assert.equal(h.lifecycles.filter(([name]) => name === 'remove').length, 6);
+  assert.equal(h.lifecycles.filter(([name]) => name === 'add').length, 12);
+  assert.deepEqual(h.original, original);
+});
+
+test('original unknown API input remains protected after native undo redo reconstruct nodes in one and two nested scopes', async () => {
+  const h = await originalInputMigrationHarness(), top = h.serialize();
+  h.move(1); const single = h.serialize(); await h.compile('single-before-undo');
+  h.move(2); const double = h.serialize(); await h.compile('double-before-undo');
+  for (const [name, document, path] of [['undo-single', single, '9:1'], ['undo-top', top, '1'], ['redo-single', single, '9:1'], ['redo-double', double, '9:10:1']]) {
+    const previous = h.visitLeaves(h.root)[0], raw = copy(document);
+    await h.app.loadGraphData(copy(document), false, false);
+    assert.notEqual(h.visitLeaves(h.root)[0], previous, 'native undo recreates node objects');
+    const result = await h.compile(name);
+    assert.equal(result.output[path].inputs.open_picker, 'original API data', name);
+    assert.deepEqual(result.ignored_ui_inputs, []); assert.deepEqual(h.serialize(), raw); assert.deepEqual(document, raw);
+  }
+});
+
+test('deleting an original node keeps its input names protected without overriding new widget write restrictions', async () => {
+  for (const depth of [0, 1, 2]) {
+    const h = await originalInputMigrationHarness(); h.move(depth);
+    const old = h.visitLeaves(h.root)[0], replacement = h.newLeaf(old.id, 'original API data', true);
+    replacement.widgets[1].options = { read_only: true };
+    old.onRemoved?.(); const scope = old.graph; scope.nodes = [replacement]; replacement.graph = scope; replacement.onAdded?.();
+    const before = h.serialize(), result = await h.compile(`reuse-${depth}`), path = depth === 2 ? '9:10:1' : depth ? '9:1' : '1';
+    assert.equal(result.output[path].inputs.open_picker, 'original API data', `depth=${depth}`);
+    assert.equal(Object.hasOwn(result.output[path].inputs, 'frontend_upload'), false);
+    h.emit('captureMappings', `no-button-write-${depth}`, { bindings: [{ node_id: path, input: 'open_picker', class_type: 'Known' }] }); await h.flush();
+    assert.equal(h.replies.at(-1).message.result.captured.length, 0);
+    assert.deepEqual(h.serialize(), before);
+    // Undo does not need to establish which object owns the protected name.
+    replacement.onRemoved?.(); scope.nodes = [old]; old.onAdded?.();
+    const restored = await h.compile(`original-restored-${depth}`);
+    assert.equal(restored.output[path].inputs.open_picker, 'original API data');
+  }
+});
+
+test('shared double grouping preserves original API fields without granting shared widget write mappings', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  h.root.nodes.push({ ...h.root.nodes[0], id: 11 });
+  const raw = h.serialize(), result = await h.compile('shared-double-origin');
+  for (const path of ['9:10:1', '11:10:1']) assert.equal(result.output[path].inputs.open_picker, 'original API data');
+  assert.deepEqual(result.ignored_ui_inputs, []); assert.deepEqual(h.serialize(), raw);
+  h.emit('captureMappings', 'shared-origin-write-map', { bindings: [{ node_id: '9:10:1', input: 'open_picker', class_type: 'Known' }] }); await h.flush();
+  assert.equal(h.replies.at(-1).message.result.captured.length, 0);
+  assert.equal(h.replies.at(-1).message.result.unsupported[0].reason, 'shared_definition_widget');
+});
+
+test('native reconstruction keeps original names globally but subsequent never-imported UI names still clean', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  const restored = h.serialize();
+  restored.definitions.subgraphs.find(record => record.id === 'origin-inner').nodes[0].id = 31;
+  const raw = copy(restored);
+  await h.app.loadGraphData(copy(restored), false, false);
+  const fresh = h.newLeaf(2, 'new UI action', true); fresh.graph = h.root; h.root.nodes.push(fresh);
+  const result = await h.compile('normalized-source');
+  assert.equal(result.output['9:10:31'].inputs.open_picker, 'original API data');
+  assert.equal(result.output[2].inputs.open_picker, 'new UI action');
+  assert.equal(Object.hasOwn(result.output[2].inputs, 'frontend_upload'), false);
+  assert.deepEqual(result.ignored_ui_inputs, [{ node_id: '2', input: 'frontend_upload', reason: 'undeclared_button_widget' }]);
+  assert.deepEqual(restored, raw);
+});
+
+test('native undo redo with simultaneous ID and metadata normalization retains original names without matching sources', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  for (const [name, id] of [['undo-normalized', 31], ['redo-normalized', 32]]) {
+    const restored = h.serialize(), record = restored.definitions.subgraphs.find(item => item.id === 'origin-inner').nodes[0];
+    record.id = id; record.properties.frontend_normalized = name;
+    const raw = copy(restored);
+    await h.app.loadGraphData(copy(restored), false, false);
+    const result = await h.compile(name);
+    assert.equal(result.output[`9:10:${id}`].inputs.open_picker, 'original API data', name);
+    assert.deepEqual(result.ignored_ui_inputs, [], name);
+    assert.deepEqual(h.serialize(), raw); assert.deepEqual(restored, raw);
+  }
+});
+
+test('native reconstruction keeps same-name new hosts and nodes while cleaning their never-imported UI names', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  const restored = h.serialize();
+  restored.nodes.push(h.newLeaf(2, 'new UI action', true).serialize(), { id: 12, type: 'fresh-definition', widgets_values: [] });
+  restored.definitions.subgraphs.push({ id: 'fresh-definition', nodes: [h.newLeaf(3, 'new UI action', true).serialize()], links: [] });
+  const raw = copy(restored);
+  await h.app.loadGraphData(copy(restored), false, false);
+  const result = await h.compile('recovered-source-with-new-nodes');
+  assert.equal(result.output['9:10:1'].inputs.open_picker, 'original API data');
+  for (const path of ['2', '12:3']) {
+    assert.equal(result.output[path].inputs.open_picker, 'new UI action');
+    assert.equal(Object.hasOwn(result.output[path].inputs, 'frontend_upload'), false);
+  }
+  assert.deepEqual(result.ignored_ui_inputs, ['2', '12:3'].map(node_id => ({ node_id, input: 'frontend_upload', reason: 'undeclared_button_widget' })));
+  assert.deepEqual(h.serialize(), raw); assert.deepEqual(restored, raw);
+});
+
+test('failed import rollback retains original API fields when restoration normalizes both ID and metadata', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  const original = copy(h.original), before = h.serialize();
+  const normalize = data => {
+    const record = data.definitions.subgraphs.find(item => item.id === 'origin-inner').nodes[0];
+    record.id = 41; record.properties.frontend_normalized = true; return data;
+  };
+  h.setRestoreNormalization(normalize);
+  h.emit('importApi', 'failed-normalized-rollback', { prompt: { 1: { class_type: 'Known', inputs: { text: 'different source' } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /无损转换/);
+  const raw = h.serialize(), result = await h.compile('after-normalized-rollback');
+  assert.equal(result.output['9:10:41'].inputs.open_picker, 'original API data');
+  assert.deepEqual(result.ignored_ui_inputs, []);
+  assert.deepEqual(raw, normalize(copy(before))); assert.deepEqual(h.serialize(), raw);
+  assert.deepEqual(h.original, original);
+});
+
+test('failed import restores grouped original names through rebuilt nodes and explicit new load clears them', async () => {
+  const h = await originalInputMigrationHarness(); h.move(2);
+  const before = h.serialize(), originalNode = h.visitLeaves(h.root)[0];
+  h.emit('importApi', 'failed-replacement-import', { prompt: { 1: { class_type: 'Known', inputs: { text: 'different source' } } } }); await h.flush();
+  assert.match(h.replies.at(-1).message.error, /无损转换/);
+  assert.notEqual(h.visitLeaves(h.root)[0], originalNode);
+  assert.deepEqual(copy(h.serialize()), before);
+  const result = await h.compile('after-grouped-import-rollback');
+  assert.equal(result.output['9:10:1'].inputs.open_picker, 'original API data');
+  h.emit('load', 'explicit-new-native-source', { document: copy(before) }); await h.flush();
+  const next = await h.compile('after-new-native-load');
+  assert.equal(Object.hasOwn(next.output['9:10:1'].inputs, 'open_picker'), false);
+  assert.deepEqual(copy(h.serialize()), before);
+});
+
+test('original API distinct-name and UTF8 byte budgets allow exact limits and retain all fields beyond them', async () => {
+  for (const limit of ['names', 'bytes']) for (const excess of [0, 1]) {
+    const h = await originalInputMigrationHarness();
+    if (limit === 'names') {
+      for (let id = 2; id < 10000 + excess; id++) h.node.widgets.push({ name: `original_${id}`, type: 'button', value: 'original' });
+    } else {
+      const bytes = 2 * 1024 * 1024 - 'text'.length - 'open_picker'.length + excess;
+      const name = '界'.repeat(Math.floor(bytes / 3)) + 'x'.repeat(bytes % 3);
+      h.node.widgets.push({ name, type: 'button', value: 'original' });
+    }
+    h.emit('importApi', `bounded-original-${limit}-${excess}`, { prompt: h.output() }); await h.flush();
+    assert.equal(h.replies.at(-1).message.error, undefined);
+    const fresh = h.newLeaf(2, 'new UI action', true); fresh.graph = h.root; h.root.nodes.push(fresh);
+    const before = h.serialize(), api = h.output();
+    const result = await h.compile(`bounded-${limit}-${excess}`);
+    if (excess) {
+      assert.deepEqual(result.output, api, limit); assert.deepEqual(result.ignored_ui_inputs, [], limit);
+      assert.equal(h.replies.some(({ message }) => message.result?.code === 'api-input-protection-limit'), true);
+    } else {
+      assert.equal(result.output[2].inputs.open_picker, 'new UI action');
+      assert.equal(Object.hasOwn(result.output[2].inputs, 'frontend_upload'), false);
+      assert.deepEqual(result.output[1], api[1]);
+    }
+    assert.deepEqual(h.serialize(), before);
+    if (excess) {
+      // A fresh native document clears even the saturated veto.
+      const resetDocument = { nodes: [fresh.serialize()], links: [] };
+      h.emit('load', `replace-bounded-${limit}`, { document: resetDocument }); await h.flush();
+      const reset = await h.compile(`reset-${limit}`);
+      assert.deepEqual(reset.output[2].inputs, { text: 'keep text' });
+      assert.equal(reset.ignored_ui_inputs.length, 2, limit);
+      assert.deepEqual(copy(h.serialize()).nodes, resetDocument.nodes);
+    }
+  }
+});
+
+test('unique shape, unique old ID and ambiguous reconstruction never assign deletion permission to another original node', async () => {
+  for (const variant of ['shape', 'old ID', 'ambiguous']) {
+    const h = await originalInputMigrationHarness();
+    if (variant === 'ambiguous') {
+      const second = h.newLeaf(2, 'original API data'); second.graph = h.root; h.root.nodes.push(second);
+      h.emit('importApi', 'two-originals', { prompt: h.output() }); await h.flush();
+      assert.equal(h.replies.at(-1).message.error, undefined);
+    }
+    const restored = h.serialize(); restored.nodes[0].id = 31;
+    if (variant === 'ambiguous') {
+      restored.nodes[1].id = 32; restored.nodes[1].properties.frontend_normalized = true;
+    } else {
+      restored.nodes[0].properties.frontend_normalized = true;
+      const fresh = h.newLeaf(variant === 'shape' ? 2 : 1, variant === 'shape' ? 'original API data' : 'fresh UI action').serialize();
+      if (variant === 'old ID') fresh.properties.fresh_ui = true;
+      restored.nodes.push(fresh);
+    }
+    const documentBefore = copy(restored);
+    await h.app.loadGraphData(copy(restored), false, false);
+    h.visitLeaves(h.root).at(-1).widgets.push({ name: 'frontend_upload', type: 'button', value: 'new UI action' });
+    const raw = h.serialize(), output = h.output(), result = await h.compile(`no-source-matching-${variant}`);
+    for (const [path, node] of Object.entries(output)) assert.equal(result.output[path].inputs.open_picker, node.inputs.open_picker, variant);
+    assert.equal(result.ignored_ui_inputs.length, 1);
+    assert.equal(result.ignored_ui_inputs[0].input, 'frontend_upload');
+    assert.deepEqual(h.serialize(), raw); assert.deepEqual(restored, documentBefore);
+  }
+});
+
+test('replacing an original node outside native load preserves its names while never-imported UI names still clean', async () => {
+  const h = await originalInputMigrationHarness(), original = copy(h.original);
+  const previous = h.node, replacement = h.newLeaf(31, 'original API data', true);
+  replacement.properties.frontend_normalized = true; replacement.graph = h.root;
+  previous.onRemoved?.(); h.root.nodes = [replacement]; replacement.onAdded?.();
+  const raw = h.serialize(), result = await h.compile('replacement-outside-native-load');
+  assert.equal(result.output[31].inputs.open_picker, 'original API data');
+  assert.equal(Object.hasOwn(result.output[31].inputs, 'frontend_upload'), false);
+  assert.deepEqual(h.serialize(), raw); assert.deepEqual(h.original, original);
+});
+
+test('native load rejection before or after graph mutation blocks compile and writes until explicit load succeeds', async () => {
+  for (const fault of ['before mutation', 'rebuilt nodes', 'replaced root']) {
+    const h = await originalInputMigrationHarness(), before = h.serialize(), previous = h.visitLeaves(h.root)[0];
+    if (fault === 'before mutation') h.setRestoreNormalization(() => { throw new Error('private loader detail'); });
+    else h.setAfterRestore(() => {
+      if (fault === 'replaced root') h.app.rootGraph = { ...h.root };
+      throw new Error('private loader detail');
+    });
+    await assert.rejects(h.app.loadGraphData(copy(before), false, false), /private loader detail/);
+    if (fault !== 'before mutation') assert.notEqual(h.visitLeaves(h.root)[0], previous);
+    h.emit('compile', 'failed-native-compile'); h.emit('patch', 'failed-native-write', { patches: [{ node_id: '1', widget_name: 'text', value: 'unwanted' }] });
+    await h.flush();
+    for (const id of ['failed-native-compile', 'failed-native-write']) {
+      const reply = h.replies.find(({ message }) => message.requestId === id).message;
+      assert.match(reply.error, /重新载入/); assert.equal(reply.result, undefined);
+    }
+    assert.equal(JSON.stringify(h.replies).includes('private loader detail'), false);
+    assert.deepEqual(h.serialize(), before);
+    h.setRestoreNormalization(data => data); h.setAfterRestore(() => {}); delete h.app.rootGraph;
+    await h.app.loadGraphData(copy(before), false, false);
+    h.emit('compile', 'unverified-recovery'); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /重新载入/, 'ordinary native success does not recover a failed document');
+    h.emit('load', 'explicit-recovery', { document: before }); await h.flush();
+    const result = await h.compile('after-explicit-recovery');
+    assert.equal(Object.hasOwn(result.output[1].inputs, 'open_picker'), false);
+    assert.deepEqual(h.serialize(), before);
+  }
+});
+
+test('compile waiting on nativeTail rechecks loaded state after a partial native load rejects', async () => {
+  const h = await originalInputMigrationHarness();
+  let rejectLoad, compiles = 0;
+  h.setAfterRestore(() => new Promise((_resolve, reject) => { rejectLoad = reject; }));
+  const nativeResult = h.app.loadGraphData(h.serialize(), false, false).catch(error => error);
+  await h.flush();
+  const graphToPrompt = h.app.graphToPrompt;
+  h.app.graphToPrompt = async (...args) => { compiles++; return graphToPrompt(...args); };
+  h.emit('compile', 'waiting-compile'); await h.flush();
+  assert.equal(h.replies.some(({ message }) => message.requestId === 'waiting-compile'), false);
+  rejectLoad(new Error('native rejection')); await nativeResult; await h.flush();
+  assert.match(h.replies.at(-1).message.error, /重新载入/); assert.equal(compiles, 0);
+});
+
+test('a verified patch rollback restores usability and original names after its callback native load partially fails', async () => {
+  const h = await originalInputMigrationHarness(), before = h.serialize();
+  h.visitLeaves(h.root)[0].widgets[0].callback = async () => {
+    h.setAfterRestore(() => { h.setAfterRestore(() => {}); throw new Error('callback native load failure'); });
+    await h.app.loadGraphData(h.serialize(), false, false);
+  };
+  h.emit('patch', 'failed-callback-native-load', { patches: [{ node_id: '1', widget_name: 'text', value: 'changed' }] }); await h.flush();
+  const reply = h.replies.at(-1).message;
+  assert.match(reply.error, /已恢复/); assert.equal(reply.result.rolled_back, true);
+  assert.deepEqual(h.serialize(), before);
+  const result = await h.compile('verified-rollback-recovery');
+  assert.equal(result.output[1].inputs.text, 'keep text');
+  assert.equal(result.output[1].inputs.open_picker, 'original API data');
+});
+
+test('a successful same-document native load may rebind a rebuilt root without replacing protected input names', async () => {
+  const h = await originalInputMigrationHarness();
+  h.setAfterRestore(() => { h.app.rootGraph = { ...h.root }; });
+  await h.app.loadGraphData(h.serialize(), false, false);
+  const result = await h.compile('verified-new-root');
+  assert.equal(result.output[1].inputs.open_picker, 'original API data');
+  assert.deepEqual(result.ignored_ui_inputs, []);
+});
+
+test('root and owner changes during compilation or authoritative schema awaits cannot return an applicable API copy', async () => {
+  for (const phase of ['compile', 'schema']) for (const boundary of ['root', 'owner']) {
+    const h = await buttonHarness({ importer: true }), first = { path: 'first' }, second = { path: 'second' };
+    const store = { $id: 'workflow', activeWorkflow: first, getWorkflowByPath: path => path === 'first' ? first : second };
+    h.app.extensionManager = { workflow: store };
+    const original = { 1: { class_type: 'Known', inputs: { text: 'keep text', open_picker: 'original API data' } } };
+    h.app.graphToPrompt = async () => ({ workflow: h.current(), output: copy(original) });
+    h.emit('importApi', 'original', { prompt: original }); await h.flush();
+    assert.equal(h.replies.at(-1).message.error, undefined);
+    h.node.widgets.push({ name: 'frontend_upload', type: 'button', value: 'new UI action' });
+    const output = { 1: { ...original[1], inputs: { ...original[1].inputs, frontend_upload: 'new UI action' } } };
+    const change = () => {
+      if (boundary === 'root') h.app.rootGraph = { serialize: () => h.current(), getNodeById: () => h.node };
+      else store.activeWorkflow = second;
+    };
+    h.app.graphToPrompt = async () => { if (phase === 'compile') change(); return { workflow: h.current(), output }; };
+    const fetch = h.window.fetch;
+    h.window.fetch = async (...args) => { if (phase === 'schema') change(); return fetch(...args); };
+    h.emit('compile', `context-change-${phase}-${boundary}`); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /工作流或编辑会话已变化/);
+    assert.equal(h.replies.at(-1).message.result, undefined);
+    assert.equal(output[1].inputs.open_picker, 'original API data'); assert.equal(output[1].inputs.frontend_upload, 'new UI action');
+  }
+});
+
+test('successful API import replaces the old name set and failed attempts do not add their names to it', async () => {
+  const h = await originalInputMigrationHarness();
+  h.emit('importApi', 'failed-name-set', { prompt: { 1: { class_type: 'Known', inputs: { text: 'different', attempt_only: 'unverified' } } } });
+  await h.flush(); assert.match(h.replies.at(-1).message.error, /无损转换/);
+  h.visitLeaves(h.root)[0].widgets.push({ name: 'attempt_only', type: 'button', value: 'new UI action' });
+  const afterRollback = await h.compile('old-set-after-rollback');
+  assert.equal(afterRollback.output[1].inputs.open_picker, 'original API data');
+  assert.equal(Object.hasOwn(afterRollback.output[1].inputs, 'attempt_only'), false);
+  h.emit('importApi', 'new-name-set', { prompt: { 1: { class_type: 'Known', inputs: { text: 'keep text' } } } }); await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  const replaced = await h.compile('after-new-import');
+  assert.deepEqual(replaced.output[1].inputs, { text: 'keep text' });
+});
+
+test('API conversion pins its completed native document across compilation and schema awaits without overwriting another owner', async () => {
+  for (const phase of ['compile', 'schema']) for (const boundary of ['root', 'owner']) {
+    const h = await buttonHarness({ importer: true }), first = { path: 'first' }, second = { path: 'second' };
+    const store = { $id: 'workflow', activeWorkflow: first, getWorkflowByPath: path => path === 'first' ? first : second };
+    h.app.extensionManager = { workflow: store };
+    const original = { 1: { class_type: 'Known', inputs: { text: 'keep text' } } };
+    const output = { 1: { class_type: 'Known', inputs: { text: 'keep text', open_picker: 'UI button value' } } };
+    const root = { serialize: () => h.current(), getNodeById: () => h.node };
+    const change = () => { if (boundary === 'root') h.app.rootGraph = root; else store.activeWorkflow = second; };
+    h.app.graphToPrompt = async () => { if (phase === 'compile') change(); return { workflow: h.current(), output }; };
+    const fetch = h.window.fetch;
+    h.window.fetch = async (...args) => { if (phase === 'schema') change(); return fetch(...args); };
+    const loads = h.calls.filter(call => call === 'load').length;
+    h.emit('importApi', 'conversion-context-change', { prompt: original }); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /工作流或编辑会话已变化/);
+    assert.equal(h.replies.at(-1).message.result, undefined);
+    assert.equal(h.calls.filter(call => call === 'load').length, loads, 'foreign document must not be overwritten by rollback');
+    if (boundary === 'owner') assert.equal(store.activeWorkflow, second); else assert.equal(h.app.rootGraph, root);
+    h.emit('compile', 'invalidated-conversion'); await h.flush();
+    assert.match(h.replies.at(-1).message.error, /重新载入/);
+  }
+});
+
+test('duplicate original names and repeated lifecycle metadata changes consume no additional name budget', async () => {
+  const h = await originalInputMigrationHarness();
+  for (let id = 2; id < 10000; id++) h.node.widgets.push({ name: `original_${id}`, type: 'button', value: 'original' });
+  const second = h.newLeaf(2); second.widgets = copy(h.node.widgets); second.graph = h.root; h.root.nodes.push(second);
+  h.emit('importApi', 'deduplicated-name-budget', { prompt: h.output() }); await h.flush();
+  assert.equal(h.replies.at(-1).message.error, undefined);
+  for (let id = 100; id < 10200; id++) { h.node.id = id; h.node.onAdded(); }
+  h.node.id = 1; h.node.properties.temporary_large_source = '界'.repeat(800000); h.node.onAdded(); delete h.node.properties.temporary_large_source;
+  const fresh = h.newLeaf(3, 'new UI action', true); fresh.graph = h.root; h.root.nodes.push(fresh);
+  const before = h.serialize(), result = await h.compile('bounded-by-names-only');
+  assert.equal(result.output[3].inputs.open_picker, 'new UI action');
+  assert.equal(Object.hasOwn(result.output[3].inputs, 'frontend_upload'), false);
+  assert.equal(h.replies.some(({ message }) => message.result?.code === 'api-input-protection-limit'), false);
+  assert.deepEqual(h.serialize(), before);
 });
 
 test('unavailable malformed rejected and timed-out authoritative schemas retain API data', async () => {
@@ -1152,6 +1765,23 @@ test('declared additions require explicit confirmation and preserve every origin
   assert.deepEqual(accepted.result.output[1], { ...original[1], inputs: { seed: 4, extra: 'auto' } });
   assert.deepEqual(h.expected, original);
   await assert.rejects(h.app.queuePrompt(), /返回棱光/);
+});
+
+test('verified semantic additions remain protected if later schema and widgets present them as UI actions', async () => {
+  const h = await additionHarness(), review = await h.attempt();
+  const accepted = await h.attempt(acceptReview(review.result.review));
+  assert.equal(accepted.error, undefined);
+  const node = h.app.graph._nodes[0];
+  node.widgets = [{ name: 'seed', type: 'number', value: 4 }, { name: 'extra', type: 'button', value: 'auto' },
+    { name: 'frontend_upload', type: 'button', value: 'new UI action' }];
+  h.Registered.nodeData.input = { required: { seed: ['INT'] } };
+  h.window.AbortController = AbortController;
+  h.window.fetch = async () => ({ ok: true, json: async () => ({ Known: { input: copy(h.Registered.nodeData.input) } }) });
+  h.setOutput({ 1: { ...h.output()[1], inputs: { seed: 4, extra: 'auto', frontend_upload: 'new UI action' } } });
+  h.emit('compile', 'accepted-input-not-ui'); await h.flush();
+  const result = h.replies.at(-1).message.result;
+  assert.equal(result.output[1].inputs.extra, 'auto');
+  assert.equal(Object.hasOwn(result.output[1].inputs, 'frontend_upload'), false);
 });
 
 test('API importer mutations cannot rewrite the comparison baseline or quoted original prompt', async () => {
@@ -1895,7 +2525,7 @@ for (const loseOwner of [false, true]) test(`failed API import restores native t
   const original = {path: 'owned'}, imported = {path: 'imported'}, loads = [];
   let registered = original;
   const workflow = {$id: 'workflow', activeWorkflow: original, getWorkflowByPath: path => path === 'owned' ? registered : imported};
-  const h = harness({extensionManager: {workflow}, load: (_document, ...args) => loads.push(args),
+  const h = harness({extensionManager: {workflow}, load: (_document, ...args) => { loads.push(args); if (args[2]) workflow.activeWorkflow = args[2]; },
     loadApiJson: async (_prompt, {set}) => {workflow.activeWorkflow = imported; if (loseOwner) registered = null;
       set({nodes: [{id: 7, type: 'Absent'}], links: []});}}); h.start();
   h.emit('load','owned',{document:document()}); await h.flush();

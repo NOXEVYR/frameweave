@@ -244,7 +244,14 @@ export function createNativeWorkflowEditor(host) {
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', releaseOnLeave);
       for (const item of state.pending.values()) { clearTimeout(item.timeout); item.reject(new Error('编辑器已关闭')); }
-      state.pending.clear(); dialog.close(); dialog.remove();
+      state.pending.clear(); frame.remove();
+      // The outer canvas must not become clickable while this session still
+      // owns its target. Keep a visible closing state until cleanup finishes.
+      dialog.setAttribute('aria-busy', 'true');
+      status.textContent = pendingTitle.textContent = '正在返回，请稍候…';
+      pendingMessage.textContent = '正在结束内部编辑会话，完成后将返回。';
+      stage.setAttribute('data-editor-pending', 'true'); pendingPanel.hidden = false;
+      for (const control of [...buttons.children, ...pendingActions.children]) control.disabled = true;
       let sessionCleanup = 'confirmed';
       try {
         if (leavingPage) { host.releaseSession(session.session_id); sessionCleanup = 'requested'; }
@@ -261,6 +268,7 @@ export function createNativeWorkflowEditor(host) {
         // Keep ownership until old cleanup completes. Otherwise its endSession
         // callback could remove the next session's guard for the same target.
         if (active === state) active = null;
+        dialog.close(); dialog.remove();
       }
     }
     const back = element('button', `← 返回${targetLabel}`); back.className = 'button quiet';

@@ -3,6 +3,8 @@ import { app } from '/scripts/app.js';
 // Kept equal to interface-limits.mjs by the capacity regression tests.
 const MAX_INTERFACE_FIELDS = 4096;
 const MAX_PATCH_BYTES = 2 * 1024 * 1024;
+const MAX_API_SOURCE_NAMES = 10000;
+const MAX_API_SOURCE_NAME_BYTES = 2 * 1024 * 1024;
 
 // Loaded last through ComfyUI's extension list, inside a separate editor origin.
 // The proxy remains the enforcement boundary for execution and backend writes.
@@ -10,6 +12,9 @@ const config = window.__PRISM_EDITOR__;
 const state = { ready: false, loaded: false, claimed: false, source: null, lostOnLoad: [], pending: 0, seen: new Set(), tail: Promise.resolve(), nativeTail: Promise.resolve() };
 const authorizedLoads = new WeakSet();
 let additionReview = null;
+// Original API names veto automatic deletion throughout this document session.
+// They never establish node identity or grant a writable mapping.
+let originalApiSource = null, documentSession = 0;
 const mappingReceipts = new Map(), mappingBindings = new Map(), mappingLifecycles = new WeakMap();
 let mappingSerial = 0;
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -251,11 +256,45 @@ function nativeDocumentOwner() {
       store.getWorkflowByPath(workflow.path) === workflow) return { store, workflow };
   return null;
 }
+function protectedApiSource() {
+  if (!originalApiSource) return null;
+  if (originalApiSource.session !== documentSession || originalApiSource.root !== graph() ||
+      !sameDocumentOwner(originalApiSource.owner, nativeDocumentOwner())) {
+    invalidateDocument(); throw new Error('api-source-context-changed');
+  }
+  return originalApiSource;
+}
+function sameDocumentOwner(left, right) {
+  return left?.store === right?.store && left?.workflow === right?.workflow;
+}
+function invalidateDocument() { state.loaded = false; resetMappings(); }
+function requireLoadedDocument() {
+  if (!state.loaded) throw new Error('not-loaded');
+  return protectedApiSource();
+}
+function captureApiSource(prompt) {
+  const source = { root: graph(), session: documentSession, owner: nativeDocumentOwner(), names: new Set(), saturated: false };
+  let retainedBytes = 0;
+  function retain(name) {
+    if (source.names.has(name)) return true;
+    const bytes = new TextEncoder().encode(name).length;
+    if (source.names.size >= MAX_API_SOURCE_NAMES || bytes > MAX_API_SOURCE_NAME_BYTES - retainedBytes) {
+      source.names.clear(); source.saturated = true; return false;
+    }
+    source.names.add(name); retainedBytes += bytes; return true;
+  }
+  for (const definition of Object.values(prompt)) {
+    for (const name of Object.keys(definition.inputs)) if (!retain(name)) return source;
+  }
+  return source;
+}
 async function restoreDocument(document, owner) {
+  const session = documentSession;
   if (owner && (app.extensionManager?.workflow !== owner.store ||
       owner.store.getWorkflowByPath(owner.workflow.path) !== owner.workflow)) throw new Error('document-owner-changed');
   authorizedLoads.add(document);
   await app.loadGraphData(document, false, false, ...(owner ? [owner.workflow] : []));
+  if (session !== documentSession || !sameDocumentOwner(owner, nativeDocumentOwner())) throw new Error('document-owner-changed');
 }
 
 const blockedDocumentCommands = new Set(['Comfy.NewBlankWorkflow', 'Comfy.OpenWorkflow', 'Comfy.LoadDefaultWorkflow',
@@ -399,7 +438,7 @@ function installDocumentGate() {
     const authorized = document && typeof document === 'object' && authorizedLoads.delete(document);
     const replacesDocument = args[0] !== false;
     const receiver = this;
-    const pending = state.nativeTail.then(() => {
+    const pending = state.nativeTail.then(async () => {
       // GraphCanvas restores its startup document AFTER extension setup. That
       // restore may arrive arbitrarily late, so a timer is not an ownership
       // boundary. Parent loads claim this editor until it closes. Native undo
@@ -408,7 +447,24 @@ function installDocumentGate() {
         documentOwnershipNotice();
         return;
       }
-      return nativeLoad.call(receiver, document, ...args);
+      const source = !replacesDocument && (authorized ? originalApiSource : protectedApiSource());
+      const session = documentSession, owner = nativeDocumentOwner(), claimed = state.claimed;
+      try {
+        const result = await nativeLoad.call(receiver, document, ...args);
+        if (!authorized && claimed && (session !== documentSession || !sameDocumentOwner(owner, nativeDocumentOwner()))) {
+          throw new Error('api-source-context-changed');
+        }
+        if (source) {
+          if (source !== originalApiSource || source.session !== documentSession || !graph() ||
+              !sameDocumentOwner(source.owner, nativeDocumentOwner())) throw new Error('api-source-context-changed');
+          source.root = graph();
+        }
+        return result;
+      } catch (error) {
+        // A loader can replace nodes before rejecting. Keep the name veto, but
+        // require a verified bridge rollback or explicit load before reuse.
+        invalidateDocument(); throw error;
+      }
     });
     // Await an already-running startup restore before applying a parent load.
     // A failed native operation must not poison later loads or undo/redo.
@@ -652,7 +708,10 @@ function mappingLifecycle(node) {
   marker = { epoch: 0 };
   for (const [name, , original] of descriptors) Object.defineProperty(node, name, {
     configurable: true, enumerable: false, writable: true,
-    value: function (...args) { marker.epoch++; return original?.apply(this, args); },
+    value: function (...args) {
+      marker.epoch++;
+      return original?.apply(this, args);
+    },
   });
   mappingLifecycles.set(node, marker);
   return marker;
@@ -678,20 +737,21 @@ function sameMappingProof(before, after) {
   for (const name of ['root', 'node', 'owner', 'widget', 'scope', 'widgetId', 'widgetName', 'widgetType',
     'schemaOwner', 'registered', 'schema', 'schemaInput', 'schemaContent', 'widgetOptions', 'widgetOptionsContent',
     'widgetDisabled', 'widgetReadOnly', 'widgetSerialize', 'widgetPath']) if (before[name] !== after[name]) return false;
-  for (const name of ['nodes', 'slots']) {
-    if (before[name].length !== after[name].length) return false;
-    for (let index = 0; index < before[name].length; index++) {
-      const a = before[name][index], b = after[name][index];
+  for (const name of ['nodes', 'slots', 'uiWidgets']) {
+    const previous = before[name] || [], current = after[name] || [];
+    if (previous.length !== current.length) return false;
+    for (let index = 0; index < previous.length; index++) {
+      const a = previous[index], b = current[index];
       if (Object.keys(a).some(key => a[key] !== b[key])) return false;
     }
   }
   return true;
 }
 
-function findWidget(nodeId, name, lookup = null, inspectUI = false) {
+function resolveWidgetTarget(nodeId, name, lookup = null, inspectUI = false) {
   const resolved = resolveExecutionNode(nodeId, lookup);
   if (resolved.reason) return resolved;
-  const { node, parts, hosts } = resolved, slotsProof = [];
+  const { node, parts, hosts } = resolved, slotsProof = [], uiWidgets = [];
   let owner = node, scope = resolved.scope, widgetName = name, depth = hosts.length;
   const occurrences = depth ? lookup ? (lookup.occurrences ||= instanceOccurrences(graph())) : instanceOccurrences(graph()) : null;
   if (occurrences?.invalid) return { reason: 'instance_traversal_limit' };
@@ -702,6 +762,20 @@ function findWidget(nodeId, name, lookup = null, inspectUI = false) {
     if (slots.length > 1) return { reason: 'ambiguous_input' };
     const slot = slots[0];
     slotsProof.push(mappingSlotProof(scope, owner, slot));
+    if (inspectUI) {
+      // Promotion can remove the leaf button entirely. Prove each actual IO
+      // hop and any remaining UI widget, including a shared definition owner.
+      // A semantic or ambiguous widget on that route is never UI evidence.
+      const matches = lookup ? lookup.widgets(owner).get(widgetName) || [] : (owner.widgets || []).filter(widget => widget.name === widgetName);
+      if (matches.length > 1) return { reason: 'ambiguous_widget' };
+      const item = matches[0];
+      if (item && (!uiWidgetReason(item) || String(item.type).startsWith('converted-widget'))) return { reason: 'semantic_widget_route' };
+      if (!item && slot?.link == null) return { reason: 'widget_not_found' };
+      try { uiWidgets.push({ owner, name: widgetName, widget: item || null, type: item?.type, value: item?.value,
+        valueContent: canonicalJSON(item?.value), options: item?.options,
+        optionsContent: canonicalJSON(item?.options), reason: uiWidgetReason(item) }); }
+      catch { return { reason: 'ui_proof_unavailable' }; }
+    }
     if (slot?.link == null) break;
     const link = scope.getLink?.(slot.link) || scope.links?.get?.(slot.link) || scope.links?.[slot.link];
     if (!depth || !link?.originIsIoNode || !Number.isInteger(link.origin_slot)) return { reason: 'connected_input' };
@@ -713,7 +787,7 @@ function findWidget(nodeId, name, lookup = null, inspectUI = false) {
     scope = depth ? hosts[depth - 1].subgraph : graph();
     widgetName = hostSlot.widget.name;
   }
-  if (hosts.length && occurrences.counts.get(scope) !== 1) return { reason: 'shared_definition_widget' };
+  if (!inspectUI && hosts.length && occurrences.counts.get(scope) !== 1) return { reason: 'shared_definition_widget' };
   const candidates = lookup ? lookup.widgets(owner).get(widgetName) || [] : (owner.widgets || []).filter(widget => widget.name === widgetName);
   if (candidates.length !== 1) return { reason: candidates.length ? 'ambiguous_widget' : 'widget_not_found' };
   const widget = candidates[0];
@@ -731,10 +805,16 @@ function findWidget(nodeId, name, lookup = null, inspectUI = false) {
     schema, schemaInput, schemaContent: lookup ? lookup.schemaContent(schemaInput) : canonicalJSON(schemaInput),
     widgetOptions: widget.options, widgetOptionsContent: lookup ? lookup.optionsContent(widget.options) : canonicalJSON(widget.options),
     widgetDisabled: widget.disabled, widgetReadOnly: widget.options?.read_only, widgetSerialize: widget.options?.serialize,
-    nodes: [...hosts, node].map(mappingNodeProof), slots: slotsProof }; }
+    nodes: [...hosts, node].map(mappingNodeProof), slots: slotsProof, ...(inspectUI ? { uiWidgets } : {}) }; }
   catch { /* Opaque extension metadata must not break ordinary legacy controls. */ }
   return { node, widget, owner, widget_path: widgetPath, mappingProof };
 }
+
+// Writable mappings always retain occurrence/isolation and value restrictions.
+// The UI-only route is consumed solely by execution-copy cleanup, never by
+// captureMappings, patchWidgets, media authorization or control discovery.
+function findWidget(nodeId, name, lookup = null) { return resolveWidgetTarget(nodeId, name, lookup); }
+function findUIWidget(nodeId, name, lookup = null) { return resolveWidgetTarget(nodeId, name, lookup, true); }
 
 const mappingKey = (nodeId, input) => JSON.stringify([String(nodeId), input]);
 function resetMappings() { mappingReceipts.clear(); mappingBindings.clear(); }
@@ -800,8 +880,10 @@ async function stripUndeclaredUIInputs(value, expected = null) {
   // Remove only proven frontend additions, from a copy of the API output.
   // Widget positions, display names and undeclared strings are not evidence.
   const output = clone(value), ignored_ui_inputs = [];
+  const source = expected === null ? requireLoadedDocument() : null;
   const root = graph(), registry = window.LiteGraph?.registered_node_types;
   if (!root || !registry) return { output, ignored_ui_inputs };
+  if (source?.saturated) return { output, ignored_ui_inputs };
   const candidates = [], lookup = widgetLookup();
   for (const [nodeId, definition] of Object.entries(output)) {
     if (!isRecord(definition?.inputs)) continue;
@@ -820,18 +902,19 @@ async function stripUndeclaredUIInputs(value, expected = null) {
       // An original API parameter remains semantic data even if an extension
       // subsequently presents it using a button or removes its schema entry.
       if (isRecord(expected?.[nodeId]?.inputs) && Object.hasOwn(expected[nodeId].inputs, input)) continue;
-      const widgets = (node.widgets || []).filter(widget => widget.name === input);
-      if (widgets.length !== 1) continue;
-      const widget = widgets[0];
-      const reason = uiWidgetReason(widget);
-      if (!reason) continue;
+      // Same-name UI additions also stay: reconstructed identities cannot be
+      // proved from IDs, classes or serialized shapes. This grants no writes.
+      if (source?.names.has(input)) continue;
       const serialized = definition.inputs[input];
       if (Array.isArray(serialized) && serialized.length === 2 &&
           ['string', 'number'].includes(typeof serialized[0]) && Number.isInteger(serialized[1]) && serialized[1] >= 0) continue;
-      const target = findWidget(nodeId, input, lookup, true);
-      if (target.reason || !target.mappingProof || !uiWidgetReason(target.widget)) continue;
-      candidates.push({ nodeId, input, reason, target, widget, widgetValue: widget.value,
-        ownerValue: target.widget.value, classType: definition.class_type });
+      const target = findUIWidget(nodeId, input, lookup);
+      const reason = uiWidgetReason(target.widget);
+      if (target.reason || !target.mappingProof || !reason) continue;
+      // A promoted value must agree with its proven source. A stale compiled
+      // value or a different route remains data for strict backend validation.
+      if (target.owner !== node && !Object.is(serialized, target.widget.value)) continue;
+      candidates.push({ nodeId, input, reason, target, ownerValue: target.widget.value, classType: definition.class_type });
     }
   }
   // Frontend extensions mutate constructor.nodeData (including required upload
@@ -865,6 +948,9 @@ async function stripUndeclaredUIInputs(value, expected = null) {
     })());
   }
   await Promise.all(schemas.values()); // All class probes share a two-second bound.
+  if (expected === null && (requireLoadedDocument() !== source || graph() !== root)) {
+    invalidateDocument(); throw new Error('api-source-context-changed');
+  }
   const currentLookup = widgetLookup();
   for (const candidate of candidates) {
     const groups = await schemas.get(candidate.classType);
@@ -873,13 +959,9 @@ async function stripUndeclaredUIInputs(value, expected = null) {
     // level is not proof that an input is UI-only. Leave those graphs intact.
     if (groups.some(group => group && Object.values(group).some(spec =>
       Array.isArray(spec) && ['COMFY_DYNAMICCOMBO_V3', 'COMFY_AUTOGROW_V3'].includes(spec[0])))) continue;
-    const current = findWidget(candidate.nodeId, candidate.input, currentLookup, true);
-    const leafWidgets = (current.node?.widgets || []).filter(widget => widget.name === candidate.input);
+    const current = findUIWidget(candidate.nodeId, candidate.input, currentLookup);
     if (current.reason || !sameMappingProof(candidate.target.mappingProof, current.mappingProof) ||
-        leafWidgets.length !== 1 || leafWidgets[0] !== candidate.widget ||
-        uiWidgetReason(leafWidgets[0]) !== candidate.reason ||
-        !Object.is(leafWidgets[0].value, candidate.widgetValue) ||
-        !Object.is(current.widget.value, candidate.ownerValue) || !uiWidgetReason(current.widget)) continue;
+        uiWidgetReason(current.widget) !== candidate.reason || !Object.is(current.widget.value, candidate.ownerValue)) continue;
     delete output[candidate.nodeId].inputs[candidate.input];
     ignored_ui_inputs.push({ node_id: candidate.nodeId, input: candidate.input, reason: candidate.reason });
   }
@@ -995,6 +1077,7 @@ async function patchWidgets(patches, requestedMappings) {
   let wrote = false, before = null, documentOwner = null;
   try {
     root.beforeChange?.();
+    requireLoadedDocument();
     verifyRequestedMappings(requestedMappings);
     const beforeWriteLookup = widgetLookup();
     for (const item of prepared) {
@@ -1012,6 +1095,7 @@ async function patchWidgets(patches, requestedMappings) {
     // rollback document only after confirming that current transaction base.
     before = clone(root.serialize());
     documentOwner = nativeDocumentOwner();
+    requireLoadedDocument();
     // Serialization is an extension hook too. If it changed a target, the
     // saved document may predate that edit, even when it now equals the request.
     verifyRequestedMappings(requestedMappings);
@@ -1044,6 +1128,7 @@ async function patchWidgets(patches, requestedMappings) {
         }
         item.mediaTransaction?.complete();
         await callbackResult;
+        requireLoadedDocument();
         const current = findWidget(item.identity.node_id, item.identity.widget_name);
         if (needsProof(item) && (current.reason || !sameMappingProof(item.mappingProof, current.mappingProof))) throw new Error('mapping_changed_during_callback');
       } else item.mediaTransaction?.complete();
@@ -1074,6 +1159,7 @@ async function patchWidgets(patches, requestedMappings) {
       if (current.reason || !sameMappingProof(item.mappingProof, current.mappingProof) || !Object.is(current.widget.value, item.value)) throw new Error('mapping_changed_during_finalization');
     }
     verifyRequestedMappings(requestedMappings);
+    requireLoadedDocument();
     return { result: { applied: prepared.map(({ identity }) => ({ node_id: String(identity.node_id), widget_name: identity.widget_name })), unsupported: [] } };
   } catch (error) {
     if (!wrote) {
@@ -1100,6 +1186,8 @@ async function patchWidgets(patches, requestedMappings) {
       if (graph() !== root) throw new Error('root_changed');
       await restoreDocument(before, documentOwner);
       root.afterChange?.();
+      state.loaded = true;
+      requireLoadedDocument();
       rolledBack = true;
     } catch { state.loaded = false; }
     return { error: rolledBack ? '控件联动失败，已恢复修改前的工作流。' : '控件联动失败且恢复失败，请重新加载工作流。', result: { applied: [], unsupported: prepared.map(({ identity }) => ({ ...identity, reason: 'callback_failed' })), rolled_back: rolledBack } };
@@ -1113,9 +1201,18 @@ async function importApiPrompt(value, acceptance = {}) {
   if (typeof prototypeImporter !== 'function') throw new Error('api-import-unavailable');
   const prompt = validateApiPrompt(value);
   await state.nativeTail;
+  const previousApiSource = requireLoadedDocument(), session = documentSession;
   const before = clone(graph().serialize());
   const documentOwner = nativeDocumentOwner();
+  // Temporary conversion graphs must not inherit the previous document's
+  // context. Publish their name set only after strict semantic verification.
+  state.loaded = false; originalApiSource = null;
   resetMappings(); media.reset(); media.arm();
+  let conversion;
+  const requireConversion = () => {
+    if (session !== documentSession || !conversion || conversion.root !== graph() ||
+        !sameDocumentOwner(conversion.owner, nativeDocumentOwner())) throw new Error('api-source-context-changed');
+  };
   try {
     // Invoke ComfyUI's awaited implementation directly. Some extension
     // instance wrappers call it without returning its Promise.
@@ -1123,16 +1220,22 @@ async function importApiPrompt(value, acceptance = {}) {
     // and any review quote bound to the validated original document.
     await prototypeImporter.call(app, clone(prompt), 'PrismCanvas preset', { deferWarnings: true });
     await state.nativeTail;
+    // The importer may create its own tab. Freeze that completed conversion's
+    // identity before any later asynchronous compilation or schema lookup.
+    conversion = { root: graph(), owner: nativeDocumentOwner() };
+    requireConversion();
     const workflow = clone(graph().serialize());
     const summary = summarize(workflow);
     if (summary.missing.length) throw new Error('missing-node-types');
     // Pass the serialized root graph explicitly. Current ComfyUI frontends may
     // have another active canvas object while the native root graph is loaded.
     const compiled = await app.graphToPrompt(graph());
+    requireConversion();
     if (!compiled?.workflow || !isRecord(compiled.output) || !Object.keys(compiled.output).length) {
       throw new Error('invalid-output');
     }
     const normalized = await stripUndeclaredUIInputs(compiled.output, prompt);
+    requireConversion();
     // Preserve every original API field, including unknown extension data.
     // Only proven frontend-added buttons and titles are nonsemantic additions.
     const comparison = compareApiPrompts(prompt, normalized.output);
@@ -1158,15 +1261,29 @@ async function importApiPrompt(value, acceptance = {}) {
     } else if (acceptance.review_id !== undefined || acceptance.accepted_added_inputs !== undefined) {
       const error = new Error('semantic-mismatch'); error.diagnostics = comparison; throw error;
     }
+    requireConversion();
     state.source = workflow;
+    originalApiSource = captureApiSource(normalized.output);
+    state.loaded = true;
+    if (originalApiSource.saturated) send({ action: 'notice', result: { code: 'api-input-protection-limit',
+      message: '原 API 输入名较多，已停止自动清理 UI 输入；原数据仍保留，应用前需通过后端检查。' } });
     state.lostOnLoad = [];
     return { workflow, ...normalized, ...describeControls(normalized.output), ...summary,
       ...(acceptedAdditions ? { accepted_added_inputs: acceptedAdditions } : {}) };
   } catch (cause) {
+    // Do not restore our old document over a different document that appeared
+    // during a conversion await. A fresh editor session is required instead.
+    if (conversion) {
+      try { requireConversion(); } catch { invalidateDocument(); throw new Error('api-source-context-changed'); }
+    }
     try {
       await restoreDocument(before, documentOwner);
       await state.nativeTail;
       state.source = before;
+      // The verified restore uses this attempt's original owner and document.
+      // Rebind only that session's protected API source to the restored root.
+      if (session !== documentSession) throw new Error('api-source-context-changed');
+      originalApiSource = previousApiSource ? { ...previousApiSource, root: graph() } : null;
       state.lostOnLoad = [];
       state.loaded = true;
     } catch {
@@ -1195,6 +1312,7 @@ async function handle(message) {
       state.lostOnLoad = [];
       const document = clone(message.document);
       if (!document || !Array.isArray(document.nodes)) throw new Error('invalid-document');
+      originalApiSource = null; documentSession++;
       state.claimed = true;
       installNativeDocumentControls();
       if (typeof globalThis.document !== 'undefined') globalThis.document.documentElement?.setAttribute('data-prism-bound-document', '');
@@ -1212,21 +1330,25 @@ async function handle(message) {
       result = { ...summarize(loaded), ...(message.include_workflow === true ? { workflow: loaded } : {}) };
       state.loaded = true;
     } else {
-      if (!state.loaded) throw new Error('not-loaded');
+      requireLoadedDocument();
       await state.nativeTail;
+      requireLoadedDocument();
       if (action === 'fitView') {
         send({ requestId, action, result: fitEditorView() }); return;
       }
       if (action === 'importApi') {
         result = await importApiPrompt(message.prompt, message);
       } else if (action === 'patch') {
-        send({ requestId, action, ...await patchWidgets(message.patches, message.mapping_receipts) });
+        const patched = await patchWidgets(message.patches, message.mapping_receipts);
+        if (!patched.error) requireLoadedDocument();
+        send({ requestId, action, ...patched });
         return;
       } else if (action === 'captureMedia') {
         const beforeLookup = widgetLookup();
         const before = new Map((Array.isArray(message.bindings) ? message.bindings : []).map(item =>
           [mappingKey(item?.node_id, item?.input), findWidget(item?.node_id, item?.input, beforeLookup)]));
         const compiled = await app.graphToPrompt(graph());
+        requireLoadedDocument();
         if (!compiled?.output) throw new Error('invalid-output');
         const afterLookup = widgetLookup();
         for (const item of message.bindings || []) {
@@ -1234,6 +1356,7 @@ async function handle(message) {
           if (!original.reason && (current.reason || !sameMappingProof(original.mappingProof, current.mappingProof))) throw new Error('mapping-receipt-changed');
         }
         await media.prepareCapture?.(message.bindings, compiled.output);
+        requireLoadedDocument();
         result = media.capture(message.bindings, compiled.output);
       } else if (action === 'captureMappings') {
         // Compilation may run async extensions. Bind only the owners that were
@@ -1242,6 +1365,7 @@ async function handle(message) {
         const beforeLookup = widgetLookup();
         const before = message.bindings.map(item => findWidget(item?.node_id, item?.input, beforeLookup));
         const compiled = await app.graphToPrompt(graph());
+        requireLoadedDocument();
         const output = validateApiPrompt(compiled?.output);
         const afterLookup = widgetLookup();
         for (const [index, item] of message.bindings.entries()) {
@@ -1251,6 +1375,7 @@ async function handle(message) {
         result = captureMappings(message.bindings, output);
       }
       verifyRequestedMappings(message.mapping_receipts);
+      requireLoadedDocument();
       const workflow = clone(graph().serialize());
       const summary = summarize(workflow);
       if (action === 'snapshot') result = { workflow, ...summary };
@@ -1267,12 +1392,16 @@ async function handle(message) {
         result = { workflow: compiled.workflow, ...normalized, ...describeControls(normalized.output) };
       } else if (!['importApi', 'captureMedia', 'captureMappings'].includes(action)) throw new Error('invalid-action');
     }
+    if (action !== 'load') requireLoadedDocument();
     verifyRequestedMappings(message.mapping_receipts);
     send({ requestId, action, result });
   } catch (error) {
     // Native errors can include prompts, local paths, or entire node payloads.
     const errors = { captureMappings: '实例控件映射无法核验，未修改工作流；请重新读取当前输入。', captureMedia: '素材控件映射已变化或无法核验，未修改工作流。', load: '工作流加载失败，请检查文件格式与节点扩展。', snapshot: '无法保存编辑快照，请先成功加载工作流。', compile: '原生工作流编译失败，请检查节点与连线后重试。', patch: '参数回写失败，请先成功加载工作流并检查控件。', importApi: error.message === 'api-import-unavailable' ? '当前 ComfyUI 前端不支持 API 工作流导入，未修改原生工作流。' : error.message === 'api-import-rollback-failed' ? '预设转换失败且无法恢复临时图，请关闭此编辑器后重新打开原工作流。' : error.message === 'invalid-api-prompt' ? '预设 API 工作流格式无效，未修改原生工作流。' : 'ComfyUI 前端无法无损转换此预设，已恢复原工作流；预设内容仍保留。' };
-    const message = error.message === 'mapping-receipt-changed' ?
+    const message = error.message === 'api-source-context-changed' ?
+      '原 API 所属工作流或编辑会话已变化，已停止编译和回写；请返回外层重新打开原工作流。' :
+      error.message === 'not-loaded' ? '工作流加载或恢复未完成，已停止编译和回写；请重新载入原工作流。' :
+      error.message === 'mapping-receipt-changed' ?
       '子图实例或控件归属已变化，旧会话不能继续保存或回写；请重新进入工作流核对，原已保存内容仍保留。' :
       action === 'fitView' ? '当前工作流视图尚未就绪，请等待前端加载后重试。' : errors[action] || '不支持的编辑器请求。';
     send({ requestId, action, error: message, ...(action === 'importApi' && error.result ? { result: error.result } : {}) });

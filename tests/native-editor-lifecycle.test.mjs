@@ -70,8 +70,14 @@ test('old server cleanup must complete before reopening the same target', async 
   h.host.api = async (path, payload) => { if (path === '/api/editor-sessions/close') { started.resolve(); await gate.promise; } return api(path, payload); };
   try {
     await h.open(); const closing = button(h, '放弃未保存修改并返回').click(); await started.promise;
+    const dialog = elements(h.body).find(item => item.tagName === 'dialog');
+    assert.equal(dialog.open, true); assert.equal(dialog.attributes['aria-busy'], 'true');
+    assert.equal(elements(dialog).some(item => item.tagName === 'iframe'), false);
+    assert.ok(elements(dialog).some(item => item.textContent === '正在返回，请稍候…'));
+    assert.ok(elements(dialog).filter(item => item.tagName === 'button').every(item => item.disabled));
     assert.equal(h.editor.isOpen(), true); await assert.rejects(h.editor.open(h.node), /先关闭/); assert.equal(outcomes.length, 0);
     gate.resolve(); await closing; assert.equal(h.editor.isOpen(), false); assert.equal(outcomes.length, 1);
+    assert.equal(dialog.open, false); assert.equal(dialog.parentElement, null);
     await h.open(); assert.equal(h.editor.isOpen(), true);
   } finally { gate.resolve(); await h.restore(); }
 });

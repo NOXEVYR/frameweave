@@ -1626,6 +1626,10 @@ class App:
                 for entry_index, entry in enumerate(values):
                     if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
                         continue
+                    # Loaders can echo their input media through history UI channels.
+                    # Only saved outputs and generated temp previews are job results.
+                    if entry.get("type", "output") == "input":
+                        continue
                     filename = entry["filename"]
                     suffix = Path(filename).suffix.lower()
                     if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
@@ -1687,6 +1691,8 @@ class App:
                 # outputs. Merge by stable ownership identity; never erase them.
                 outputs = {output_identity(job_id, value): value for value in self._history_outputs(job_id, owner, item)}
                 for value in job.get("outputs", []):
+                    if value.get("storage_type", "output") == "input":
+                        continue
                     key = output_identity(job_id, value)
                     outputs.setdefault(key, {**value, "output_id": key})
                 job["outputs"] = list(outputs.values())

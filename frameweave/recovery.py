@@ -77,6 +77,10 @@ def job_record(value):
         record = media_record({**output, 'backend': result['backend'], 'storage_type': output.get('storage_type', 'output')})
         if output.get('type') not in ('image', 'video', 'audio'):
             raise ValueError('产物类型无效')
+        # Older clients listed input-loader previews as generated results. Restore
+        # the real outputs without touching input-media registrations or files.
+        if record['storage_type'] == 'input':
+            continue
         outputs.append({**output, **{k: v for k, v in record.items() if k != 'backend'}})
     result['outputs'] = outputs
     if 'cancellation' in result:

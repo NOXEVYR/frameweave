@@ -315,18 +315,30 @@ async function completeInterfaceInputs(info, selection, { path, payload, options
   });
 }
 async function configureNativeInterface(node, compiled = null, session = null, { automatic = false, syncBaseline = [] } = {}) {
-  const context = nativeSessionContexts.get(node); context?.assertCurrent();
-  const guard = captureNativeInterfaceTarget(node);
-  const previousFields = context?.fields || packageCatalog.peek(node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
-  const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
-  const connectionGraph = clone(graph);
-  if (node.data.kind !== 'package') for (const edge of connectionGraph.edges.filter(e => e.target === node.id)) edge.targetField = edgeInputField(graph, edge);
-  const result = await configureWorkflowInterface({ api, toast, chooseEditorInterface,
-    autoEditorInterfaceSelection, resolveEditorConflicts, completeInterfaceInputs }, node.data,
-    { compiled, session, automatic, syncBaseline, previousFields,
-      connections: editorConnectionSummary(connectionGraph, node.id, oldOutputs),
-      assertCurrent: () => assertNativeInterfaceTarget(guard) });
-  return result ? { ...result, _canvas_guard: guard } : null;
+  let persisted = false, delegated = false;
+  try {
+    const context = nativeSessionContexts.get(node); context?.assertCurrent();
+    const guard = captureNativeInterfaceTarget(node);
+    const previousFields = context?.fields || packageCatalog.peek(node.data.package_id)?.fields || (node.data.kind !== 'package' ? generationInputPorts(node,graph).filter(field=>graph.edges.some(edge=>edge.target===node.id&&edgeInputField(graph,edge)===field.id)) : []);
+    const oldOutputs = (node.data.editor_output_fields || []).filter(item => (node.data.editor_outputs || []).includes(item.id));
+    const connectionGraph = clone(graph);
+    if (node.data.kind !== 'package') for (const edge of connectionGraph.edges.filter(e => e.target === node.id)) edge.targetField = edgeInputField(graph, edge);
+    const connections = editorConnectionSummary(connectionGraph, node.id, oldOutputs);
+    delegated = true;
+    const result = await configureWorkflowInterface({ api, toast, chooseEditorInterface,
+      autoEditorInterfaceSelection, resolveEditorConflicts, completeInterfaceInputs }, node.data,
+      { compiled, session, automatic, syncBaseline, previousFields,
+        connections,
+        assertCurrent: () => assertNativeInterfaceTarget(guard) });
+    persisted = result ? true : false;
+    return result ? { ...result, _canvas_guard: guard } : null;
+  } catch (error) {
+    if (!delegated) error.persisted = false;
+    else if (persisted === true) error.persisted = true;
+    else if (![true, false, 'unknown'].includes(error.persisted)) error.persisted = 'unknown';
+    if (error.persisted === true) error.requiresReopen = true;
+    throw error;
+  }
 }
 async function configureNativePanel(node) {
   const existing = nativeSessionContexts.get(node), context = existing || beginNativeEditorContext(node);
@@ -557,7 +569,11 @@ async function api(path, body) {
   const timeout = setTimeout(() => controller.abort(), ['/api/diagnostics', '/api/environment'].includes(path) ? 90000 : 45000);
   try {
     const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-FW-Token': csrf }, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal });
-    const result = await response.json().catch(() => ({ error: `服务返回无效数据 (${response.status})` }));
+    const result = await response.json().catch(() => {
+      const error = `服务返回无效数据 (${response.status})`;
+      if (response.ok) throw new Error(error);
+      return { error };
+    });
     if (!response.ok) {
       const error = new Error(result.error || `请求失败 (${response.status})`);
       error.status = response.status; error.payload = result; throw error;

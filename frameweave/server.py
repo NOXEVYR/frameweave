@@ -77,6 +77,14 @@ class SubmissionUncertain(BackendError):
     """The backend may have accepted the prompt; never repeat automatically."""
 
 
+class EditorPrewriteRejected(Exception):
+    """An editor apply failed before entering any persistence transaction."""
+
+    def __init__(self, error):
+        super().__init__("请求的 JSON 嵌套或数字超出限制" if isinstance(error, (RecursionError, OverflowError)) else str(error))
+        self.status = 502 if isinstance(error, (BackendError, OSError)) else 400
+
+
 def atomic_json(path, value):
     temp = path.with_name(path.name + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -318,28 +326,31 @@ class App:
 
     def apply_editor(self, workflow_id, data, configure=False):
         with self.lock:
-            if configure:
-                if data.get('backend_url') != self.backend.url:
-                    raise ValueError('请切换到该工作流的原推理后端后配置参数')
-                prompt = self._editor_package_prompt(data)
-            else:
-                session = self.editor_sessions.get(data.get('session_id'))
-                if not session or session['workflow_id'] != workflow_id:
-                    raise ValueError('编辑会话已失效，请重新进入工作流')
-                if session['backend'] != self.backend.url:
-                    raise ValueError('编辑期间推理后端已变化，请重新进入工作流')
-                prompt = data.get('prompt')
-            current = self.editor_workflows.get(workflow_id)
-            if data.get('base_revision', current['revision']) != current['revision']:
-                raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
-            if not configure:
-                # Reject malformed editor state before creating a reusable package.
-                validate_editor_document(data.get('document'))
-            result = self.apply_interface(prompt, data, current['name'], persist=False)
-            if result.get('requires_resolution'):
-                return result
-            compiled_prompt = result.pop('_compiled_prompt')
-            package_document = result.pop('_package_document')
+            try:
+                if configure:
+                    if data.get('backend_url') != self.backend.url:
+                        raise ValueError('请切换到该工作流的原推理后端后配置参数')
+                    prompt = self._editor_package_prompt(data)
+                else:
+                    session = self.editor_sessions.get(data.get('session_id'))
+                    if not session or session['workflow_id'] != workflow_id:
+                        raise ValueError('编辑会话已失效，请重新进入工作流')
+                    if session['backend'] != self.backend.url:
+                        raise ValueError('编辑期间推理后端已变化，请重新进入工作流')
+                    prompt = data.get('prompt')
+                current = self.editor_workflows.get(workflow_id)
+                if data.get('base_revision', current['revision']) != current['revision']:
+                    raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
+                if not configure:
+                    # Reject malformed editor state before creating a reusable package.
+                    validate_editor_document(data.get('document'))
+                result = self.apply_interface(prompt, data, current['name'], persist=False)
+                if result.get('requires_resolution'):
+                    return {**result, 'persisted': False, 'persistence_stage': 'prewrite'}
+                compiled_prompt = result.pop('_compiled_prompt')
+                package_document = result.pop('_package_document')
+            except (ValueError, KeyError, TypeError, RecursionError, OverflowError, BackendError, OSError) as exc:
+                raise EditorPrewriteRejected(exc) from exc
             # Sources join the same metadata rollback as editor revisions. No
             # provenance is inferred from names or an uncommitted revision file.
             with self.packages.lock, self.editor_workflows.lock:
@@ -2284,6 +2295,9 @@ def make_server(app, port=0):
                     self.respond({"error": "接口不存在"}, 404)
                     return
                 self.respond(result)
+            except EditorPrewriteRejected as exc:
+                self.respond({"error": str(exc), "persisted": False,
+                              "persistence_stage": "prewrite"}, exc.status)
             except SubmissionRejected as exc:
                 self.respond({"error": str(exc), "submission_state": "rejected"}, 400)
             except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:

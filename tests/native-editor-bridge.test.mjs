@@ -79,6 +79,15 @@ test('does not signal ready until the native canvas and its DOM element have mou
   assert.equal(h.replies[0].message.action, 'ready');
 });
 
+test('requested load snapshot contains the frontend-normalized graph without rewriting the input', async () => {
+  const h = harness({ load: value => { value.nodes[0].widgets_values.seed = 9; } }); h.start();
+  const input = document(); h.emit('load', 'load-report', { document: input, include_workflow: true });
+  await h.flush(); const result = h.replies.at(-1).message.result;
+  assert.equal(result.workflow.nodes[0].widgets_values.seed, 9); assert.equal(input.nodes[0].widgets_values.seed, 8);
+  assert.deepEqual(h.calls, ['load']); assert.deepEqual(result.missing, []);
+  h.current().nodes[0].widgets_values.seed = 10; assert.equal(result.workflow.nodes[0].widgets_values.seed, 9);
+});
+
 test('does not signal ready until ComfyUI publishes the mounted app and graph', () => {
   const h = harness({ windowAppReadyAfter: 5 });
   h.start();

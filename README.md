@@ -12,7 +12,8 @@
 | --- | --- | --- |
 | Windows 稳定成品 0.11.1 | 已公开，自动更新通道仍指向此版 | [下载便携包](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.1-Windows-x64.zip) |
 | 0.11.4 源码预览 | 已公开；新增素材拖放、命名端口、预设内部编辑和实时预览 | [下载源码](https://raw.githubusercontent.com/NOXEVYR/frameweave/main/releases/PrismCanvas-v0.11.4-source.zip) |
-| Windows 0.11.5 Phase8L 候选 | 保护内部工作流文档、草稿和预览；H3 新增参数确认后显示完整节点，稳定更新源未提升 | [候选下载与验证](https://github.com/NOXEVYR/frameweave/blob/codex/phase7w-unified-workflows/releases/PrismCanvas-0.11.5-Phase8L.md) |
+| Windows 0.11.5 Phase8M 候选 | 内部连线检查、明确应用拒绝后可同窗口修复；H3 参数复核后显示完整节点，稳定更新源未提升 | [候选下载与验证](https://github.com/NOXEVYR/frameweave/blob/codex/phase7w-unified-workflows/releases/PrismCanvas-0.11.5-Phase8M.md) |
+| 历史 Phase8L 候选 | 保护内部工作流文档、草稿和预览 | [Phase8L](releases/PrismCanvas-0.11.5-Phase8L.md) |
 | 历史 Phase8K 候选 | 临时视频预览身份修复及196节点图三媒体完整编辑往返验证 | [Phase8K](releases/PrismCanvas-0.11.5-Phase8K.md) |
 | 历史 Phase8J 候选 | 编译失败说明、统一媒体输入及已验证 VHS 预览适配 | [Phase8J](releases/PrismCanvas-0.11.5-Phase8J.md) |
 | 历史 Phase8F 候选 | 预设空图提示、文档归属和缩放动画保存修复及原验证记录保留 | [Phase8F](releases/PrismCanvas-0.11.5-Phase8F.md) |

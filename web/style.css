@@ -2408,13 +2408,20 @@ kbd {
 }
 .native-workflow-dialog { width: calc(100vw - 24px); max-width: none; height: calc(100dvh - 24px); max-height: none; padding: 0; overflow: hidden; border: 1px solid #becce2; border-radius: 14px; }
 .native-workflow-dialog[open] { display: flex; flex-direction: column; }
-.native-workflow-dialog > header { flex: 0 0 auto; padding: 14px 20px 10px; background: #fff; border-bottom: 1px solid #d6dfec; position: relative; }
+.native-workflow-dialog > header { flex: 0 0 auto; max-height: 46%; overflow: auto; padding: 14px 20px 10px; background: #fff; border-bottom: 1px solid #d6dfec; position: relative; }
 .native-workflow-dialog > header strong { display: block; font-size: 18px; color: #20324e; margin-bottom: 10px; }
 .native-workflow-dialog > header p { font-size: 14px; line-height: 1.5; margin: 8px 0 0; max-height: 80px; overflow: auto; overflow-wrap: anywhere; }
 .native-editor-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.native-workflow-dialog > header > .native-editor-actions { position: sticky; top: -14px; z-index: 2; background: #fff; padding: 6px 0; }
 .native-editor-note { flex: 0 0 auto; padding: 8px 20px; background: #eef2ff; color: #344563; font-size: 13px; }
 .native-editor-sources { margin-top: 8px; color: #344563; font-size: 13px; line-height: 1.6; }
 .native-editor-sources summary { cursor: pointer; color: #405e9c; }
+.native-editor-link-diagnostics { margin-top: 8px; font-size: 13px; line-height: 1.6; color: #344563; }
+.native-editor-link-diagnostics summary { cursor: pointer; color: #405e9c; overflow-wrap: anywhere; }
+.native-editor-link-content { max-height: 22vh; overflow: auto; overscroll-behavior: contain; padding: 8px 12px; margin-top: 6px; border: 1px solid #d4ddf0; border-radius: 8px; background: #f6f8ff; }
+.native-editor-link-content p { margin: 4px 0 8px; }
+.native-editor-link-content strong { font-size: 13px; margin-bottom: 0; }
+.native-editor-link-content ul { padding-left: 20px; overflow-wrap: anywhere; }
 .native-editor-sources ul { max-height: 18vh; overflow: auto; margin: 6px 0; padding-left: 22px; overflow-wrap: anywhere; }
 .native-workflow-dialog iframe { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #202127; }
 .native-editor-stage { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }

@@ -1209,7 +1209,7 @@ async function handle(message) {
       // placeholder that survived loading can later be replaced or deleted by
       // the user, and must then stop appearing in the current missing list.
       state.lostOnLoad = lostDuringLoad(state.source, loaded);
-      result = summarize(loaded);
+      result = { ...summarize(loaded), ...(message.include_workflow === true ? { workflow: loaded } : {}) };
       state.loaded = true;
     } else {
       if (!state.loaded) throw new Error('not-loaded');

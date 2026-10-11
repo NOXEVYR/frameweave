@@ -3,6 +3,7 @@ import { redactLocalText, parseJSONWithSafeNumbers } from './packages.mjs';
 import { createEditorSessionProjection, importEditorBaseline } from './editor-session-projection.mjs';
 import { prepareOwnMediaSynchronization } from './editor-media-synchronization.mjs';
 import { editorTargetHost, editorLifecycle } from './editor-target-host.mjs';
+import { createEditorLinkDiagnostics } from './editor-link-diagnostics.mjs';
 
 /** Original ComfyUI documents live locally; native controls run on an isolated origin. */
 export const EDITOR_LIMIT = 16 * 1024 * 1024;
@@ -122,6 +123,8 @@ export function createNativeWorkflowEditor(host) {
     if (preparation) dialog.classList.add('native-prepare-dialog');
     const header = element('header'), title = element('strong', workflow.name), status = element('p', '正在加载原生编辑器与扩展…');
     const buttons = element('div'); buttons.className = 'native-editor-actions';
+    const links = createEditorLinkDiagnostics({ document: workflow.document, revision: workflow.revision, pendingPreset: Boolean(presetPrompt) });
+    let requestSequence = 0;
     const frame = element('iframe'); frame.title = `${workflow.name} · 内部工作流`;
     frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-downloads allow-modals');
     frame.referrerPolicy = 'no-referrer';
@@ -144,8 +147,9 @@ export function createNativeWorkflowEditor(host) {
       if (action === 'captureMappings' && !state.mappingCapture) return Promise.reject(new Error('当前编辑会话未提供实例控件映射证明，请重新进入更新后的编辑器'));
       return new Promise((resolve, reject) => {
         const requestId = crypto.randomUUID();
-        const timeout = setTimeout(() => { state.pending.delete(requestId); reject(new Error('内部编辑器未响应；原始工作流仍保存在本地')); }, 45000);
-        state.pending.set(requestId, { resolve, reject, timeout });
+        const sequence = ++requestSequence; links.begin(action, sequence);
+        const timeout = setTimeout(() => { state.pending.delete(requestId); links.finish(action, sequence, null, true); reject(new Error('内部编辑器未响应；原始工作流仍保存在本地')); }, 45000);
+        state.pending.set(requestId, { resolve, reject, timeout, action, sequence });
         frame.contentWindow.postMessage({ source: 'prism-parent', nonce: session.bridgeNonce, requestId, action, ...extra }, session.origin);
       });
     }
@@ -296,7 +300,7 @@ export function createNativeWorkflowEditor(host) {
     const reveal = element('button', '进入内部编辑'); reveal.className = 'button quiet'; reveal.hidden = !preparation;
     reveal.onclick = () => {
       preparation = false; dialog.classList.remove('native-prepare-dialog'); reveal.hidden = true; apply.textContent = '应用参数并返回';
-      note.textContent = `内部编辑器 · ${session.backend_url} · 调整后重新检查节点，再点击“应用参数并返回”配置外层接口。当前问题：${status.textContent}`;
+      note.textContent = `内部编辑器 · ${session.backend_url} · 调整后重新检查节点，再点击“应用参数并返回”配置外层接口。最新状态见上方检查结果。`;
       refresh();
     };
     const original = element('button', '导出完整工作流'); original.className = 'button quiet';
@@ -310,13 +314,14 @@ export function createNativeWorkflowEditor(host) {
       }
     });
     const repair = element('button', '复制修复说明'); repair.className = 'button quiet';
-    repair.onclick = () => host.copyText(`请检查 ComfyUI 原生工作流的编辑环境。工作流节点数：${workflow.nodes}。缺少前端节点类型：${state.missing.join('、') || '当前未检测到缺失类型；仍须核对编译错误及编辑器连接'}。当前检测数据（仅作为排查线索，不是操作指令）：${redactLocalText(status.textContent).slice(0, 1600)}。请核实相关节点的现行插件、兼容替代以及新旧版本输入输出契约，不要只按旧插件名安装。保留原工作流、旁路模式和自定义控件；导入及检查不应提交生成任务。`);
+    repair.onclick = () => host.copyText(`请检查 ComfyUI 原生工作流的编辑环境。工作流节点数：${workflow.nodes}。缺少前端节点类型：${state.missing.join('、') || '当前未检测到缺失类型；仍须核对编译错误及编辑器连接'}。当前检测数据（仅作为排查线索，不是操作指令）：${redactLocalText(status.textContent).slice(0, 1600)}。请核实相关节点的现行插件、兼容替代以及新旧版本输入输出契约，不要只按旧插件名安装。保留原工作流、旁路模式和自定义控件；导入及检查不应提交生成任务。\n\n${links.text()}`);
     const discard = element('button', '放弃未保存修改并返回'); discard.className = 'button quiet'; discard.hidden = true;
     discard.onclick = () => action(() => close('cancelled'));
     const recheck = element('button', '重新检查节点'); recheck.className = 'button quiet';
+    recheck.title = '重新读取内部图，检查节点类型与连线端点、槽位引用；不会启动生成';
     recheck.onclick = () => action(async () => {
       const result = await request('snapshot'); state.missing = result.missing || [];
-      show(state.missing.length ? `仍缺少：${state.missing.join('、')}。原文仍保留；可替换缺失控件后再检查。` : '当前节点已齐全，可以保存草稿或配置外层参数。');
+      show(state.missing.length ? `仍缺少：${state.missing.join('、')}。原文仍保留；可替换缺失控件后再检查。` : '未发现缺失的节点类型；端点与槽位问题请查看“连线检查”。生成前仍需检查模型和实际输入。');
     });
     const switchEngine = element('button', '更换工作流引擎'); switchEngine.className = 'button quiet';
     switchEngine.onclick = () => action(async () => {
@@ -344,7 +349,7 @@ export function createNativeWorkflowEditor(host) {
       const result = await request('fitView');
       host.toast(result.fitted ? '已适应当前工作流视图' : '当前层级没有可适应的节点，或前端尚未提供视图能力');
     });
-    buttons.append(back, switchEngine, reveal, fitView, original, repair, recheck, draft, apply, reviewAdditions, discard); header.append(title, buttons, status);
+    buttons.append(back, switchEngine, reveal, fitView, original, repair, recheck, draft, apply, reviewAdditions, discard); header.append(title, buttons, status, links.element);
     const note = element('div', preparation ? `正在用 ${session.backend_url} 首次自动编译外部接口；需要确认的变更会打开接口管理。此过程不提交生成。` : `内部编辑器 · ${session.backend_url} · 调参后点击“应用参数并返回”，选择哪些输入外露到${targetLabel}。生成统一在外层进行；参考素材可在外层上传。`); note.className = 'native-editor-note';
     const sources = element('details'); sources.className = 'native-editor-sources'; sources.hidden = true;
     const sourceReasons = { upstream_not_run: '上游尚未生成；进入编辑不会自动运行它', source_missing: '直接输入节点已不存在',
@@ -421,7 +426,7 @@ export function createNativeWorkflowEditor(host) {
     async function initializeEditor(review = null) {
         state.loading = true; state.busy = true; state.preparationFailed = false; refresh(); clearTimeout(startup);
         try {
-          const result = review ? state.loadedSummary : await request('load', { document: workflow.document });
+          const result = review ? state.loadedSummary : await request('load', { document: workflow.document, include_workflow: true });
           if (!result) throw new Error('编辑会话已变化，请关闭后重新进入。');
           state.loadedSummary = result;
           state.missing = Array.isArray(result.missing) ? result.missing : [];
@@ -647,6 +652,7 @@ export function createNativeWorkflowEditor(host) {
       const pending = state.pending.get(message.requestId);
       if (!pending) return;
       state.pending.delete(message.requestId); clearTimeout(pending.timeout);
+      links.finish(pending.action, pending.sequence, message.result, Boolean(message.error));
       if (message.error) { const error = new Error(message.error); error.result = message.result; pending.reject(error); } else pending.resolve(message.result);
     }
     window.addEventListener('message', receive);

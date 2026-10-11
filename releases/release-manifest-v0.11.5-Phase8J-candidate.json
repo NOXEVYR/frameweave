@@ -1,0 +1,60 @@
+{
+  "application": "PrismCanvas",
+  "version": "0.11.5",
+  "candidate": "Phase8J",
+  "stable_release": false,
+  "source_archive_sha256": "5b715b0012712a4db3f969b2d048d035ce54a6e5758f221d59e0b431bb4c7d5b",
+  "exe_sha256": "a4f73414fef4698f2c16369a3821762f3e6e2ad02daf67d33eb8bbeb43566307",
+  "packages": [
+    {
+      "filename": "PrismCanvas-Phase8J-Source.zip",
+      "bytes": 1661093,
+      "sha256": "5b715b0012712a4db3f969b2d048d035ce54a6e5758f221d59e0b431bb4c7d5b"
+    },
+    {
+      "filename": "PrismCanvas-0.11.5-Phase8J-Windows-x64-candidate.zip",
+      "bytes": 11171965,
+      "sha256": "b4e970129272ee585fa23b1f718ffdc142acd80671e9473dcbd9b5ea7c5e2369"
+    }
+  ],
+  "validation": {
+    "node_pass": 1696,
+    "node_skipped": 0,
+    "installed_plugin_function_test_included": true,
+    "python_proxy_pass": 22,
+    "python_full_rerun": false,
+    "source_browser_checks": 18,
+    "actual_exe_browser_checks": 18,
+    "independent_media_slots": [
+      "image",
+      "video",
+      "audio"
+    ],
+    "media_decode_verified": true,
+    "reload_retained_media": true,
+    "actual_exe_web_hashes": 74,
+    "exe_start_exit_checks": 2,
+    "javascript_errors": 0,
+    "generation_attempts": 0,
+    "runtime_files": 119,
+    "source_files": 354,
+    "new_gpu_generation": 0,
+    "human_audio_acceptance": false,
+    "full_original_large_workflow_generation_verified": false,
+    "all_plugin_versions_supported": false
+  },
+  "local_install_verified": true,
+  "old_version_preserved": true,
+  "stable_update_feed_changed": false,
+  "contains_model_weights": false,
+  "contains_comfyui_plugins": false,
+  "contains_tts_dependencies": false,
+  "contains_user_data": false,
+  "archive_manifests_are_packaging_checkpoints": true,
+  "postseal_documentation_paths": [
+    "README.md",
+    "docs/DEVELOPMENT_LOG.md",
+    "docs/VALIDATION.md",
+    "docs/UNIFIED_OPTIMIZATION.md"
+  ]
+}

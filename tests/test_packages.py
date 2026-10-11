@@ -223,14 +223,16 @@ class PackageTests(unittest.TestCase):
                 "LoadVideo": {"input": {"required": {"file": ["COMBO", {"video_upload": True}]}}},
             }, "image")
 
-    def test_video_field_cannot_bind_to_unrelated_node_or_unexposed_loader(self):
-        with self.assertRaisesRegex(ValueError, "只能绑定"):
-            normalize_document({
-                "name": "bad", "description": "",
-                "prompt": {"1": {"class_type": "Text", "inputs": {"text": "x"}}},
-                "fields": [{"id": "video", "node_id": "1", "input": "text", "type": "video",
-                            "label": "video", "default": ""}],
-            })
+    def test_video_field_transport_is_validated_live_and_legacy_loaders_stay_exposed(self):
+        package = normalize_document({
+            "name": "bad", "description": "",
+            "prompt": {"1": {"class_type": "Text", "inputs": {"text": "x"}}},
+            "fields": [{"id": "video", "node_id": "1", "input": "text", "type": "video",
+                        "label": "video", "default": ""}],
+        })
+        with self.assertRaisesRegex(ValueError, "兼容媒体上传节点"):
+            validate_package_media_field(package, "video", {
+                "Text": {"input": {"required": {"text": ["STRING"]}}}}, "video")
         for node_type, field_name in (("LoadVideo", "file"), ("VHS_LoadVideo", "video")):
             with self.subTest(node_type=node_type), self.assertRaisesRegex(ValueError, "必须开放视频上传"):
                 normalize_document({

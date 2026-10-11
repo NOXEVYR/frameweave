@@ -1,11 +1,18 @@
+import { MAX_INTERFACE_FIELDS } from './interface-limits.mjs';
 /** Pure graph operations shared by the canvas and dependency-free tests. */
 import { packageValues, parseJSONWithSafeNumbers } from './packages.mjs';
+import { cachedPackageField } from './canvas-port-layout.mjs';
+import { normalizeHiddenUpdates } from './editor-hidden-updates.mjs';
+import { normalizeTextCompositions, composeTextInput, textCompositionOwn, textSourceOccurrence, textContributionIdentity } from './text-input-composition.mjs';
 export const SCHEMA = 'frameweave.canvas.v1';
+export const COMPOSED_SCHEMA = 'frameweave.canvas.v2';
 export const NODE_TYPES = ['prompt', 'reference', 'generation', 'result'];
 export const KINDS = ['h3_t2v', 'h3_i2v', 'h3_ref', 'sdxl', 'sdxl_i2i', 'krea', 'qwen21_t2i', 'qwen21_edit', 'api', 'package'];
 const copy = value => JSON.parse(JSON.stringify(value));
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const FIELD_TYPES = ['text', 'integer', 'number', 'boolean', 'select', 'image', 'audio', 'video'];
+const MEDIA_TYPES = ['image', 'video', 'audio'];
+const mediaLabel = type => ({ image: '图片', video: '视频', audio: '音频' })[type] || '媒体';
 const RESERVED_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 const fieldId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value) && !RESERVED_FIELDS.has(value);
 
@@ -31,31 +38,37 @@ function localBackendIdentity(value, label = '媒体来源引擎') {
 }
 
 function packageMediaOwners(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 64) throw new Error('工作流包媒体来源记录无效');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > MAX_INTERFACE_FIELDS) throw new Error('工作流包媒体来源记录无效');
   const owners = {};
   for (const [id, owner] of Object.entries(value)) {
     if (!fieldId(id) || !owner || typeof owner !== 'object' || Array.isArray(owner)
         || typeof owner.name !== 'string' || !owner.name) throw new Error('工作流包媒体来源字段无效');
     owners[id] = { name: uploadedMediaName(owner.name, '工作流包媒体'), backend: localBackendIdentity(owner.backend, '工作流包媒体来源引擎') };
+    if (owner.preview_url !== undefined) {
+      if (typeof owner.preview_url !== 'string' || !/^\/api\/media\/[a-f0-9]{32}$/.test(owner.preview_url)) throw new Error('工作流包媒体预览必须是已登记的本机媒体地址');
+      owners[id].preview_url = owner.preview_url;
+    }
   }
   return owners;
 }
 
 /** Cached public ports only. The actual package is refreshed and validated before running. */
 function packageFields(value) {
-  if (!Array.isArray(value) || value.length > 64) throw new Error('工作流包最多开放 64 个输入参数');
+  if (!Array.isArray(value) || value.length > MAX_INTERFACE_FIELDS) throw new Error(`工作流包最多开放 ${MAX_INTERFACE_FIELDS} 个输入参数`);
   const seen = new Set();
   return value.map(field => {
     if (!field || typeof field !== 'object' || Array.isArray(field) || !fieldId(field.id) || seen.has(field.id)) throw new Error('工作流包参数 ID 无效或重复');
     if (typeof field.label !== 'string' || !field.label.trim() || field.label.length > 120) throw new Error('工作流包参数名称必须是 1–120 字符的文本');
     if (!FIELD_TYPES.includes(field.type)) throw new Error('工作流包不支持此参数类型');
     seen.add(field.id);
-    return { id: field.id, label: field.label, type: field.type };
+    if (field.presentation !== undefined && !['port', 'control'].includes(field.presentation)) throw new Error('接口展示方式无效');
+    for (const key of ['role', 'group']) if (field[key] !== undefined && (typeof field[key] !== 'string' || field[key].length > 120)) throw new Error('接口分类无效');
+    return cachedPackageField(field);
   });
 }
 
 function normalizedInputLabels(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 256) throw new Error('生成输入端口名称无效');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > MAX_INTERFACE_FIELDS) throw new Error('生成输入端口名称无效');
   const labels = {};
   for (const [id, label] of Object.entries(value)) {
     if (!fieldId(id) || typeof label !== 'string' || !label.trim() || label.length > 80) throw new Error('生成输入端口名称无效');
@@ -71,7 +84,7 @@ export function generationInputPorts(node) {
   if (!node || node.type !== 'generation') return [];
   const labels = node.data?.inputLabels || {};
   if (node.data?.kind === 'package') {
-    try { return packageFields(node.data.packageFields || []).map(field => makePort(field.id, field.label, field.type, labels)); }
+    try { return packageFields(node.data.packageFields || []).map(field => ({ ...field, label: labels[field.id] || field.label })); }
     catch { return []; }
   }
   const kind = node.data?.kind;
@@ -90,18 +103,27 @@ export function generationInputPorts(node) {
   return inputs;
 }
 
-function sourceOutputType(source, edge, expected = 'image', graph) {
+export function sourceOutputType(source, edge, expected = 'image', graph) {
   if (!['generation', 'result'].includes(source?.type)) return null;
-  const outputs = source.data?.outputs;
+  let outputs = source.data?.outputs;
   const index = edge?.outputIndex || 0;
   if (source.type === 'result' && graph) {
     const owner = graph.nodes.find(node => node.type === 'generation' && graph.edges.some(link => link.source === node.id && link.target === source.id));
-    if (owner) return sourceOutputType(owner, edge, expected);
+    if (owner) {
+      // A historical file cannot reintroduce an output removed from the current
+      // workflow contract. Unknown-but-still-present sinks can use file evidence.
+      if (edge?.sourceOutput && Array.isArray(owner.data.editor_outputs) && !owner.data.editor_outputs.includes(edge.sourceOutput)) return null;
+      if (Array.isArray(outputs) && Array.isArray(owner.data.editor_outputs)) outputs = outputs.filter(item => owner.data.editor_outputs.includes(item.node_id));
+      const declared = sourceOutputType(owner, edge, expected);
+      if (declared) return declared;
+    }
   }
   if(source.type==='generation') {
+    if (edge?.sourceOutput && Array.isArray(source.data.editor_outputs) && !source.data.editor_outputs.includes(edge.sourceOutput)) return null;
+    if (Array.isArray(outputs) && Array.isArray(source.data.editor_outputs)) outputs = outputs.filter(item => source.data.editor_outputs.includes(item.node_id));
     if(source.data.kind?.startsWith('h3_')) return 'video';
     if(['sdxl','sdxl_i2i','krea','qwen21_t2i','qwen21_edit'].includes(source.data.kind)) return 'image';
-    const definitions=(source.data.editor_output_fields||[]).filter(field=>!edge?.sourceOutput||field.id===edge.sourceOutput);
+    const definitions=(source.data.editor_output_fields||[]).filter(field=>(!Array.isArray(source.data.editor_outputs) || source.data.editor_outputs.includes(field.id)) && (!edge?.sourceOutput||field.id===edge.sourceOutput));
     if(definitions.some(field=>field.mediaType===expected))return expected;
     const types=[...new Set(definitions.map(field=>field.mediaType).filter(type=>['image','video','audio'].includes(type)))];
     if(types.length===1)return types[0];
@@ -109,7 +131,8 @@ function sourceOutputType(source, edge, expected = 'image', graph) {
   if (Array.isArray(outputs) && outputs.length) {
     const matching = outputs.filter(item => item.type === expected && (!edge?.sourceOutput || item.node_id === edge.sourceOutput));
     if (matching[index]) return expected;
-    return outputs[0].type;
+    const types = [...new Set(outputs.filter(item => !edge?.sourceOutput || item.node_id === edge.sourceOutput).map(item => item.type).filter(type => MEDIA_TYPES.includes(type)))];
+    return types.length === 1 ? types[0] : null;
   }
   return null;
 }
@@ -146,12 +169,13 @@ export function edgeInputField(graph, edge) {
 function edgeOptions(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('连接参数必须为对象');
   const result = {};
+  if (Object.hasOwn(options, 'sourceOccurrence')) result.sourceOccurrence = textSourceOccurrence(options);
   if (Object.hasOwn(options, 'targetField')) {
     if (!fieldId(options.targetField)) throw new Error('连接的目标参数 ID 无效');
     result.targetField = options.targetField;
   }
   if (Object.hasOwn(options, 'sourceField')) {
-    if (!['text', 'negative', 'image', 'video'].includes(options.sourceField)) throw new Error('连接的来源字段无效');
+    if (!['text', 'negative', ...MEDIA_TYPES].includes(options.sourceField)) throw new Error('连接的来源字段无效');
     result.sourceField = options.sourceField;
   }
   if (Object.hasOwn(options, 'outputIndex')) {
@@ -212,37 +236,72 @@ export function createNode(type, x, y, overrides = {}) {
 }
 
 export function canConnect(graph, source, target, options = {}) {
+  const validation = validateConnection(graph, source, target, options);
+  if (!validation.ok) return validation;
+  // A default drag must not create another contribution after occurrence zero
+  // was disconnected. Import/execution validate exact stored identities instead.
+  const to = graph.nodes.find(node => node.id === target), from = graph.nodes.find(node => node.id === source);
+  if (from.type === 'prompt' && to.type === 'generation' && to.data.kind === 'package'
+    && textSourceOccurrence(options) === 0 && normalizeTextCompositions(to.data.packageTextCompositions, to.data.packageFields)[options.targetField]
+    && graph.edges.some(edge => edge.target === target && edge.targetField === options.targetField && edge.source === source
+      && (edge.sourceField || 'text') === (options.sourceField || 'text'))) {
+    return { ok: false, reason: '相同文本来源已连接，不能重复拼接' };
+  }
+  return validation;
+}
+
+// Importing a legacy edge preserves its meaning; it does not prove its media type.
+function validateConnection(graph, source, target, options = {}, resolvedType = null, allowUnknown = false) {
   if (source === target) return { ok: false, reason: '节点不能连接自身' };
   const from = graph.nodes.find(node => node.id === source);
   const to = graph.nodes.find(node => node.id === target);
   if (!from || !to) return { ok: false, reason: '连接节点不存在' };
   let binding;
   try { binding = edgeOptions(options); } catch (error) { return { ok: false, reason: error.message }; }
-  if (binding.sourceField && !(from.type === 'prompt' ? ['text', 'negative'] : ['reference', 'generation', 'result'].includes(from.type) ? ['image', 'video'] : []).includes(binding.sourceField)) return { ok: false, reason: '来源节点与连接字段类型不匹配' };
+  if (binding.sourceField && !(from.type === 'prompt' ? ['text', 'negative'] : ['reference', 'generation', 'result'].includes(from.type) ? MEDIA_TYPES : []).includes(binding.sourceField)) return { ok: false, reason: '来源节点与连接字段类型不匹配' };
   if (binding.outputIndex && !['generation', 'result'].includes(from.type)) return { ok: false, reason: '只有生成或结果节点可选择输出图片序号' };
   const packaged = to.type === 'generation' && to.data.kind === 'package';
   const input = binding.targetField ? generationInputPorts(to).find(item => item.id === binding.targetField) : null;
   if (binding.targetField && !input) return { ok: false, reason: packaged ? '工作流包目标参数不存在，请刷新工作流包定义' : '生成节点目标输入端口不存在' };
+  if (Object.hasOwn(binding, 'sourceOccurrence')) {
+    try { textContributionIdentity({ source, ...binding }, { sourceType: from.type, fieldType: input?.type,
+      composition: packaged && normalizeTextCompositions(to.data.packageTextCompositions, to.data.packageFields)[input?.id] }); }
+    catch (error) { return { ok: false, reason: error.message }; }
+  }
   if (to.type === 'generation') {
     if (!packaged && !['prompt', 'reference', 'generation', 'result'].includes(from.type)) return { ok: false, reason: '生成节点只接收提示词、参考素材或上游生成结果' };
     if (packaged && !binding.targetField) return { ok: false, reason: '请选择工作流包的目标输入参数；未连接字段仍可通过表单填写' };
-    const knownOutputType = sourceOutputType(from, options, input?.type || binding.sourceField || 'image', graph);
-    const sourceType = from.type === 'prompt' ? 'text' : from.type === 'reference' ? from.data.mediaType : knownOutputType || binding.sourceField;
-    if (binding.sourceField && ['image', 'video'].includes(binding.sourceField) && knownOutputType && binding.sourceField !== knownOutputType) return { ok: false, reason: '所选输出媒体类型与来源节点的输出不匹配' };
+    const knownOutputType = MEDIA_TYPES.includes(resolvedType) ? resolvedType : sourceOutputType(from, options, input?.type || binding.sourceField || 'image', graph);
+    const sourceType = from.type === 'prompt' ? 'text' : from.type === 'reference' ? from.data.mediaType : knownOutputType;
+    if (!sourceType && ['generation', 'result'].includes(from.type) && !allowUnknown) return { ok: false, reason: '上游输出媒体类型未知，请先确认输出接口或完成生成，不能根据目标参数推定类型' };
+    if (binding.sourceField && MEDIA_TYPES.includes(binding.sourceField) && knownOutputType && binding.sourceField !== knownOutputType) return { ok: false, reason: '所选输出媒体类型与来源节点的输出不匹配' };
     if (binding.sourceField === 'text' || binding.sourceField === 'negative') {
       if (from.type !== 'prompt') return { ok: false, reason: '来源节点与连接字段类型不匹配' };
     }
     if (binding.sourceField === 'video' && from.type === 'reference' && from.data.mediaType !== 'video') return { ok: false, reason: '来源素材不是视频' };
     if (binding.sourceField === 'image' && from.type === 'reference' && from.data.mediaType !== 'image') return { ok: false, reason: '来源素材不是图片' };
+    if (binding.sourceField === 'audio' && from.type === 'reference' && from.data.mediaType !== 'audio') return { ok: false, reason: '来源素材不是音频' };
     if (input) {
-      if (!['text', 'image', 'video'].includes(input.type)) return { ok: false, reason: '此参数通过表单填写；只有文本、图片与视频参数支持连线' };
-      if (graph.edges.some(edge => edge.target === target && edgeInputField(graph, edge) === input.id)) return { ok: false, reason: '此输入端口已有连接，请先断开原连接' };
-      if (sourceType && sourceType !== input.type) return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片，视频接视频' };
+      if (!['text', ...MEDIA_TYPES].includes(input.type)) return { ok: false, reason: '此参数通过表单填写；只有文本、图片、视频与音频参数支持连线' };
+      let composition;
+      try { composition = packaged && normalizeTextCompositions(to.data.packageTextCompositions, to.data.packageFields)[input.id]; }
+      catch (error) { return { ok: false, reason: error.message }; }
+      const existing = graph.edges.filter(edge => edge.target === target && edgeInputField(graph, edge) === input.id);
+      if (existing.length && !composition) return { ok: false, reason: '此输入端口已有连接，请先断开原连接' };
+      if (composition) {
+        const context = { sourceType: from.type, fieldType: input.type, composition };
+        try {
+          const identity = textContributionIdentity({ source, ...binding }, context);
+          if (existing.some(edge => textContributionIdentity(edge, context) === identity)) return { ok: false, reason: '相同文本来源已连接，不能重复拼接' };
+        } catch (error) { return { ok: false, reason: error.message }; }
+      }
+      if (sourceType && sourceType !== input.type) return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片，视频接视频，音频接音频' };
+      if (!sourceType && MEDIA_TYPES.includes(binding.sourceField) && binding.sourceField !== input.type) return { ok: false, reason: '连接类型不匹配：所存来源字段与目标参数不同' };
       if (!sourceType && !['generation', 'result'].includes(from.type)) return { ok: false, reason: '连接类型不匹配：文本接文本，图片接图片，视频接视频' };
     } else {
       if (binding.targetField) return { ok: false, reason: '生成节点目标输入端口不存在' };
       const compatible = from.type === 'prompt' || from.type === 'reference' && from.data.mediaType === 'image'
-        || ['generation', 'result'].includes(from.type) && (!sourceType || sourceType === 'image');
+        || ['generation', 'result'].includes(from.type) && (sourceType === 'image' || !sourceType && (!binding.sourceField || binding.sourceField === 'image'));
       if (!compatible) return { ok: false, reason: '连接顺序：提示词 / 图片参考 → 生成 → 结果；请为生成输入选择明确端口' };
     }
     if (!binding.targetField && graph.edges.some(edge => edge.source === source && edge.target === target && !edge.targetField)) return { ok: false, reason: '连接已存在' };
@@ -274,8 +333,25 @@ export function connect(graph, source, target, options = {}) {
   return graph;
 }
 
+function freezeImageInputSlots(graph, affectedTargets) {
+  // Freeze inferred slots before removing their predecessors from a legacy canvas.
+  const bindings = graph.edges.filter(edge => affectedTargets.has(edge.target) && !edge.targetField
+    && ['reference', 'generation', 'result'].includes(graph.nodes.find(node => node.id === edge.source)?.type))
+    .map(edge => [edge, edgeInputField(graph, edge)]);
+  for (const [edge, field] of bindings) if (field) edge.targetField = field;
+}
+
+export function removeEdges(graph, ids) {
+  const removed = new Set(ids);
+  freezeImageInputSlots(graph, new Set(graph.edges.filter(edge => removed.has(edge.id)).map(edge => edge.target)));
+  graph.edges = graph.edges.filter(edge => !removed.has(edge.id));
+  return graph;
+}
+
 export function removeNodes(graph, ids) {
   const removed = new Set(ids);
+  const affectedTargets = new Set(graph.edges.filter(edge => removed.has(edge.source) && !removed.has(edge.target)).map(edge => edge.target));
+  freezeImageInputSlots(graph, affectedTargets);
   graph.nodes = graph.nodes.filter(node => !removed.has(node.id));
   graph.edges = graph.edges.filter(edge => !removed.has(edge.source) && !removed.has(edge.target));
   return graph;
@@ -293,7 +369,14 @@ export function duplicateNodes(graph, ids) {
     map.set(node.id, clone.id);
     return clone;
   });
-  const edges = graph.edges.filter(edge => map.has(edge.source) && map.has(edge.target)).map(edge => ({ id: makeId('edge'), source: map.get(edge.source), target: map.get(edge.target), ...edgeOptions(edge) }));
+  const edges = graph.edges.filter(edge => map.has(edge.source) && map.has(edge.target)).map(edge => {
+    const options = edgeOptions(edge);
+    if (!options.targetField && ['reference', 'generation', 'result'].includes(graph.nodes.find(node => node.id === edge.source)?.type)) {
+      const field = edgeInputField(graph, edge);
+      if (field) options.targetField = field;
+    }
+    return { id: makeId('edge'), source: map.get(edge.source), target: map.get(edge.target), ...options };
+  });
   const validated = parseGraph(serializeGraph({ nodes: clones, edges }));
   graph.nodes.push(...validated.nodes);
   graph.edges.push(...validated.edges);
@@ -304,35 +387,48 @@ export function generationPayload(graph, id, context = {}) {
   const node = graph.nodes.find(item => item.id === id && item.type === 'generation');
   if (!node) throw new Error('请选择生成节点');
   if (!KINDS.includes(node.data.kind)) throw new Error('生成模式不受支持');
+  for (const edge of graph.edges.filter(item => item.target === id && Object.hasOwn(item, 'sourceOccurrence'))) {
+    const source = graph.nodes.find(item => item.id === edge.source);
+    const field = (node.data.packageFields || []).find(item => item.id === edge.targetField);
+    const composition = node.data.kind === 'package' && normalizeTextCompositions(node.data.packageTextCompositions, node.data.packageFields)[edge.targetField];
+    textContributionIdentity(edge, { sourceType: source?.type, fieldType: field?.type, composition });
+  }
   if (graph.edges.some(edge => edge.target === id && graph.nodes.some(ref => ref.id === edge.source && ref.type === 'reference' && ref.data.localAssetId && !ref.data.name))) throw new Error('参考图片已保存在本机，点击“开始生成”时会自动传入当前推理引擎');
   if (node.data.kind === 'package') {
     if (typeof node.data.package_id !== 'string' || !node.data.package_id) throw new Error('请先选择或导入对应工作流包');
     const values = packageValues(node.data.packageValues || {});
+    const compositions = normalizeTextCompositions(node.data.packageTextCompositions, node.data.packageFields);
+    for (const field of Object.keys(compositions)) textCompositionOwn(values, field);
+    const textInputs = new Map();
     const checked = { nodes: graph.nodes, edges: graph.edges.filter(edge => edge.target !== id) };
     for (const edge of graph.edges.filter(edge => edge.target === id)) {
-      const validation = canConnect(checked, edge.source, edge.target, edge);
+      const validation = validateConnection(checked, edge.source, edge.target, edge, context.edgeMediaTypes?.[edge.id]);
       if (!validation.ok) throw new Error(`工作流包输入连接无效：${validation.reason}`);
       checked.edges.push(edge);
       const source = graph.nodes.find(item => item.id === edge.source);
       if (source.type === 'prompt') {
         const text = source.data[edge.sourceField || 'text'];
         if (typeof text !== 'string' || text.length > 100000) throw new Error('连接的提示词必须是不超过 100000 字符的文本');
-        values[edge.targetField] = text;
+        if (compositions[edge.targetField]) {
+          if (!textInputs.has(edge.targetField)) textInputs.set(edge.targetField, []);
+          textInputs.get(edge.targetField).push(text);
+        } else values[edge.targetField] = text;
       } else if (source.type === 'reference') {
         if (!source.data.name) throw new Error('工作流包参考图片待准备，请先上传已连接的图片');
         const field = (node.data.packageFields || []).find(item => item.id === edge.targetField);
-        if (!field || !['image', 'video'].includes(field.type) || source.data.mediaType !== field.type) throw new Error('工作流包输入与连接素材类型不匹配');
-        values[edge.targetField] = uploadedMediaName(source.data.name, field.type === 'video' ? '工作流视频' : '参考图');
+        if (!field || !MEDIA_TYPES.includes(field.type) || source.data.mediaType !== field.type) throw new Error('工作流包输入与连接素材类型不匹配');
+        values[edge.targetField] = uploadedMediaName(source.data.name, `工作流${mediaLabel(field.type)}`);
       } else {
         const images = context?.edgeImages;
         if (!images || typeof images !== 'object' || Array.isArray(images) || !Object.hasOwn(images, edge.id) || !images[edge.id]) throw new Error('等待上游生成完成，输出图片待准备；请先运行上游并将图片上传到当前后端');
         const field = (node.data.packageFields || []).find(item => item.id === edge.targetField);
-        if (!field || !['image', 'video'].includes(field.type)) throw new Error('工作流包连接目标不是图片或视频输入');
-        const outputType = sourceOutputType(source, edge, field.type, graph);
+        if (!field || !MEDIA_TYPES.includes(field.type)) throw new Error('工作流包连接目标不是图片、视频或音频输入');
+        const outputType = context.edgeMediaTypes?.[edge.id] || sourceOutputType(source, edge, field.type, graph);
         if (outputType && outputType !== field.type) throw new Error('上游生成结果与工作流包输入媒体类型不匹配');
-        values[edge.targetField] = uploadedMediaName(images[edge.id], field.type === 'video' ? '工作流视频' : '参考图');
+        values[edge.targetField] = uploadedMediaName(images[edge.id], `工作流${mediaLabel(field.type)}`);
       }
     }
+    for (const [field, incoming] of textInputs) values[field] = composeTextInput(compositions[field], incoming, values[field] ?? '');
     return { kind: 'package', package_id: node.data.package_id, values: packageValues(values), ...(node.data.editor_backend ? { editor_backend: node.data.editor_backend } : {}), ...(node.data.editor_outputs?.length ? { output_nodes: [...node.data.editor_outputs] } : {}) };
   }
   if (node.data.kind === 'api') {
@@ -375,13 +471,24 @@ export function generationPayload(graph, id, context = {}) {
     } else {
       const images = context?.edgeImages;
       if (!images || typeof images !== 'object' || Array.isArray(images) || !Object.hasOwn(images, edge.id) || !images[edge.id]) throw new Error('等待上游生成完成，输出图片待准备；请先运行上游并将图片上传到当前后端');
-      const outputType = sourceOutputType(source, edge, 'image', graph);
+      const outputType = context.edgeMediaTypes?.[edge.id] || sourceOutputType(source, edge, 'image', graph);
+      if (!outputType) throw new Error('上游输出媒体类型未知，不能作为图片输入');
       if (outputType && outputType !== 'image') throw new Error('上游输出不是图片，不能连接到此图片输入端口');
       name = uploadedImageName(images[edge.id]);
     }
     imageInputs.push({ edge, source, port: portInfo, name });
   }
-  const orderedImages = [...imageInputs].sort((a, b) => generationInputPorts(node).findIndex(item => item.id === a.port.id) - generationInputPorts(node).findIndex(item => item.id === b.port.id));
+  const imagePorts = generationInputPorts(node).filter(port => port.type === 'image');
+  const orderedImages = [...imageInputs].sort((a, b) => imagePorts.findIndex(item => item.id === a.port.id) - imagePorts.findIndex(item => item.id === b.port.id));
+  // These backends bind a compact list by position: holes must never promote a
+  // later reference into the edit target or another numbered conditioning slot.
+  if (node.data.kind === 'qwen21_edit' || ['krea', 'h3_ref'].includes(node.data.kind) && orderedImages.length) {
+    const used = new Set(orderedImages.map(item => item.port.id));
+    const lastIndex = imagePorts.findIndex(port => port.id === orderedImages.at(-1)?.port.id);
+    const requiredCount = Math.max(node.data.kind === 'qwen21_edit' ? 1 : 0, lastIndex + 1);
+    const missing = imagePorts.slice(0, requiredCount).filter(port => !used.has(port.id));
+    if (missing.length) throw new Error(`缺少图片输入端口：${missing.map(port => `${port.label}（${port.id}）`).join('、')}；请补齐前面的图片槽位，后续参考图不会自动前移`);
+  }
   const refs = orderedImages.map(item => item.name);
   if (node.data.kind === 'sdxl_i2i' && refs.length !== 1) throw new Error('SDXL 图生图需要连接 1 张已上传的参考图片');
   if (node.data.kind.startsWith('qwen21_')) {
@@ -504,7 +611,7 @@ export function recipeGraph(recipe, x = 80, y = 80) {
   if (!['api', 'package'].includes(request.kind)) {
     (request.references || []).forEach((name, index) => {
       const metadata = (recipe.references || []).find(item => item.name === name) || {};
-      const reference = createNode('reference', x - 345, y + index * 340, { title: `复用素材 ${index + 1}`, name, url: metadata.url || '', mediaType: 'image', role: request.reference_roles?.[index] || 'reference' });
+      const reference = createNode('reference', x - 345, y + index * 340, { title: `复用素材 ${index + 1}`, name, url: metadata.url || '', uploadBackend: metadata.backend || recipe.backend || '', mediaType: 'image', role: request.reference_roles?.[index] || 'reference' });
       fragment.nodes.push(reference);
       const role = request.reference_roles?.[index] || 'reference';
       const targetField = request.kind === 'qwen21_edit' ? 'image_' + (index + 1)
@@ -536,12 +643,20 @@ export function progressPercent(progress) {
 }
 
 export function serializeGraph(graph, viewport = { x: 60, y: 60, scale: 1 }) {
-  return stableStringify({ schema: SCHEMA, nodes: graph.nodes, edges: graph.edges, viewport });
+  for (const edge of graph.edges) if (Object.hasOwn(edge, 'sourceOccurrence')) textSourceOccurrence(edge);
+  const composed = graph.nodes.some(node => node.data?.packageTextCompositions && Object.keys(node.data.packageTextCompositions).length)
+    || graph.edges.some(edge => Object.hasOwn(edge, 'sourceOccurrence'));
+  return stableStringify({ schema: composed ? COMPOSED_SCHEMA : SCHEMA, nodes: graph.nodes, edges: graph.edges, viewport });
 }
 
 export function parseGraph(text) {
+  if (typeof text !== 'string' && Array.isArray(text?.edges)) {
+    for (const edge of text.edges) if (edge && Object.hasOwn(edge, 'sourceOccurrence')) textSourceOccurrence(edge);
+  }
   const input = parseJSONWithSafeNumbers(typeof text === 'string' ? text : JSON.stringify(text));
-  if (!input || typeof input !== 'object' || input.schema !== SCHEMA || !Array.isArray(input.nodes) || !Array.isArray(input.edges)) throw new Error('不是有效的 FrameWeave 画布文件');
+  if (!input || typeof input !== 'object' || ![SCHEMA, COMPOSED_SCHEMA].includes(input.schema) || !Array.isArray(input.nodes) || !Array.isArray(input.edges)) throw new Error('不是有效或受支持的 FrameWeave 画布文件；新版格式请更新客户端后打开');
+  if (input.schema === SCHEMA && (input.nodes.some(node => node?.data?.packageTextCompositions && Object.keys(node.data.packageTextCompositions).length)
+    || input.edges.some(edge => edge && Object.hasOwn(edge, 'sourceOccurrence')))) throw new Error('带文本拼接规则或贡献身份的画布需要 v2 格式，请用支持此规则的客户端重新导出');
   if (input.nodes.length > 500 || input.edges.length > 2000) throw new Error('画布超过限制：最多 500 个节点 / 2000 条连接');
   const seen = new Set();
   const nodes = input.nodes.map(node => {
@@ -574,6 +689,11 @@ export function parseGraph(text) {
     if (node.type === 'generation' && !KINDS.includes(data.kind)) throw new Error('生成模式不受支持');
     if (node.type === 'generation' && (!data.models || typeof data.models !== 'object' || Array.isArray(data.models))) data.models = {};
     if (node.type === 'generation') {
+      if (Object.hasOwn(node.data, 'outputs')) {
+        if (!Array.isArray(node.data.outputs)) throw new Error('工作流输出文件记录无效');
+        data.outputs = copy(node.data.outputs).filter(item => item && MEDIA_TYPES.includes(item.type)
+          && (typeof item.url === 'string' || typeof item.filename === 'string')).slice(0, 32);
+      }
       if (node.data.packageMediaBackends !== undefined) data.packageMediaBackends = packageMediaOwners(node.data.packageMediaBackends);
       if (node.data.editor_id !== undefined) {
         if (typeof node.data.editor_id !== 'string' || !/^e-[a-f0-9]{24}$/.test(node.data.editor_id)) throw new Error('原生工作流 ID 无效');
@@ -588,19 +708,25 @@ export function parseGraph(text) {
       }
       if (data.editor_outputs !== undefined && (!Array.isArray(data.editor_outputs) || data.editor_outputs.length > 64 || data.editor_outputs.some(id => typeof id !== 'string' || !id || id.length > 120))) throw new Error('工作流输出定义无效');
       if (node.data.editor_controls !== undefined) {
-        if (!Array.isArray(node.data.editor_controls) || node.data.editor_controls.length > 4096) throw new Error('工作流控件映射无效');
+        if (!Array.isArray(node.data.editor_controls) || node.data.editor_controls.length > MAX_INTERFACE_FIELDS) throw new Error('工作流控件映射无效');
         data.editor_controls = node.data.editor_controls.map(control => {
           const keys = ['node_id', 'input', 'widget_node_id', 'widget_name'];
           if (!control || keys.some(key => typeof control[key] !== 'string' || !control[key] || control[key].length > 200)) throw new Error('工作流控件映射无效');
           return Object.fromEntries(keys.map(key => [key, control[key]]));
         });
       }
+      if (node.data.editor_hidden_updates !== undefined) data.editor_hidden_updates = normalizeHiddenUpdates(node.data.editor_hidden_updates);
       if (Object.hasOwn(node.data, 'refine')) {
         const value = node.data.refine;
         if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.enabled !== 'boolean') throw new Error('二次重绘参数无效');
         data.refine = packageValues(value);
       }
       if (Object.hasOwn(node.data, 'packageFields')) data.packageFields = packageFields(node.data.packageFields);
+      if (Object.hasOwn(node.data, 'packageTextCompositions')) {
+        if (data.kind !== 'package') throw new Error('文本拼接规则仅适用于工作流包');
+        data.packageTextCompositions = normalizeTextCompositions(node.data.packageTextCompositions, data.packageFields);
+        for (const id of Object.keys(data.packageTextCompositions)) textCompositionOwn(data.packageValues, id);
+      }
       if (Object.hasOwn(node.data, 'inputLabels')) data.inputLabels = normalizedInputLabels(node.data.inputLabels);
       if (!Number.isSafeInteger(data.seed) || data.seed < 0) throw new Error('随机种子必须是 0 到 9007199254740991 之间的整数');
       if (Object.hasOwn(node.data, 'loras')) data.loras = loraStack(node.data.loras, data.kind);
@@ -638,7 +764,7 @@ export function parseGraph(text) {
   const edgeIds = new Set();
   for (const edge of input.edges) {
     if (!edge || typeof edge.id !== 'string' || !edge.id || edge.id.length > 120 || edgeIds.has(edge.id)) throw new Error('连接 ID 无效或重复');
-    const validation = canConnect(graph, edge.source, edge.target, edge);
+    const validation = validateConnection(graph, edge.source, edge.target, edge, null, true);
     if (!validation.ok) throw new Error(`无效连接：${validation.reason}`);
     edgeIds.add(edge.id);
     graph.edges.push({ id: edge.id, source: edge.source, target: edge.target, ...edgeOptions(edge) });

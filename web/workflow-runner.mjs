@@ -1,7 +1,10 @@
 /** Durable, sequential canvas orchestration. No model runtime or UI dependencies. */
-import { executionOrder, generationPayload, parseGraph, serializeGraph } from './graph.mjs';
+import { executionOrder, generationPayload, parseGraph, serializeGraph, COMPOSED_SCHEMA } from './graph.mjs';
+import { projectExecution } from './execution-scope.mjs';
+import { cancellationId, jobStateDetail } from './job-state.mjs';
 
 export const RUN_SCHEMA = 'frameweave.workflow-run.v1';
+export const COMPOSED_RUN_SCHEMA = 'frameweave.workflow-run.v2';
 export function validateRunTargets(graph, targets) {
   const order = executionOrder(graph, targets);
   if (!order.length) throw new Error('请选择至少一个可执行生成节点');
@@ -28,20 +31,26 @@ class Failure extends Error {}
 /** load is synchronous; save may be synchronous or return a promise. */
 export function createWorkflowRunner({ api, load = () => null, save, onChange = () => {}, onJob = () => {}, wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   if (typeof api !== 'function' || typeof save !== 'function') throw new Error('工作流执行器需要 api 与持久保存回调');
-  let state = null, busy = false, stopped = false, wake = null, saveQueue = Promise.resolve();
+  let state = null, executionGraph = null, busy = false, stopped = false, wake = null, saveQueue = Promise.resolve(), explicitRefresh = new Set();
   const loaded = load();
   if (loaded && typeof loaded.then === 'function') throw new Error('工作流记录 load 必须同步返回');
   if (loaded) {
     state = copy(loaded);
-    if (state.schema !== RUN_SCHEMA || !Array.isArray(state.steps) || !state.graph || !Array.isArray(state.target_ids)) throw new Error('工作流运行记录格式无效，请保留记录检查后恢复');
+    if (![RUN_SCHEMA, COMPOSED_RUN_SCHEMA].includes(state.schema) || !Array.isArray(state.steps) || !state.graph || !Array.isArray(state.target_ids)) throw new Error('工作流运行记录格式不受支持，请更新客户端并保留记录检查后恢复');
     validateCanvasId(state.canvas_id);
-    state.graph = parseGraph(serializeGraph(state.graph));
-    const order = executionOrder(state.graph, state.target_ids);
+    const serialized = serializeGraph(state.graph);
+    if (state.schema === RUN_SCHEMA && JSON.parse(serialized).schema === COMPOSED_SCHEMA) throw new Error('文本拼接任务需要 v2 运行记录，不能按旧版覆盖语义恢复');
+    state.graph = parseGraph(serialized);
+    // A saved scope is authoritative for this run; old v1 records retain every
+    // incoming dependency and their original request evidence.
+    executionGraph = Object.hasOwn(state, 'execution') ? projectExecution(state.graph, state.execution, state.target_ids) : state.graph;
+    const order = executionOrder(executionGraph, state.target_ids);
     if (order.length !== state.steps.length || state.steps.some((step, index) => step.node_id !== order[index] || !stepStates.has(step.state))) throw new Error('工作流运行记录的步骤顺序无效');
     state.backend = normalizeBackend(state.backend);
     for (const step of state.steps) {
       if (['submitting', 'uncertain', 'running', 'completed'].includes(step.state) && (!/^[\da-f-]{36}$/i.test(step.request_id || '') || !step.request || typeof step.request !== 'object')) throw new Error('工作流记录缺少原始请求证据，不能自动重建提交');
       if (['running', 'completed'].includes(step.state) && !step.job_id) throw new Error('工作流记录缺少已受理的任务 ID');
+      for (const key of ['cancellation_id', 'acknowledged_cancellation_id']) if (step[key] != null && !cancellationId({ cancellation: { id: step[key] } })) throw new Error('工作流取消确认记录无效，请保留原请求证据');
       step.image_inputs ||= {};
     }
     if (!['completed', 'failed'].includes(state.status) || unsettled(state)) { state.status = 'paused'; state.error = '已恢复运行记录；点击查询并继续后才会执行。'; }
@@ -73,41 +82,72 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
     guardStop();
   }
   function upstreamFor(edge) {
-    const source = state.graph.nodes.find(node => node.id === edge.source);
+    const source = executionGraph.nodes.find(node => node.id === edge.source);
     if (source?.type === 'generation') return source.id;
     if (source?.type !== 'result') return null;
-    const candidates = state.graph.edges.filter(item => item.target === source.id).map(item => state.graph.nodes.find(node => node.id === item.source)).filter(node => node?.type === 'generation');
-    if (candidates.length !== 1) throw new Failure('图片结果节点必须连接本次工作流的唯一上游生成节点，不能使用旧任务结果。');
+    const candidates = executionGraph.edges.filter(item => item.target === source.id).map(item => executionGraph.nodes.find(node => node.id === item.source)).filter(node => node?.type === 'generation');
+    if (candidates.length !== 1) throw new Failure('媒体结果节点必须连接本次工作流的唯一上游生成节点，不能使用旧任务结果。');
     return candidates[0].id;
   }
   async function prepare(step) {
     step.state = 'preparing'; await persist();
-    const edgeImages = {};
-    for (const edge of state.graph.edges.filter(edge => edge.target === step.node_id)) {
+    const edgeImages = {}, edgeMediaTypes = {};
+    for (const edge of executionGraph.edges.filter(edge => edge.target === step.node_id)) {
       const upstreamId = upstreamFor(edge); if (!upstreamId) continue;
       const upstream = state.steps.find(item => item.node_id === upstreamId);
       if (!upstream || upstream.state !== 'completed' || !upstream.job_id) throw new Failure('上游任务尚未成功完成，不能继续下游。');
       const selectedIndex = edge.outputIndex ?? 0;
-      const target=state.graph.nodes.find(node=>node.id===step.node_id);
-      const mediaType=target?.data.kind==='package' && target.data.packageFields?.find(field=>field.id===edge.targetField)?.type==='video'?'video':'image';
+      const target = executionGraph.nodes.find(node => node.id === step.node_id);
+      const mediaType = target?.data.kind === 'package'
+        ? target.data.packageFields?.find(field => field.id === edge.targetField)?.type : 'image';
+      if (!['image', 'video', 'audio'].includes(mediaType)) throw new Failure('连接目标没有明确的媒体输入类型，不能交接上游文件。');
       const images = (upstream.outputs || []).filter(output => output.type === mediaType);
       const candidates = edge.sourceOutput ? images.filter(output => output.node_id === edge.sourceOutput) : images;
-      if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= candidates.length) throw new Failure(`上游任务没有所绑定输出节点及序号的${mediaType==='video'?'视频':'图片'}；请检查输出接口，视频与音频不能直接作为图片输入。`);
-      const outputIndex = images.indexOf(candidates[selectedIndex]);
       let input = step.image_inputs[edge.id];
-      if (!input || input.job_id !== upstream.job_id || input.output_index !== outputIndex || (input.media_type || 'image') !== mediaType) {
+      const pinnedId = input?.job_id === upstream.job_id ? input.output_id : null;
+      const selected = pinnedId ? candidates.find(output => output.output_id === pinnedId) : candidates[selectedIndex];
+      if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || !selected) throw new Failure(`上游任务没有所绑定输出身份、节点及序号的${{ image: '图片', video: '视频', audio: '音频' }[mediaType]}；请检查输出接口和实际媒体类型。`);
+      const outputIndex = images.indexOf(selected);
+      // Identify the selected file from this run, never a saved historical job.
+      const outputId = typeof selected.output_id === 'string' && selected.output_id ? selected.output_id : null;
+      if (!input || input.job_id !== upstream.job_id || (outputId ? input.output_id !== outputId : input.output_index !== outputIndex) || (input.media_type || 'image') !== mediaType
+          || input.backend && input.backend !== state.backend) {
         await checkBackend(); guardStop();
         let uploaded;
-        try { uploaded = await api(`/api/jobs/${encodeURIComponent(upstream.job_id)}/${mediaType==='video'?'media-input':'image-input'}`, { output_index: outputIndex, ...(mediaType==='video'?{package_id:target.data.package_id,field_id:edge.targetField}:{}) }); }
+        try { uploaded = await api(`/api/jobs/${encodeURIComponent(upstream.job_id)}/${mediaType === 'image' ? 'image-input' : 'media-input'}`, {
+          output_index: outputIndex, ...(outputId ? { output_id: outputId } : {}),
+          ...(mediaType === 'image' ? {} : { media_type: mediaType, package_id: target.data.package_id, field_id: edge.targetField }),
+        }); }
         catch (error) { throw new Pause(`上游素材交接未完成：${error.message}。不会提交下游生成。`); }
-        if (typeof uploaded?.name !== 'string' || !uploaded.name) throw new Failure('图片交接未返回有效输入名称');
-        input = { job_id: upstream.job_id, output_index: outputIndex, name: uploaded.name, url: uploaded.url || '', ...(mediaType==='video'?{media_type:mediaType}:{}) };
+        await checkBackend(); guardStop();
+        if (typeof uploaded?.name !== 'string' || !uploaded.name) throw new Failure('媒体交接未返回有效输入名称');
+        if (uploaded.media_type && uploaded.media_type !== mediaType || uploaded.output_id && outputId && uploaded.output_id !== outputId
+            || uploaded.backend && normalizeBackend(uploaded.backend) !== state.backend) throw new Failure('媒体交接返回的类型、输出身份或推理引擎不匹配');
+        input = { job_id: upstream.job_id, output_index: outputIndex, name: uploaded.name, url: uploaded.url || '',
+          ...(mediaType === 'image' ? {} : { media_type: mediaType }), ...(outputId ? { output_id: outputId } : {}),
+          backend: state.backend,
+        };
         step.image_inputs[edge.id] = input; await persist();
       }
       edgeImages[edge.id] = input.name;
+      edgeMediaTypes[edge.id] = selected.type;
     }
     guardStop();
-    step.request = generationPayload(state.graph, step.node_id, { edgeImages });
+    const request = generationPayload(executionGraph, step.node_id, { edgeImages, edgeMediaTypes });
+    if (state.execution && request.kind === 'package') {
+      await checkBackend(); guardStop();
+      let compiled;
+      try { compiled = await api('/api/compile', copy(request)); }
+      catch (error) { throw new Pause(`无法核验冻结执行范围：${error.message}。已暂停，请检查参数或重新规划运行。`); }
+      await checkBackend(); guardStop();
+      const frozen = state.execution.packages[step.node_id], summary = compiled?.summary;
+      const sameIds = (actual, expected) => Array.isArray(actual) && actual.length === expected.length
+        && new Set(actual).size === actual.length && actual.every(id => typeof id === 'string' && expected.includes(id));
+      if (summary?.package_id !== frozen.package_id || !['selected_outputs', 'node_ids', 'active_field_ids'].every(key => sameIds(summary?.execution?.[key], frozen[key]))) {
+        throw new Pause('工作流的实时执行范围已变化；已暂停，请重新规划新运行，不能扩大原冻结范围。');
+      }
+    }
+    step.request = request;
     step.request_id = globalThis.crypto.randomUUID();
     step.state = 'submitting'; await persist();
   }
@@ -145,17 +185,28 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
     while (true) {
       await checkBackend();
       let response;
-      try { response = await api('/api/jobs'); } catch (error) { throw new Pause(`无法读取原任务状态：${error.message}`); }
+      try {
+        response = explicitRefresh.delete(step.job_id)
+          ? { jobs: [await api(`/api/jobs/${encodeURIComponent(step.job_id)}/refresh`, {})] }
+          : await api('/api/jobs');
+      } catch (error) { throw new Pause(`无法读取原任务状态：${error.message}`); }
       if (!Array.isArray(response?.jobs)) throw new Pause('原任务列表返回无效数据，已暂停后续步骤。');
       const job = response.jobs.find(job => job?.id === step.job_id);
       if (!job) throw new Pause('原任务不在当前任务列表中；保留任务与请求 ID，请核实原引擎历史。');
+      if (job.backend && normalizeBackend(job.backend) !== state.backend) throw new Pause('原任务响应属于另一个推理引擎，已暂停后续步骤。');
       const changed = step.job_status !== job.status;
       step.job_status = job.status;
+      const cancelId = cancellationId(job);
+      if (cancelId && cancelId !== step.acknowledged_cancellation_id) {
+        step.cancellation_id = cancelId;
+        await persist(); observeJob(step, job);
+        throw new Pause(`${jobStateDetail(job) || '检测到原任务的取消请求。'} 已暂停后续节点；点击“查询并继续”确认后才会跟踪原任务或使用其完成结果。`);
+      }
       if (job.status === 'completed') {
         step.outputs = copy(job.outputs || []); step.state = 'completed'; step.error = ''; await persist(); observeJob(step, job); return;
       }
       if (['failed', 'cancelled'].includes(job.status)) { step.state = 'failed'; throw new Failure(`上游步骤${job.status === 'cancelled' ? '已取消' : '生成失败'}${job.error ? `：${job.error}` : ''}，后续步骤未执行。`); }
-      if (!['queued', 'running'].includes(job.status)) throw new Pause('原任务状态未知，已暂停后续步骤。');
+      if (!['queued', 'running'].includes(job.status)) throw new Pause('原任务状态待确认，已暂停后续步骤；保留原任务与请求 ID，查询不会重新生成。');
       if (changed) { await persist(); observeJob(step, job); }
       guardStop(); await delay();
     }
@@ -183,15 +234,20 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
   return {
     getState: snapshot,
     isRunning: () => busy,
-    async start({ graph, targetIds, backend, canvasId }) {
+    async start({ graph, targetIds, backend, canvasId, execution }) {
       if (busy) throw new Error('工作流正在执行，请勿重复启动');
       if (state && (!['completed', 'failed'].includes(state.status) || unsettled(state))) throw new Error('已有未结束的运行记录，请查询并继续或安全清除记录');
       validateCanvasId(canvasId);
       const frozen = parseGraph(serializeGraph(graph));
       const targets = targetIds === undefined ? frozen.nodes.filter(node => node.type === 'generation').map(node => node.id) : [...targetIds];
-      const order = validateRunTargets(frozen, targets);
+      const frozenExecution = execution === undefined ? undefined : copy(execution);
+      const projected = frozenExecution === undefined ? frozen : projectExecution(frozen, frozenExecution, targets);
+      const order = validateRunTargets(projected, targets);
       const normalized = normalizeBackend(backend), now = new Date().toISOString();
-      state = { schema: RUN_SCHEMA, id: globalThis.crypto.randomUUID(), status: 'running', backend: normalized, graph: frozen, target_ids: targets, created_at: now, updated_at: now, error: '', steps: order.map(node_id => ({ node_id, state: 'pending', request_id: null, request: null, job_id: null, job_status: null, image_inputs: {} })) };
+      const schema = JSON.parse(serializeGraph(frozen)).schema === COMPOSED_SCHEMA ? COMPOSED_RUN_SCHEMA : RUN_SCHEMA;
+      state = { schema, id: globalThis.crypto.randomUUID(), status: 'running', backend: normalized, graph: frozen, target_ids: targets, created_at: now, updated_at: now, error: '', steps: order.map(node_id => ({ node_id, state: 'pending', request_id: null, request: null, job_id: null, job_status: null, image_inputs: {} })) };
+      executionGraph = projected;
+      if (frozenExecution !== undefined) state.execution = frozenExecution;
       if (canvasId !== undefined) state.canvas_id = canvasId;
       busy = true; stopped = false; return drive();
     },
@@ -200,6 +256,8 @@ export function createWorkflowRunner({ api, load = () => null, save, onChange = 
       if (!state) throw new Error('没有可恢复的工作流记录');
       if (state.status === 'completed') return snapshot();
       if (state.status === 'failed') throw new Error('此运行已失败，请修复参数后开始新的运行');
+      for (const step of state.steps) if (step.cancellation_id) step.acknowledged_cancellation_id = step.cancellation_id;
+      explicitRefresh = new Set(state.steps.filter(step => step.job_id && step.job_status === 'unknown').map(step => step.job_id));
       busy = true; stopped = false; return drive();
     },
     async stop() {

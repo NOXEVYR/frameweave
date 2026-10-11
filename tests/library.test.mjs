@@ -50,9 +50,10 @@ test('task history filters by combined status and visible metadata without searc
   const jobs = [
     { id: 'done-1', kind: 'package', status: 'completed', summary: { package_name: '电影海报' }, prompt: 'private secret' },
     { id: 'failed-2', kind: 'h3_t2v', status: 'failed', error: 'Missing model' },
-    { id: 'waiting-3', status: 'queued' }, { id: 'rendering-4', status: 'running' },
+    { id: 'waiting-3', status: 'queued' }, { id: 'rendering-4', status: 'running' }, { id: 'unknown-5', status: 'unknown' },
   ];
-  assert.deepEqual(filterJobs(jobs, 'active').map(job => job.id), ['waiting-3', 'rendering-4']);
+  assert.deepEqual(filterJobs(jobs, 'active').map(job => job.id), ['waiting-3', 'rendering-4', 'unknown-5']);
+  assert.deepEqual(filterJobs(jobs, 'unknown').map(job => job.id), ['unknown-5']);
   assert.deepEqual(filterJobs(jobs, 'failed', 'ＭＩＳＳＩＮＧ').map(job => job.id), ['failed-2']);
   assert.equal(filterJobs(jobs, 'completed', '海报').length, 1);
   assert.equal(filterJobs(jobs, 'all', 'private').length, 0);

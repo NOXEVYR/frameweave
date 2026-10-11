@@ -1,5 +1,7 @@
 import { parseGraph, serializeGraph } from './graph.mjs';
 import { frameDialog } from './workspace-tools.mjs';
+import { validateCanvasStructure } from './workflow-canvas.mjs';
+import { normalizeTextCompositions, composeTextInput, recordTextContribution } from './text-input-composition.mjs';
 
 /** Reusable settings are local canvas snapshots, independent of job history. */
 export function configurationBundle(bundle, nodeId, name) {
@@ -12,25 +14,36 @@ export function configurationBundle(bundle, nodeId, name) {
   if (!pack || copy.data.editor_id && !editor) throw new Error('配置缺少工作流定义，原画布未更改');
   // Prompt wires have stable text values. Media and upstream generation outputs
   // are deliberately not captured as reusable file references.
+  const compositions = normalizeTextCompositions(copy.data.packageTextCompositions, copy.data.packageFields);
+  const textInputs = new Map();
+  const contributions = new Set();
   for (const edge of source.edges.filter(item => item.target === nodeId)) {
     const parent = source.nodes.find(item => item.id === edge.source);
     const field = (copy.data.packageFields || []).find(item => item.id === edge.targetField);
+    recordTextContribution(contributions, edge, { sourceType: parent?.type, fieldType: field?.type, composition: compositions[field?.id] });
     if (parent?.type === 'prompt' && field?.type === 'text') {
       const value = parent.data[edge.sourceField || 'text'];
       if (typeof value !== 'string' || value.length > 64000) throw new Error('连接的提示词超出工作流字段允许的文本范围');
-      copy.data.packageValues[field.id] = value;
+      if (compositions[field.id]) {
+        if (!textInputs.has(field.id)) textInputs.set(field.id, []);
+        textInputs.get(field.id).push(value);
+      } else copy.data.packageValues[field.id] = value;
     }
   }
-  for (const field of copy.data.packageFields || []) if (['image', 'audio'].includes(field.type)) copy.data.packageValues[field.id] = '';
+  for (const [id, incoming] of textInputs) copy.data.packageValues[id] = composeTextInput(compositions[id], incoming, copy.data.packageValues[id] ?? '');
+  for (const field of copy.data.packageFields || []) if (['image', 'audio', 'video'].includes(field.type)) copy.data.packageValues[field.id] = '';
   copy.data.packageMediaBackends = {};
   copy.data.title = name; copy.x = 80; copy.y = 80;
-  return {schema:'prismcanvas.project.v1', version:1, name, configuration:true,
+  const document = {schema:'prismcanvas.project.v1', version:1, name, configuration:true,
     canvas:JSON.parse(serializeGraph({nodes:[copy],edges:[]},{x:30,y:30,scale:1})),
     packages:[structuredClone(pack)], editors:editor ? [structuredClone(editor)] : []};
+  validateCanvasStructure(document);
+  return document;
 }
 
 export function configuredNodes(bundle) {
   if (bundle?.schema !== 'prismcanvas.project.v1' || bundle.version !== 1) throw new Error('配置记录格式无效');
+  validateCanvasStructure(bundle);
   return parseGraph(bundle.canvas).nodes.filter(node => node.type === 'generation' && node.data.kind === 'package' && node.data.package_id);
 }
 
@@ -48,7 +61,7 @@ export function createWorkflowConfigurations(host) {
     const dialog = openDialog('保存工作流配置');
     const label=el('label','配置名称'); label.className='field';
     const name=el('input');name.value=node.data.title;name.maxLength=120;name.setAttribute('aria-label','配置名称');label.append(name);
-    const note=el('p','保存外层参数、输入定义和完整内部工作流，不依赖生成队列。图片、音频与外部连线不随配置保存，下次重新上传或连接。');note.className='form-note';
+    const note=el('p','保存外层参数、输入定义和完整内部工作流，不依赖生成队列。图片、音频、视频与外部连线不随配置保存，下次重新上传或连接。');note.className='form-note';
     const status=el('p');status.className='form-note';status.setAttribute('role','status');
     const button=el('button','保存为新配置');button.className='button primary';
     button.onclick=async()=>{

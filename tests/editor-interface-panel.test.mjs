@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 
 import {
   EDITOR_INTERFACE_FIELD_LIMIT,
+  autoEditorInterfaceSelection,
   chooseEditorInterface,
   deriveEditorRebindings,
   editorFieldGroup,
   editorFieldTypeCompatible,
+  editorFieldSupportsPort,
   editorInputTargetsUnique,
   initialEditorFieldIds,
   initialEditorOutputIds,
@@ -22,7 +24,7 @@ test('input remapping cannot collide with another remap or a retained connection
   assert.equal(editorInputTargetsUnique(connections, { old: 'new', kept: null }), true);
 });
 
-test('classifies common ComfyUI controls and requires image/audio inputs', () => {
+test('classifies common ComfyUI controls and requires image/audio/video inputs', () => {
   const cases = [
     [{ id: 'ckpt', input: 'ckpt_name', type: 'STRING' }, '模型与编码器'],
     [{ id: 'vae', label: 'VAE', type: 'COMBO' }, '模型与编码器'],
@@ -39,7 +41,9 @@ test('classifies common ComfyUI controls and requires image/audio inputs', () =>
   assert.equal(editorFieldGroup({ id: 'audio', type: 'AUDIO' }), '媒体');
   assert.equal(isRequiredEditorMediaField({ id: 'image', type: 'IMAGE' }), true);
   assert.equal(isRequiredEditorMediaField({ id: 'audio', type: 'AUDIO' }), true);
-  assert.equal(isRequiredEditorMediaField({ id: 'video', type: 'VIDEO' }), false);
+  assert.equal(isRequiredEditorMediaField({ id: 'video', type: 'VIDEO' }), true);
+  assert.equal(editorFieldGroup({ id: 'custom', input: 'custom_option', type: 'text' }), '其他');
+  assert.equal(editorFieldGroup({ id: 'model', input: 'value', type: 'text', role: 'model' }), '模型与编码器');
 });
 
 test('first-time defaults prioritize required media and common model, prompt, and sampling controls under 64', () => {
@@ -56,13 +60,81 @@ test('first-time defaults prioritize required media and common model, prompt, an
   const selected = initialEditorFieldIds(fields);
   assert.ok(selected.includes('audio'));
   assert.ok(selected.includes('image'));
-  assert.ok(selected.includes('ckpt'));
-  assert.ok(selected.includes('lora'));
+  assert.equal(selected.includes('ckpt'), false);
+  assert.equal(selected.includes('lora'), false);
   assert.ok(selected.includes('prompt'));
   assert.ok(selected.includes('width'));
   assert.ok(selected.includes('misc'));
+  assert.equal(selected.some(id => id.startsWith('manual-')), false);
   assert.ok(selected.length <= EDITOR_INTERFACE_FIELD_LIMIT);
   assert.deepEqual(selected.slice(0, 2), ['audio', 'image']);
+});
+
+test('automatic selection preserves user labels, selection and presentation without mutating input', () => {
+  const fields = [
+    { id: 'prompt', input: 'text', label: 'Internal name', type: 'text' },
+    { id: 'model', input: 'ckpt_name', label: 'Model', type: 'text' },
+    { id: 'video', input: 'video', type: 'video' },
+    { id: 'new', input: 'width', type: 'integer', recommended: true },
+  ];
+  const previousFields = [
+    { id: 'prompt', label: '我的提示词', type: 'text', presentation: 'control' },
+    { id: 'model', label: '我的模型', type: 'text' },
+  ];
+  const original = structuredClone({ fields, previousFields });
+  const previousValues = { prompt: 'outer value' }, previousBaseline = { prompt: 'baseline value' };
+  const result = autoEditorInterfaceSelection({ fields, outputs: [{ id: 'out' }], previousFields,
+    previousValues, previousBaseline, connections: [{ direction: 'input', fieldId: 'model', type: 'text' }] });
+  assert.deepEqual(result.fields.map(field => [field.id, field.label, field.presentation]), [
+    ['prompt', '我的提示词', 'control'], ['model', '我的模型', 'port'], ['video', undefined, 'port'],
+  ]);
+  assert.deepEqual(result.output_nodes, ['out']);
+  assert.deepEqual(result.rebindings, {});
+  assert.deepEqual(result.output_rebindings, {});
+  assert.deepEqual({ fields, previousFields }, original);
+  assert.deepEqual(previousValues, { prompt: 'outer value' });
+  assert.deepEqual(previousBaseline, { prompt: 'baseline value' });
+});
+
+test('automatic first interface exposes common controls and keeps required media without other clutter', () => {
+  const result = autoEditorInterfaceSelection({ fields: [
+    { id: 'prompt', type: 'text', input: 'text' },
+    { id: 'model', type: 'text', input: 'ckpt_name' },
+    { id: 'seed', type: 'integer', input: 'seed' },
+    { id: 'audio', type: 'audio', input: 'audio', presentation: 'port' },
+    { id: 'image', type: 'image', input: 'image' },
+    { id: 'video', type: 'video', input: 'video' },
+    { id: 'misc', type: 'text', input: 'custom_option' },
+  ], outputs: [{ id: 'out', mediaType: 'image' }] });
+  assert.deepEqual(result.fields.map(field => [field.id, field.presentation]), [
+    ['prompt', 'port'], ['model', 'control'], ['seed', 'control'], ['audio', 'port'], ['image', 'port'], ['video', 'port'],
+  ]);
+  for (const type of ['text', 'STRING', 'image', 'VIDEO', 'audio', 'AUDIO']) assert.equal(editorFieldSupportsPort({ type }), true);
+  for (const type of ['integer', 'number', 'boolean', 'COMBO']) assert.equal(editorFieldSupportsPort({ type }), false);
+});
+
+test('automatic selection requires manual review instead of truncating controls or guessing rebindings', () => {
+  const outputs = [{ id: 'out', mediaType: 'image' }];
+  const fields = [{ id: 'live', type: 'text', input: 'text' }];
+  assert.equal(autoEditorInterfaceSelection({ fields }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs: Array.from({ length: 65 }, (_, i) => ({ id: `out-${i}` })) }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs: Array.from({ length: 64 }, (_, i) => ({ id: `out-${i}` })) }).output_nodes.length, 64);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs, selectedOutputs: ['removed'] }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs, previousFields: [{ id: 'gone', type: 'text' }] }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs, previousFields: [{ id: 'live', type: 'integer' }] }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs,
+    connections: [{ direction: 'input', fieldId: 'gone', type: 'text' }] }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs,
+    connections: [{ direction: 'output', outputId: 'gone', mediaType: 'image' }] }), null);
+  assert.equal(autoEditorInterfaceSelection({ fields, outputs,
+    selectedOutputs: [{ id: 'out', mediaType: 'video' }],
+    connections: [{ direction: 'output', outputId: 'out', mediaType: 'video' }] }), null);
+  assert.equal(autoEditorInterfaceSelection({ outputs,
+    fields: Array.from({ length: 65 }, (_, i) => ({ id: `seed-${i}`, input: 'seed', type: 'integer' })) }).fields.length, 64);
+  assert.equal(autoEditorInterfaceSelection({ outputs,
+    fields: Array.from({ length: 65 }, (_, i) => ({ id: `video-${i}`, type: 'video' })) }).fields.length, 65);
+  assert.equal(autoEditorInterfaceSelection({ outputs,
+    fields: Array.from({ length: 4097 }, (_, i) => ({ id: `custom-${i}`, type: 'boolean', input: 'custom' })) }), null);
 });
 
 test('keeps prior selection without auto-expansion and drops a field whose type changed', () => {

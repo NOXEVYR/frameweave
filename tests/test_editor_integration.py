@@ -3,12 +3,15 @@
 import copy
 import http.client
 import json
+import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from frameweave.server import App, make_server
+from frameweave.packages import apply_editor_values
 from test_service import MockComfy
 
 
@@ -199,6 +202,19 @@ class EditorIntegrationTests(unittest.TestCase):
                              for call in self.backend.calls))
         self.assertEqual(self.backend.next_id, 0)
 
+    def test_editor_import_and_inspect_report_specific_unsafe_integer(self):
+        document = editor_document()
+        document['nodes'][0]['widgets_values'] = [{'image_hash': 492469318636598500}]
+        source = json.dumps(document)
+        for route in ('/api/editor-workflows/inspect', '/api/editor-workflows'):
+            status, _, response = self.post(route, {'name': 'Invalid fixture', 'document': document, 'source_json': source})
+            self.assertEqual(status, 400, response)
+            self.assertIn('浏览器的精确范围', response['error'])
+            self.assertIn('原文件未修改', response['error'])
+            self.assertNotIn('492469318636598500', response['error'])
+        self.assertFalse(self.app.editor_workflows.directory.exists())
+        self.assertEqual(self.backend.next_id, 0)
+
     def test_draft_revision_conflicts_and_identical_document_is_a_noop(self):
         document = editor_document()
         source = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
@@ -258,7 +274,8 @@ class EditorIntegrationTests(unittest.TestCase):
         invalid["2"]["class_type"] = "NotInstalled"
         status, _, rejected = self.post(
             f"/api/editor-workflows/{ident}/apply",
-            {"session_id": session_id, "document": document, "prompt": invalid})
+            {"session_id": session_id, "document": document, "prompt": invalid,
+             "output_nodes": ["2"]})
         self.assertEqual(status, 400, rejected)
         self.assertFalse(self.app.packages.list())
         self.assertFalse(any(call[:2] == ("POST", "/prompt")
@@ -308,9 +325,11 @@ class EditorIntegrationTests(unittest.TestCase):
             "values": applied["values"], "editor_backend": self.backend.url,
             "output_nodes": applied["output_nodes"],
         })
-        self.assertEqual(resolved, {"kind": "api", "prompt": {
+        self.assertEqual({key: resolved[key] for key in ('kind', 'prompt')}, {"kind": "api", "prompt": {
             "1": prompt["1"], "2": prompt["2"],
         }})
+        self.assertEqual(resolved['execution']['selected_outputs'], ['2'])
+        self.assertEqual(resolved['execution']['ignored_node_ids'], ['3'])
 
         status, _, generated = self.post("/api/generate", {
             "request_id": "editor-flow-generate-01",
@@ -504,6 +523,136 @@ class EditorIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 200, accepted)
         self.assertFalse(accepted.get("requires_resolution", False))
         self.assertEqual(accepted["values"][configured_seed], 22)
+
+    def _transaction_fixture(self):
+        document = editor_document()
+        status, _, imported = self.import_document(
+            document=document, source_json=json.dumps(document, ensure_ascii=False, indent=3))
+        self.assertEqual(status, 200, imported)
+        ident = imported['id']
+        status, _, session = self.post(f'/api/editor-workflows/{ident}/session')
+        self.assertEqual(status, 200, session)
+        payload = {'session_id': session['session_id'], 'document': document,
+                   'prompt': compiled_prompt(), 'output_nodes': ['2']}
+        status, _, applied = self.post(f'/api/editor-workflows/{ident}/apply', payload)
+        self.assertEqual(status, 200, applied)
+        package = applied['package']
+        self.app.packages.update_metadata(package['id'], {'favorite': True, 'archived': True})
+        # Preserve noncanonical but equivalent stored JSON exactly as well as ID.
+        package_path = self.app.packages._path(package['id'])
+        package_path.write_text(json.dumps(json.loads(package_path.read_bytes()),
+                                           ensure_ascii=False, indent=3), encoding='utf-8')
+        record_dir = self.app.editor_workflows.directory / ident
+        before = {
+            'meta': (record_dir / 'meta.json').read_bytes(),
+            'source': self.app.editor_workflows.export(ident),
+            'compiled': self.app.editor_workflows.get_compiled(ident),
+            'packages': {path.name: path.read_bytes()
+                         for path in self.app.packages.directory.glob('*.json')},
+        }
+        modified = copy.deepcopy(document)
+        modified['nodes'][1]['widgets_values'] = ['Keep the edited note']
+        return ident, payload, {**payload, 'document': modified, 'prompt': compiled_prompt(seed=42),
+                                'base_revision': applied['workflow']['revision']}, before
+
+    def _assert_transaction_preserved(self, ident, before):
+        record_dir = self.app.editor_workflows.directory / ident
+        self.assertEqual((record_dir / 'meta.json').read_bytes(), before['meta'])
+        self.assertEqual(self.app.editor_workflows.export(ident), before['source'])
+        self.assertEqual(self.app.editor_workflows.get_compiled(ident), before['compiled'])
+        self.assertEqual({path.name: path.read_bytes()
+                          for path in self.app.packages.directory.glob('*.json')}, before['packages'])
+        self.assertEqual(list(self.app.packages.directory.glob('.editor-package-*')), [])
+        self.assertEqual(list(record_dir.glob('.apply-meta-*')), [])
+        self.assertFalse(any(call[:2] == ('POST', '/prompt') for call in self.backend.calls))
+
+    def test_native_apply_stage_and_revision_failures_preserve_both_stores(self):
+        ident, original, payload, before = self._transaction_fixture()
+        store = self.app.editor_workflows
+        real_write = store._write_new_atomic
+
+        def compiled_failure(path, raw):
+            if path.parent.name == 'compiled':
+                raise OSError('injected compiled write failure')
+            return real_write(path, raw)
+
+        cases = [
+            ('package stage', patch('frameweave.server.os.fsync',
+                                    side_effect=OSError('injected stage write failure'))),
+            ('save revision', patch.object(store, 'save_revision',
+                                          side_effect=OSError('injected revision write failure'))),
+            ('compiled file', patch.object(store, '_write_new_atomic', side_effect=compiled_failure)),
+            ('meta commit', patch.object(store, '_write_atomic',
+                                        side_effect=OSError('injected meta commit failure'))),
+        ]
+        for name, failure in cases:
+            with self.subTest(failure=name), failure:
+                status, _, result = self.post(f'/api/editor-workflows/{ident}/apply', payload)
+            self.assertEqual(status, 502, result)
+            self._assert_transaction_preserved(ident, before)
+        # An already installed package may be shared by other canvases. Failure
+        # while reusing it must preserve raw bytes, content ID and organization.
+        with patch.object(store, 'save_revision', side_effect=OSError('reuse failed')):
+            status, _, result = self.post(f'/api/editor-workflows/{ident}/apply', original)
+        self.assertEqual(status, 502, result)
+        self._assert_transaction_preserved(ident, before)
+
+    def test_native_apply_package_publish_failure_restores_exact_visible_revision(self):
+        ident, _, payload, before = self._transaction_fixture()
+        real_link = os.link
+
+        def publish_failure(source, target):
+            if Path(target).name.startswith('p-'):
+                raise OSError('injected package publication failure')
+            return real_link(source, target)
+
+        with patch('frameweave.server.os.link', side_effect=publish_failure):
+            status, _, result = self.post(f'/api/editor-workflows/{ident}/apply', payload)
+        self.assertEqual(status, 502, result)
+        self._assert_transaction_preserved(ident, before)
+        # Failed immutable revisions can remain on disk. Retry skips them and
+        # commits a usable package and the complete editor graph.
+        status, _, applied = self.post(f'/api/editor-workflows/{ident}/apply', payload)
+        self.assertEqual(status, 200, applied)
+        self.assertGreater(applied['workflow']['revision'], payload['base_revision'])
+        self.assertEqual(self.app.editor_workflows.get(ident)['document'], payload['document'])
+        self.assertEqual(self.app.editor_workflows.get_compiled(ident)['prompt'], payload['prompt'])
+        self.assertEqual(apply_editor_values(self.app.packages.get(applied['package']['id']),
+                                            applied['baseline']), payload['prompt'])
+        for name, raw in before['packages'].items():
+            self.assertEqual((self.app.packages.directory / name).read_bytes(), raw)
+
+    def test_native_apply_reports_and_keeps_original_meta_if_rollback_also_fails(self):
+        ident, _, payload, before = self._transaction_fixture()
+        real_link, real_replace = os.link, os.replace
+
+        def publish_failure(source, target):
+            if Path(target).name.startswith('p-'):
+                raise OSError('injected package publication failure')
+            return real_link(source, target)
+
+        def rollback_failure(source, target):
+            if Path(source).suffix == '.backup':
+                raise OSError('injected rollback failure')
+            return real_replace(source, target)
+
+        with patch('frameweave.server.os.link', side_effect=publish_failure), \
+                patch('frameweave.editor_workflows.os.replace', side_effect=rollback_failure):
+            status, _, result = self.post(f'/api/editor-workflows/{ident}/apply', payload)
+        self.assertEqual(status, 502, result)
+        self.assertIn('publication failure', result['error'])
+        self.assertIn('rollback failure', result['error'])
+        self.assertIn('原meta完整备份已保留', result['error'])
+        record_dir = self.app.editor_workflows.directory / ident
+        backups = list(record_dir.glob('.apply-meta-*.backup'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before['meta'])
+        self.assertEqual({path.name: path.read_bytes()
+                          for path in self.app.packages.directory.glob('*.json')}, before['packages'])
+        # Recover using the retained exact metadata; original immutable files
+        # remain intact even when the first restore operation was refused.
+        real_replace(backups[0], record_dir / 'meta.json')
+        self._assert_transaction_preserved(ident, before)
 
     def test_configure_rebinding_requires_resolution_before_package_or_revision_write(self):
         document = editor_document()

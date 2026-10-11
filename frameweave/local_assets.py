@@ -10,8 +10,11 @@ import tempfile
 import threading
 from pathlib import Path
 
+from .media_contract import AUDIO_MIMES, MAX_AUDIO_BYTES, audio_header_info, audio_content_info
+
 
 MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_LOCAL_AUDIO_BYTES = MAX_AUDIO_BYTES
 MAX_LOCAL_VIDEO_BYTES = 200 * 1024 * 1024
 MAX_LOCAL_MEDIA_BYTES = MAX_LOCAL_VIDEO_BYTES
 _ASSET_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -136,7 +139,10 @@ def _media_info(head, tail, length):
         raise ValueError("MP4/MOV brand 不受支持")
     if length >= 16 and _is_webm_header(head):
         return "video", "video/webm", ".webm"
-    raise ValueError("本地媒体仅支持 PNG、JPEG、WebP、MP4、WebM 或 MOV")
+    audio = audio_header_info(head, length, max_bytes=MAX_LOCAL_AUDIO_BYTES)
+    if audio is not None:
+        return "audio", *audio
+    raise ValueError("本地媒体仅支持 PNG、JPEG、WebP、MP4、WebM、MOV、WAV、MP3、FLAC 或 OGG")
 
 
 class LocalImageAssets:
@@ -247,7 +253,7 @@ class LocalImageAssets:
 
 
 class LocalMediaAssets:
-    """Content-addressed image/video store that can stream bounded HTTP bodies."""
+    """Content-addressed image/video/audio store for bounded HTTP bodies."""
 
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir).resolve()
@@ -288,7 +294,7 @@ class LocalMediaAssets:
                 raise ValueError("本地媒体大小无效")
             identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
             cached = self._verified.get(asset_id)
-            if cached is None or cached[0] != identity:
+            if cached is None or cached[0] != identity or cached[1] == "audio":
                 digest = hashlib.sha256()
                 with os.fdopen(os.dup(descriptor), "rb") as stream:
                     head = stream.read(4096)
@@ -298,6 +304,11 @@ class LocalMediaAssets:
                     while chunk := stream.read(1024 * 1024):
                         digest.update(chunk)
                 media_type, mime, extension = _media_info(head, tail, opened.st_size)
+                if media_type == "audio":
+                    with os.fdopen(os.dup(descriptor), "rb") as stream:
+                        stream.seek(0)
+                        content = stream.read(MAX_LOCAL_AUDIO_BYTES + 1)
+                    audio_content_info(content, max_bytes=MAX_LOCAL_AUDIO_BYTES)
                 if digest.hexdigest() != asset_id:
                     raise ValueError("本地媒体内容校验失败")
                 cached = (identity, media_type, mime, extension)
@@ -312,8 +323,10 @@ class LocalMediaAssets:
         if type(content_length) is not int or not 8 <= content_length <= MAX_LOCAL_MEDIA_BYTES:
             raise ValueError("本地媒体须在 8 字节到 200 MiB 之间")
         if not isinstance(content_type, str) or content_type.lower() not in {
-                "image/png", "image/jpeg", "image/webp", "video/mp4", "video/webm", "video/quicktime"}:
+                "image/png", "image/jpeg", "image/webp", "video/mp4", "video/webm", "video/quicktime", *AUDIO_MIMES}:
             raise ValueError("本地媒体 Content-Type 不受支持")
+        if content_type.lower() in AUDIO_MIMES and content_length > MAX_LOCAL_AUDIO_BYTES:
+            raise ValueError("参考音频须不超过 20 MiB")
         _display_filename(name, ".bin")  # Validate presentation metadata before consuming the body.
         with self._lock:
             root = self._checked_root(create=True)
@@ -328,10 +341,11 @@ class LocalMediaAssets:
                 with os.fdopen(descriptor, "wb") as stream:
                     descriptor = None
                     while remaining:
-                        chunk = source.read(min(128 * 1024, remaining))
+                        limit = min(128 * 1024, remaining)
+                        chunk = source.read(limit)
                         if not chunk:
                             raise ValueError("本地媒体请求正文不完整")
-                        if not isinstance(chunk, bytes) or len(chunk) > remaining:
+                        if not isinstance(chunk, bytes) or len(chunk) > limit:
                             raise ValueError("本地媒体请求正文无效")
                         stream.write(chunk)
                         digest.update(chunk)
@@ -343,6 +357,10 @@ class LocalMediaAssets:
                     stream.seek(-min(content_length, 32), os.SEEK_END)
                     tail = stream.read(32)
                 media_type, mime, extension = _media_info(head, tail, content_length)
+                if media_type == "audio":
+                    with temporary.open("rb") as stream:
+                        audio_content_info(stream.read(MAX_LOCAL_AUDIO_BYTES + 1),
+                                           max_bytes=MAX_LOCAL_AUDIO_BYTES)
                 if content_type.lower() != mime:
                     raise ValueError("媒体 Content-Type 与文件签名不一致")
                 filename = _display_filename(name, extension)

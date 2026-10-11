@@ -1,5 +1,14 @@
 import { executionOrder, validateExecutionMediaBackends } from './graph.mjs';
 
+/** Before planning, only explicit roots can choose an engine. */
+export function workflowRootBackendTarget(graph, targets, currentBackend) {
+  const nodes = targets.map(id => graph.nodes.find(node => node.id === id && node.type === 'generation'));
+  if (!nodes.length || nodes.some(node => !node)) throw new Error('请选择有效的生成节点');
+  const required = new Set(nodes.map(node => node.data.editor_backend).filter(Boolean));
+  if (required.size > 1) throw new Error('所选生成节点绑定了多个推理引擎，请分别运行或应用到同一引擎。');
+  return [...required][0] || currentBackend;
+}
+
 export function runBackend(graph, targets) {
   const required = new Set(executionOrder(graph, targets).map(id =>
     graph.nodes.find(node => node.id === id)?.data.editor_backend).filter(Boolean));

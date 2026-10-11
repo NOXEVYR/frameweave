@@ -9,11 +9,14 @@ import re
 import tempfile
 import threading
 import time
+import stat
+from itertools import islice
 from collections import deque
 from pathlib import Path
 
 from .diagnostics import safe_relative
-from .workflows import _check_json_limits, _expanded_inputs, _spec
+from .media_contract import MEDIA_TYPES, media_input_contract
+from .workflows import _check_json_limits, _expanded_inputs, _spec, api_carriers_equal
 
 FORMAT = "frameweave-workflow"
 MAX_BYTES = 2 * 1024 * 1024
@@ -24,7 +27,8 @@ MODEL_INPUTS = {"ckpt_name", "unet_name", "clip_name", "vae_name", "lora_name", 
 PACKAGE_ID = re.compile(r"p-[0-9a-f]{24}\Z")
 METADATA_FIELDS = {"favorite", "archived"}
 MAX_METADATA_BYTES = 64 * 1024
-MAX_INSPECTION_FIELDS = 4096
+MAX_INTERFACE_FIELDS = 4096
+MAX_INSPECTION_FIELDS = MAX_INTERFACE_FIELDS
 
 
 def encoded(value):
@@ -90,6 +94,20 @@ def transport_document(payload, *, allow_bare=False):
     return payload["document"]
 
 
+def api_prompt(document, *, _depth=0):
+    """Read API carriers without confusing real prompt/workflow node IDs."""
+    if not isinstance(document, dict) or _depth > 32:
+        raise ValueError("API 工作流载体须为对象，且不能嵌套过深")
+    if document and all(isinstance(node, dict) and isinstance(node.get("class_type"), str)
+                        and isinstance(node.get("inputs"), dict) for node in document.values()):
+        return document
+    carriers = [api_prompt(document[key], _depth=_depth + 1)
+                for key in ("prompt", "workflow") if key in document]
+    if len(carriers) == 2 and not api_carriers_equal(carriers[0], carriers[1]):
+        raise ValueError("prompt 与 workflow 载体冲突，请只保留明确导出的一个 API 工作流载体")
+    return carriers[0] if carriers else document
+
+
 def text(value, label, maximum, empty=False):
     if not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip()):
         raise ValueError(f"{label}须为不超过 {maximum} 字符的文本")
@@ -100,7 +118,13 @@ def is_link(value):
     return isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and type(value[1]) is int
 
 
-def normalize_prompt(prompt):
+def normalize_prompt(prompt, *, check_dependencies=True):
+    """Normalize bounded API data; topology is checked on execution graphs.
+
+    The default retains the historical full-graph topology check. Portable
+    source documents may keep unfinished islands by opting out, but must still
+    pass every JSON, node shape, identifier and input-name check.
+    """
     encoded(prompt)
     if not isinstance(prompt, dict) or not 1 <= len(prompt) <= 1000:
         raise ValueError("请导入包含 1–1000 个节点的 ComfyUI API 工作流")
@@ -114,15 +138,19 @@ def normalize_prompt(prompt):
             raise ValueError("API 节点需要有效 ID、class_type 和 inputs 对象")
         node_type = text(node.get("class_type"), "节点类型", 256)
         inputs = copy.deepcopy(node["inputs"])
-        if any(key in RESERVED or not key or len(key) > 256 for key in inputs):
+        if any(not isinstance(key, str) or key in RESERVED or not key or len(key) > 256 for key in inputs):
             raise ValueError("节点输入名称无效")
         result[node_id] = {"class_type": node_type, "inputs": inputs}
         dependencies[node_id] = set()
+        if not check_dependencies:
+            continue
         for value in inputs.values():
             if is_link(value):
                 if value[0] not in prompt or value[1] < 0:
                     raise ValueError("工作流连接到不存在的节点或无效输出插槽")
                 dependencies[node_id].add(value[0])
+    if not check_dependencies:
+        return result
     pending = deque((node_id, 1) for node_id, deps in dependencies.items() if not deps)
     levels, count = {}, 0
     downstream = {key: [] for key in result}
@@ -150,7 +178,7 @@ def scalar(value):
             and (type(value) is not float or math.isfinite(value)))
 
 
-def validate_value(field, value, *, template=False):
+def validate_value(field, value, *, template=False, editing_enum_preservation=False):
     kind, label = field["type"], field["label"]
     if kind in {"text", "image", "audio", "video"}:
         if not isinstance(value, str) or len(value) > (1024 if kind in {"image", "audio", "video"} else 64000):
@@ -171,14 +199,31 @@ def validate_value(field, value, *, template=False):
         if ("min" in field and value < field["min"]) or ("max" in field and value > field["max"]):
             raise ValueError(f"{label} 超出工作流包允许的范围")
     elif kind == "select":
-        if not any(type(value) is type(option) and value == option for option in field["options"]):
+        # JSON has one number type; browser transport can serialize 1.0 as 1.
+        # Keep booleans distinct and reject unsafe/nonfinite numeric options.
+        def safe_option(candidate):
+            return scalar(candidate) and (type(candidate) not in (int, float)
+                                          or abs(candidate) <= 9007199254740991)
+
+        # Explicitly preserving an editor's existing literal is not evidence
+        # that the current backend can execute it. Do not overload template:
+        # required-value deferral must never relax enum membership globally.
+        if editing_enum_preservation:
+            if not safe_option(value) or isinstance(value, str) and len(value) > 64000:
+                raise ValueError(f"{label} 的原始下拉值不是安全基础值")
+            if field.get("role") in {"model", "encoder", "lora"} and isinstance(value, str) and value:
+                safe_relative(value)
+            return value
+        if not safe_option(value) or not any(
+                safe_option(option) and api_carriers_equal(value, option)
+                for option in field["options"]):
             raise ValueError(f"{label} 不在可选值中")
     return value
 
 
 def normalize_fields(fields, prompt):
-    if not isinstance(fields, list) or len(fields) > 64:
-        raise ValueError("工作流包最多开放 64 个输入参数")
+    if not isinstance(fields, list) or len(fields) > MAX_INTERFACE_FIELDS:
+        raise ValueError(f"工作流包最多开放 {MAX_INTERFACE_FIELDS} 个输入参数")
     result, ids, bindings = [], set(), set()
     for item in fields:
         if not isinstance(item, dict):
@@ -194,15 +239,26 @@ def normalize_fields(fields, prompt):
         kind = item.get("type")
         if not isinstance(kind, str) or kind not in TYPES:
             raise ValueError("工作流包不支持此参数类型")
-        if kind == "video" and _MEDIA_INPUTS.get("video", {}).get(prompt[node_id]["class_type"]) != name:
-            raise ValueError("视频参数只能绑定到 LoadVideo.file 或 VHS_LoadVideo.video")
         field = {"id": field_id, "label": text(item.get("label"), "参数名称", 120),
                  "node_id": node_id, "input": name, "type": kind,
                  "required": item.get("required", kind in {"image", "audio", "video"}) is True}
+        # Optional display metadata is preserved only when supplied. Inserting
+        # defaults into old packages would change their content-addressed ID.
+        if "presentation" in item:
+            if item["presentation"] not in ("port", "control"):
+                raise ValueError("参数展示方式须为 port 或 control")
+            field["presentation"] = item["presentation"]
+        if "role" in item:
+            role = item["role"]
+            if not isinstance(role, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", role):
+                raise ValueError("参数角色须为最多 64 字符的小写标识")
+            field["role"] = role
+        if "group" in item:
+            field["group"] = text(item["group"], "参数分组", 80)
         if kind == "select":
             options = item.get("options")
-            if not isinstance(options, list) or not 1 <= len(options) <= 512 or any(not scalar(v) or (isinstance(v, str) and len(v) > 2048) for v in options):
-                raise ValueError("下拉选项须为 1–512 个基础值")
+            if not isinstance(options, list) or len(options) > 512 or any(not scalar(v) or (isinstance(v, str) and len(v) > 2048) for v in options):
+                raise ValueError("下拉选项须为 0–512 个基础值")
             field["options"] = copy.deepcopy(options)
         if kind in {"integer", "number"}:
             for bound in ("min", "max"):
@@ -215,9 +271,13 @@ def normalize_fields(fields, prompt):
                 raise ValueError("数值下限不能大于上限")
         default = item.get("default", prompt[node_id]["inputs"][name])
         if kind in {"image", "audio", "video"}:
-            default, field["required"] = "", True
+            default = ""
             prompt[node_id]["inputs"][name] = ""
-        field["default"] = validate_value(field, default, template=True)
+        empty_enum = kind == "select" and not field["options"]
+        if empty_enum and not api_carriers_equal(default, prompt[node_id]["inputs"][name]):
+            raise ValueError("空下拉目录的默认值必须保留原始节点字面值")
+        field["default"] = validate_value(field, default, template=True,
+                                         editing_enum_preservation=empty_enum)
         result.append(field)
         ids.add(field_id)
         bindings.add((node_id, name))
@@ -230,7 +290,7 @@ def normalize_document(document):
         raise ValueError("工作流包须为 JSON 对象")
     if document.get("format", FORMAT) != FORMAT or document.get("version", 1) != 1:
         raise ValueError("工作流包格式或版本不支持")
-    prompt = normalize_prompt(document.get("prompt"))
+    prompt = normalize_prompt(document.get("prompt"), check_dependencies=False)
     fields = normalize_fields(document.get("fields", []), prompt)
     for node_id, node in prompt.items():
         if node["class_type"] in {"LoadImage", "LoadImageMask"} and "image" in node["inputs"]:
@@ -269,16 +329,27 @@ def _limit_inspection_fields(fields, field_limit):
     return [field for field in fields if field['id'] in keep]
 
 
-def inspect_document(document, info=None, *, field_limit=64):
+def validate_inspection_result(result):
+    """Bound the complete candidate response without trimming its authority."""
+    try:
+        encoded(result)
+    except ValueError as exc:
+        if "2 MiB" in str(exc):
+            raise ValueError("接口检查结果（含候选默认值/选项）超过 2 MiB；原始工作流仍可编辑或导出，请缩减外部接口数据") from None
+        raise
+    return result
+
+
+def inspect_document(document, info=None, *, field_limit=None, check_dependencies=True):
     encoded(document)
     if not isinstance(document, dict):
         raise ValueError("请导入 JSON 工作流对象")
     if "format" in document or "fields" in document:
         result = normalize_document(document)
         fields = [{**field, "recommended": True} for field in result["fields"]]
-        return {**result, "fields": _limit_inspection_fields(fields, field_limit)}
-    source = document.get("prompt", document)
-    prompt = normalize_prompt(source)
+        return validate_inspection_result({**result, "fields": _limit_inspection_fields(fields, field_limit)})
+    source = api_prompt(document)
+    prompt = normalize_prompt(source, check_dependencies=check_dependencies)
     fields, info = [], info or {}
     labels = {"text": "提示词", "prompt": "画面提示词", "positive": "正向提示词", "negative": "负向提示词", "seed": "随机种子",
               "noise_seed": "随机种子", "steps": "采样步数", "cfg": "提示词引导", "width": "宽度",
@@ -292,7 +363,7 @@ def inspect_document(document, info=None, *, field_limit=64):
                 polarity[link[0]] = labels[key]
     for node_id, node in prompt.items():
         schema = info.get(node["class_type"], {})
-        specs, _ = _expanded_inputs(schema, node["inputs"]) if isinstance(schema, dict) else ({}, set())
+        specs, required = _expanded_inputs(schema, node["inputs"]) if isinstance(schema, dict) else ({}, set())
         for name, value in node["inputs"].items():
             if not scalar(value) or (type(value) is int and abs(value) > 9007199254740991):
                 continue
@@ -310,33 +381,30 @@ def inspect_document(document, info=None, *, field_limit=64):
                 options = [definition["key"] for definition in definitions]
             else:
                 options = spec if isinstance(spec, list) else meta.get("options") if spec == "COMBO" else None
-            if isinstance(options, list) and 1 <= len(options) <= 512 and all(scalar(v) for v in options):
+            if isinstance(options, list) and len(options) <= 512 and all(scalar(v) for v in options):
                 kind = "select"
-            if node["class_type"] in {"LoadImage", "LoadImageMask"} and name == "image":
-                kind, value = "image", ""
-                prompt[node_id]["inputs"][name] = ""
-            if node["class_type"] == "LoadVideo" and name == "file":
-                if schema and not _media_input_schema_supported(node["class_type"], name, schema, "video"):
-                    raise ValueError("当前后端 LoadVideo.file 未声明视频上传字段")
-                kind, value = "video", ""
-                prompt[node_id]["inputs"][name] = ""
-            if node["class_type"] == "VHS_LoadVideo" and name == "video":
-                if schema and not _media_input_schema_supported(node["class_type"], name, schema, "video"):
-                    raise ValueError("当前后端 VHS_LoadVideo.video 未声明视频上传字段")
-                kind, value = "video", ""
-                prompt[node_id]["inputs"][name] = ""
-            if meta.get("audio_upload") or (name == "audio" and (node["class_type"] == "LoadAudio" or "AUDIO" in schema.get("output", [])) and isinstance(value, str)):
-                kind, value = "audio", ""
+            contract = media_input_contract(node["class_type"], name, specs.get(name),
+                                            required=name in required)
+            media_type = contract["media_type"] if contract["supported"] else None
+            # Offline inspection retains historical draft recognition only.
+            # Live execution and upload never use this schema-free fallback.
+            if node["class_type"] not in info:
+                media_type = _OFFLINE_MEDIA_INPUTS.get((node["class_type"], name))
+            if media_type is not None:
+                kind, value = media_type, ""
                 prompt[node_id]["inputs"][name] = ""
             label = polarity.get(node_id, labels.get(name, name)) if name == "text" else labels.get(name, name)
             field = {"id": "f_" + hashlib.sha256((node_id + "\0" + name).encode()).hexdigest()[:16],
                      "label": f"{label} · {node_id}", "node_id": node_id, "input": name,
-                     "type": kind, "default": value, "required": kind in {"image", "audio", "video"},
-                     "recommended": name in labels and name not in MODEL_INPUTS}
+                     "type": kind, "default": value,
+                     "required": kind in {"image", "audio", "video"} and (name not in specs or name in required),
+                     "recommended": kind in MEDIA_TYPES or name in labels and name not in MODEL_INPUTS}
             if kind == "select":
                 field["options"] = options
-                if value not in options and not dynamic_combo:
+                if options and value not in options and not dynamic_combo:
                     field["options"] = [value, *options][:512]
+                if not options:
+                    validate_value(field, value, editing_enum_preservation=True)
             if kind in {"integer", "number"}:
                 for bound in ("min", "max"):
                     if type(meta.get(bound)) in (int, float):
@@ -345,45 +413,33 @@ def inspect_document(document, info=None, *, field_limit=64):
                             field[bound] = clamped
             fields.append(field)
     fields = _limit_inspection_fields(fields, field_limit)
-    return {"name": "我的生成工作流", "description": "", "prompt": prompt, "fields": fields,
-            "requirements": {"nodes": sorted({node["class_type"] for node in prompt.values()})}}
+    return validate_inspection_result({"name": "我的生成工作流", "description": "", "prompt": prompt, "fields": fields,
+                                      "requirements": {"nodes": sorted({node["class_type"] for node in prompt.values()})}})
 
 
-_MEDIA_INPUTS = {
-    "image": {"LoadImage": "image", "LoadImageMask": "image"},
-    "video": {"LoadVideo": "file", "VHS_LoadVideo": "video"},
-}
+_OFFLINE_MEDIA_INPUTS = {("LoadImage", "image"): "image",
+                        ("LoadImageMask", "image"): "image",
+                        ("LoadAudio", "audio"): "audio",
+                        ("LoadVideo", "file"): "video",
+                        ("VHS_LoadVideo", "video"): "video"}
 
 
-def _media_input_schema_supported(node_type, input_name, schema, media_type):
-    """Return whether a known file-loader widget is declared by live object_info."""
-    if _MEDIA_INPUTS.get(media_type, {}).get(node_type) != input_name or not isinstance(schema, dict):
-        return False
-    groups = schema.get("input")
-    if not isinstance(groups, dict):
-        return False
-    definition = next((groups.get(group, {}).get(input_name) for group in ("required", "optional")
-                      if isinstance(groups.get(group), dict) and input_name in groups[group]), None)
-    if definition is None:
+def _media_input_schema_supported(node_type, input_name, schema, media_type, *, values=None):
+    """Check the expanded live standard filename contract, including audio."""
+    if media_type not in MEDIA_TYPES or not isinstance(schema, dict):
         return False
     try:
-        kind, meta = _spec(definition)
+        specs, required = _expanded_inputs(schema, values or {})
     except ValueError:
         return False
-    if media_type == "video" and node_type == "LoadVideo":
-        return kind == "COMBO" and meta.get("video_upload") is True
-    if media_type == "video" and node_type == "VHS_LoadVideo":
-        return ((kind == "COMBO" and meta.get("video_upload") is True)
-                or isinstance(kind, list) and all(isinstance(value, str) for value in kind))
-    if media_type == "image":
-        return ((kind == "COMBO" and meta.get("image_upload") is True)
-                or isinstance(kind, list) and all(isinstance(value, str) for value in kind))
-    return False
+    contract = media_input_contract(node_type, input_name, specs.get(input_name),
+                                    required=input_name in required)
+    return contract["supported"] and contract["media_type"] == media_type
 
 
-def validate_package_media_field(package, field_id, info, media_type):
+def validate_package_media_field(package, field_id, info, media_type, *, values=None):
     """Resolve a stored package field against its node and the current live schema."""
-    if media_type not in _MEDIA_INPUTS or not isinstance(info, dict):
+    if media_type not in MEDIA_TYPES or not isinstance(info, dict):
         raise ValueError("媒体类型或当前后端节点信息无效")
     normalized = normalize_document(package)
     field = next((item for item in normalized["fields"] if item["id"] == field_id), None)
@@ -392,28 +448,126 @@ def validate_package_media_field(package, field_id, info, media_type):
     node = normalized["prompt"][field["node_id"]]
     node_type = node["class_type"]
     schema = info.get(node_type)
+    live_values = (apply_editor_values(package, values)[field["node_id"]]["inputs"]
+                   if values is not None else node["inputs"])
     if (node["inputs"].get(field["input"]) != ""
-            or not _media_input_schema_supported(node_type, field["input"], schema, media_type)):
+            or not _media_input_schema_supported(node_type, field["input"], schema, media_type,
+                                                 values=live_values)):
         raise ValueError("当前工作流包字段未绑定到后端声明的兼容媒体上传节点")
     return field, node
 
 
-def apply_values(document, values):
+def apply_values(document, values, *, active_nodes=None):
+    """Apply safe package values, requiring only fields in an execution closure.
+
+    Callers must compute active_nodes from validated output ancestry. This
+    changes only empty required-value checks, never IDs, types, ranges, enums
+    or relative-path checks, and never mutates the saved source document.
+    """
+    return _apply_values(document, values, editing=False, active_nodes=active_nodes)
+
+
+def apply_editor_values(document, values):
+    """Build an editor view; media and unavailable enum literals may remain.
+
+    This does not certify execution readiness. Empty static enum directories
+    preserve safe literals; nonempty enums, ranges, paths and unknown keys
+    retain normal checks. Live editing preparation still rejects new invalid
+    values before any native control patch.
+    """
+    return _apply_values(document, values, editing=True)
+
+
+def apply_planning_values(document, values):
+    """Build a scope-only view, deferring empty text/media without inventing values.
+
+    All field IDs, types, bounds, options and paths retain their normal checks.
+    Empty optional media stays present for live schema validation; execution
+    applies its usual omission rules only when compiling the final request.
+    """
+    return _apply_values(document, values, editing=False, planning=True)
+
+
+def validate_planning_fields(fields, prompt, info, active_nodes):
+    """Check active stored bindings against expanded live input contracts."""
+    specs_by_node = {}
+    kinds = {"text": {"STRING"}, "integer": {"INT", "FLOAT"},
+             "number": {"FLOAT"}, "boolean": {"BOOLEAN"}}
+    for field in fields:
+        node_id, name = field["node_id"], field["input"]
+        if node_id not in active_nodes:
+            continue
+        node = prompt[node_id]
+        if node_id not in specs_by_node:
+            schema = info.get(node["class_type"])
+            if not isinstance(schema, dict):
+                raise ValueError(f"参数 {field['id']} 缺少当前后端节点定义")
+            specs_by_node[node_id] = _expanded_inputs(schema, node["inputs"])
+        specs, required = specs_by_node[node_id]
+        if name not in specs:
+            raise ValueError(f"参数 {field['id']} 已不在当前动态输入接口中，请重新应用接口")
+        kind, meta = _spec(specs[name])
+        contract = media_input_contract(node["class_type"], name, specs[name],
+                                        required=name in required)
+        if field["type"] in MEDIA_TYPES:
+            compatible = contract["supported"] and contract["media_type"] == field["type"]
+        elif field["type"] == "select":
+            compatible = (isinstance(kind, list) or kind in {"COMBO", "COMFY_DYNAMICCOMBO_V3"}) and not contract["supported"]
+            if compatible:
+                options = kind if isinstance(kind, list) else meta.get("options", [])
+                if kind == "COMFY_DYNAMICCOMBO_V3":
+                    options = [option["key"] for option in options]
+                value = node["inputs"][name]
+                if not isinstance(options, list):
+                    raise ValueError(f"参数 {field['id']} 不在当前后端可选值中")
+                try:
+                    validate_value({**field, "options": options}, value)
+                except ValueError:
+                    raise ValueError(f"参数 {field['id']} 不在当前后端可选值中") from None
+        else:
+            compatible = isinstance(kind, str) and kind in kinds[field["type"]] and not contract["supported"]
+        if not compatible:
+            raise ValueError(f"参数 {field['id']} 与当前后端输入类型不兼容，请重新应用接口")
+
+
+def _apply_values(document, values, *, editing, active_nodes=None, planning=False):
     normalized = normalize_document(document)
     encoded(values)
     if not isinstance(values, dict) or set(values) - {field["id"] for field in normalized["fields"]}:
         raise ValueError("输入包含工作流包没有定义的参数")
+    if active_nodes is not None and (not isinstance(active_nodes, (set, frozenset))
+                                    or not active_nodes <= normalized["prompt"].keys()):
+        raise ValueError("执行节点范围无效")
     prompt = copy.deepcopy(normalized["prompt"])
     for field in normalized["fields"]:
-        value = validate_value(field, values.get(field["id"], field["default"]))
+        empty_enum = field["type"] == "select" and not field["options"]
+        preserve_enum = empty_enum and (editing or planning or
+                        active_nodes is not None and field["node_id"] not in active_nodes)
+        value = validate_value(field, values.get(field["id"], field["default"]),
+                               template=(planning or editing and field["type"] in {"image", "audio", "video"}
+                                         or active_nodes is not None and field["node_id"] not in active_nodes),
+                               editing_enum_preservation=preserve_enum)
+        # An unfilled optional upload means no input, not an empty filename.
+        # Execution still validates required inputs against the live schema,
+        # so package metadata cannot make an engine-required input optional.
+        if not editing and not planning and field["type"] in {"image", "audio", "video"} and not field["required"] and not value:
+            prompt[field["node_id"]]["inputs"].pop(field["input"], None)
+            continue
         prompt[field["node_id"]]["inputs"][field["input"]] = value
     return prompt
+
+
+def _stored_package_document(stored):
+    """Document view of a PackageStore-verified record, never external input."""
+    return {key: stored[key] for key in ("format", "version", "name", "description", "prompt", "fields")}
 
 
 class PackageStore:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.lock = threading.RLock()
+        # Presentation only. Detail, export and execution never consult this cache.
+        self._summary_cache = {}
 
     def _path(self, package_id):
         if not isinstance(package_id, str) or not PACKAGE_ID.fullmatch(package_id):
@@ -523,8 +677,128 @@ class PackageStore:
                     continue
         return sorted(packages, key=lambda item: item["updated_at"], reverse=True)
 
+    @staticmethod
+    def _summary_identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    @staticmethod
+    def _summary_row(document, package_id, modified):
+        """Bound presentation data; this is deliberately not an execution validator."""
+        if (not isinstance(document, dict) or document.get("format") != FORMAT
+                or type(document.get("version")) is not int or document["version"] != 1):
+            raise ValueError("工作流包摘要格式无效")
+        name = text(document.get("name"), "工作流包名称", 120)
+        description = text(document.get("description"), "说明", 2000, empty=True)
+        # Escaped lone surrogates parse as Python strings but cannot cross the
+        # UTF-8 HTTP boundary. One damaged display row must not break the list.
+        name.encode("utf-8")
+        description.encode("utf-8")
+        fields, prompt = document.get("fields"), document.get("prompt")
+        if not isinstance(fields, list) or len(fields) > MAX_INTERFACE_FIELDS:
+            raise ValueError("工作流包摘要参数数量无效")
+        if not isinstance(prompt, dict) or not 1 <= len(prompt) <= 1000:
+            raise ValueError("工作流包摘要节点数量无效")
+        for node_id, node in prompt.items():
+            if (not isinstance(node_id, str) or not 1 <= len(node_id) <= 100 or node_id in RESERVED
+                    or not isinstance(node, dict) or not isinstance(node.get("inputs"), dict)
+                    or any(not key or len(key) > 256 or key in RESERVED for key in node["inputs"])):
+                raise ValueError("工作流包摘要节点定义无效")
+            text(node.get("class_type"), "节点类型", 256)
+        media_types, ids, bindings = set(), set(), set()
+        for field in fields:
+            if (not isinstance(field, dict) or not isinstance(field.get("id"), str)
+                    or not ID.fullmatch(field["id"]) or field["id"] in RESERVED
+                    or field["id"] in ids or not isinstance(field.get("type"), str)
+                    or field["type"] not in TYPES):
+                raise ValueError("工作流包摘要参数定义无效")
+            ids.add(field["id"])
+            text(field.get("label"), "参数名称", 120)
+            node_id, input_name = field.get("node_id"), field.get("input")
+            if (not isinstance(node_id, str) or not isinstance(input_name, str) or node_id not in prompt
+                    or input_name not in prompt[node_id]["inputs"] or (node_id, input_name) in bindings
+                    or is_link(prompt[node_id]["inputs"][input_name])):
+                raise ValueError("工作流包摘要参数绑定无效")
+            bindings.add((node_id, input_name))
+            if field["type"] == "select":
+                options = field.get("options")
+                if (not isinstance(options, list) or not 1 <= len(options) <= 512
+                        or any(not scalar(value) or isinstance(value, str) and len(value) > 2048 for value in options)):
+                    raise ValueError("工作流包摘要选项数量或类型无效")
+            if field["type"] in MEDIA_TYPES:
+                media_types.add(field["type"])
+        return {"id": package_id, "name": name, "description": description,
+                "format": FORMAT, "version": 1, "created_at": modified, "updated_at": modified,
+                "summary": True, "field_count": len(fields), "node_count": len(prompt),
+                "media_types": sorted(media_types)}
+
+    def _read_summary(self, path, info, metadata):
+        identity = self._summary_identity(info)
+        cached = self._summary_cache.get(path.stem)
+        if cached is not None and cached[0] == identity:
+            return copy.deepcopy(cached[1])
+        with path.open("rb") as stream:
+            if self._summary_identity(os.fstat(stream.fileno())) != identity:
+                raise ValueError("工作流包在摘要读取期间已变化")
+            data = stream.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ValueError("工作流包文件超过大小上限")
+        if "p-" + hashlib.sha256(data).hexdigest()[:24] == path.stem:
+            def pairs(items):
+                result = {}
+                for key, value in items:
+                    if key in result:
+                        raise ValueError("工作流包 JSON 不能包含重复键")
+                    result[key] = value
+                return result
+
+            document = json.loads(data, object_pairs_hook=pairs,
+                                  parse_constant=lambda _: (_ for _ in ()).throw(ValueError("数字无效")))
+            _check_json_limits(document)
+            row = self._summary_row(document, path.stem, info.st_mtime)
+        else:
+            # Historical pretty/noncanonical sources are valid when the old
+            # normalized-content identity matches. Retain their bytes verbatim.
+            stored = self._get(path.stem, metadata)
+            row = self._summary_row(stored, path.stem, info.st_mtime)
+        if self._summary_identity(path.stat(follow_symlinks=False)) != identity:
+            raise ValueError("工作流包在摘要读取期间已变化")
+        self._summary_cache[path.stem] = (identity, copy.deepcopy(row))
+        return row
+
+    def list_summaries(self, *, refresh=False):
+        """Opt-in bounded sequential cold reads and cheap display-only warm reads."""
+        if type(refresh) is not bool:
+            raise ValueError("摘要刷新参数须为布尔值")
+        packages = []
+        with self.lock:
+            if refresh:
+                self._summary_cache.clear()
+            metadata = self._read_metadata()
+            paths = list(islice(self.directory.glob("p-*.json"), 200))
+            present = {path.stem for path in paths}
+            for ident in list(self._summary_cache):
+                if ident not in present:
+                    del self._summary_cache[ident]
+            for path in paths:
+                try:
+                    if not PACKAGE_ID.fullmatch(path.stem):
+                        raise ValueError("工作流包 ID 无效")
+                    info = path.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or not 1 <= info.st_size <= MAX_BYTES:
+                        raise ValueError("工作流包文件类型或大小无效")
+                    row = self._read_summary(path, info, metadata)
+                    row.update({key: metadata.get(path.stem, {}).get(key, False) for key in METADATA_FIELDS})
+                    packages.append(row)
+                except (ValueError, OSError, RecursionError):
+                    self._summary_cache.pop(path.stem, None)
+        return sorted(packages, key=lambda item: item["updated_at"], reverse=True)
+
     def export(self, package_id):
-        return normalize_document(self.get(package_id))
+        stored = self.get(package_id)
+        # get() already verifies the stored canonical content and ID. Runtime
+        # timestamps/organization metadata are not part of its document budget.
+        return normalize_document(_stored_package_document(stored))
 
     def export_transport(self, package_id):
         document = self.export(package_id)

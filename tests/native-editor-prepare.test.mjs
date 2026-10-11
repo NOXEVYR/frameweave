@@ -35,6 +35,7 @@ class MockElement {
   }
 
   setAttribute(name, value) { this.attributes[name] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
 
   addEventListener(name, callback, options = {}) {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
@@ -164,6 +165,7 @@ function harness({ backendChoice = BACKEND, sessionBackend = BACKEND, fields = [
     async applyInterface(...args) { calls.push({ kind: 'applyInterface', args }); return { applied: true }; },
     async applied(...args) { calls.push({ kind: 'applied', args }); },
     downloadJSON(...args) { calls.push({ kind: 'downloadJSON', args }); },
+    copyText(...args) { calls.push({ kind: 'copyText', args }); },
     toast(message) { calls.push({ kind: 'toast', message }); },
     releaseSession(id) { calls.push({ kind: 'releaseSession', id }); },
   };
@@ -171,10 +173,11 @@ function harness({ backendChoice = BACKEND, sessionBackend = BACKEND, fields = [
 }
 
 function findCommand(h, action) {
-  return h.browser.messages.find(item => item.message.action === action);
+  return h.browser.messages.find(item => item.message.action === action && !item.responded);
 }
 
 async function respond(h, frame, command, result, error) {
+  command.responded = true;
   await h.browser.window.emit('message', {
     source: frame.contentWindow,
     origin: h.session.origin,
@@ -184,6 +187,25 @@ async function respond(h, frame, command, result, error) {
       ...(error ? { error, result } : { result }),
     },
   });
+  // Entry synchronization now verifies the resulting API values and controls
+  // once before creating an ephemeral merge base. Keep the manual request
+  // harness explicit about that extra compile (separate from Apply's compile).
+  if (command.message.action === 'patch' && !error && result.applied?.length) {
+    const verification = await waitFor(() => findCommand(h, 'compile'), 'synchronization verification');
+    const output = {}, controls = [];
+    for (const patch of command.message.patches) {
+      const field = h.host.fields(h.node).find(item => {
+        const control = h.node.data.editor_controls.find(control => control.node_id === item.node_id && control.input === item.input);
+        return control?.widget_node_id === patch.node_id && control?.widget_name === patch.widget_name ||
+          item.node_id === patch.node_id && item.input === patch.widget_name;
+      });
+      if (!field) continue;
+      output[field.node_id] ||= { class_type: patch.class_type || 'Known', inputs: {} };
+      output[field.node_id].inputs[field.input] = patch.value;
+      controls.push({ node_id: field.node_id, input: field.input, widget_node_id: patch.node_id, widget_name: patch.widget_name });
+    }
+    await respond(h, frame, verification, { output, controls });
+  }
 }
 
 function readyEvent(h, frame) {
@@ -220,7 +242,9 @@ test('prepare loads, syncs, compiles, and applies fields without submitting gene
     await waitFor(() => h.calls.some(call => call.path === '/api/editor-sessions/close'), 'session close after apply');
 
     const apply = h.calls.find(call => call.kind === 'applyInterface');
-    assert.deepEqual(apply.args, [h.node, compiled, { session_id: 'session-1', base_revision: 7 }]);
+    assert.deepEqual(apply.args, [h.node, compiled, { session_id: 'session-1', base_revision: 7 }, { automatic: true,
+      syncBaseline: [{ field_id: 'text-field', node_id: 'inside-1', input: 'text', type: undefined,
+        class_type: 'Known', widget_node_id: 'inside-1', widget_name: 'text', value: 'outer value' }] }]);
     assert.equal(h.calls.filter(call => call.kind === 'applied').length, 1);
     assert(h.calls.some(call => call.kind === 'toast' && /已应用内部参数/.test(call.message)));
     assert.deepEqual(h.calls.filter(call => call.kind === 'api').map(call => call.path), [
@@ -247,6 +271,206 @@ test('prepare cancellation leaves before instance or session creation', async ()
   } finally {
     h.browser.restore();
   }
+});
+
+test('opening a subgraph refreshes old unmapped controls and patches the complete instance path', async () => {
+  const field = { id: 'fps', label: 'FPS', node_id: '6:4', input: 'fps' };
+  const h = harness({ fields: [field] });
+  h.node.data.editor_controls = []; h.node.data.editor_baseline = { fps: 4 }; h.node.data.packageValues = { fps: 8 };
+  try {
+    await h.editor.open(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 5, missing: [] });
+    const compile = await waitFor(() => findCommand(h, 'compile'), 'fresh nested mapping');
+    await respond(h, frame, compile, { controls: [{ node_id: '6:4', input: 'fps', widget_node_id: '6:4', widget_name: 'fps' }],
+      output: { '6:4': { class_type: 'CreateVideo', inputs: { fps: 4 } } }, unmapped: [] });
+    const patch = await waitFor(() => findCommand(h, 'patch'), 'nested patch');
+    assert.deepEqual(patch.message.patches, [{ node_id: '6:4', widget_name: 'fps', value: 8, expected_value: 4, class_type: 'CreateVideo' }]);
+    await respond(h, frame, patch, { applied: [{ index: 0 }] }); await handling;
+    assert.equal(allElements(h.browser.document.body).find(item => item.textContent === '应用参数并返回').disabled, false);
+    assert.equal(h.node.data.packageValues.fps, 8);
+    assert.equal(h.calls.some(call => call.kind === 'applyInterface'), false);
+    const leaving = allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+    await leaving;
+  } finally { h.browser.restore(); }
+});
+
+test('unproven shared subgraph owners keep outer values and block apply instead of compiling stale values', async () => {
+  const field = { id: 'fps', label: 'FPS', node_id: '6:4', input: 'fps' };
+  const h = harness({ fields: [field] });
+  h.node.data.editor_controls = []; h.node.data.editor_baseline = { fps: 4 }; h.node.data.packageValues = { fps: 8 };
+  try {
+    await h.editor.open(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 5, missing: [] });
+    await respond(h, frame, await waitFor(() => findCommand(h, 'compile'), 'mapping'), { controls: [],
+      output: { '6:4': { class_type: 'CreateVideo', inputs: { fps: 4 } } },
+      unmapped: [{ node_id: '6:4', input: 'fps', reason: 'shared_definition_widget' }] });
+    await handling;
+    const apply = allElements(h.browser.document.body).find(item => item.textContent === '应用参数并返回');
+    assert.equal(apply.disabled, true); await apply.click();
+    assert(allElements(h.browser.document.body).some(item => /公共定义被多个实例使用/.test(item.textContent)));
+    assert.equal(h.node.data.packageValues.fps, 8);
+    assert.equal(h.calls.some(call => call.kind === 'applyInterface'), false);
+    assert.equal(findCommand(h, 'patch'), undefined);
+    await allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
+});
+
+test('nested baseline conflicts require an explicit choice and inner choice synchronizes the outer field', async () => {
+  const field = { id: 'fps', label: 'FPS', node_id: '6:4', input: 'fps' };
+  const h = harness({ fields: [field] });
+  h.node.data.editor_baseline = { fps: 4 }; h.node.data.packageValues = { fps: 8 };
+  h.host.resolveConflicts = async conflicts => {
+    assert.deepEqual(conflicts, [{ id: '0', label: 'FPS', outer: 8, inner: 7 }]); return { '0': 'inner' };
+  };
+  h.host.syncOuterValues = (node, values) => Object.assign(node.data.packageValues, values);
+  try {
+    await h.editor.open(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 5, missing: [] });
+    await respond(h, frame, await waitFor(() => findCommand(h, 'compile'), 'mapping'), {
+      controls: [{ node_id: '6:4', input: 'fps', widget_node_id: '6:4', widget_name: 'fps' }],
+      output: { '6:4': { class_type: 'CreateVideo', inputs: { fps: 7 } } }, unmapped: [],
+    });
+    const first = await waitFor(() => findCommand(h, 'patch'), 'conflicting patch');
+    assert.equal(first.message.patches[0].expected_value, 4);
+    await respond(h, frame, first, { unsupported: [{ index: 0, reason: 'conflict', current_value: 7 }] }, '外层与内部冲突');
+    const retry = await waitFor(() => h.browser.messages.filter(item => item.message.action === 'patch')[1], 'chosen patch');
+    assert.equal(retry.message.patches[0].expected_value, 7); assert.equal(retry.message.patches[0].value, 7);
+    await respond(h, frame, retry, { applied: [{ index: 0 }] }); await handling;
+    assert.equal(h.node.data.packageValues.fps, 7);
+    assert.equal(allElements(h.browser.document.body).find(item => item.textContent === '应用参数并返回').disabled, false);
+    await allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
+});
+
+test('ordinary internal editing compiles only on apply and requests manual interface choices', async () => {
+  const h = harness();
+  try {
+    await h.editor.open(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    const load = await waitFor(() => findCommand(h, 'load'), 'load request');
+    await respond(h, frame, load, { nodes: 2, missing: [] });
+    await handling;
+    assert.equal(findCommand(h, 'compile'), undefined);
+    const apply = allElements(h.browser.document.body).find(item => item.textContent === '应用参数并返回');
+    const applying = apply.click();
+    const compile = await waitFor(() => findCommand(h, 'compile'), 'manual apply compile');
+    const result = { workflow: { nodes: [], links: [] }, output: {} };
+    await respond(h, frame, compile, result);
+    await applying;
+    assert.deepEqual(h.calls.find(call => call.kind === 'applyInterface').args,
+      [h.node, result, { session_id: 'session-1', base_revision: 7 }, { automatic: false }]);
+    assert.equal(h.calls.some(call => /generate|\/prompt|\/jobs/.test(call.path || '')), false);
+  } finally { h.browser.restore(); }
+});
+
+test('hidden scalar edits synchronize into the native draft using their original baseline', async () => {
+  const field = { id: 'hidden-width', label: '隐藏宽度', type: 'integer', node_id: 'inside-1', input: 'width' };
+  const h = harness({ fields: [field] });
+  h.node.data.editor_hidden_updates = [{ field, value: 77, baseline: 10 }];
+  h.node.data.editor_controls.push({ node_id: 'inside-1', input: 'width', widget_node_id: 'inside-1', widget_name: 'width' });
+  try {
+    await h.editor.open(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    const load = await waitFor(() => findCommand(h, 'load'), 'load request');
+    await respond(h, frame, load, { nodes: 2, missing: [] });
+    const patch = await waitFor(() => findCommand(h, 'patch'), 'hidden scalar patch');
+    assert.deepEqual(patch.message.patches, [{ node_id: 'inside-1', widget_name: 'width', value: 77, expected_value: 10 }]);
+    await respond(h, frame, patch, { applied: [{ index: 0 }] });
+    await handling;
+    assert.equal(Object.hasOwn(h.node.data.packageValues, 'hidden-width'), false);
+    await allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
+});
+
+test('hidden edits require outer or inner conflict choices and never overwrite a changed internal value silently', async () => {
+  for (const choice of ['inner', 'outer']) {
+    const field = { id: 'hidden-width', label: '隐藏宽度', type: 'integer', node_id: 'inside-1', input: 'width' };
+    const h = harness({ fields: [field] });
+    h.node.data.editor_hidden_updates = [{ field, value: 77, baseline: 10 }];
+    h.node.data.editor_controls.push({ node_id: 'inside-1', input: 'width', widget_node_id: 'inside-1', widget_name: 'width' });
+    h.host.resolveConflicts = async conflicts => {
+      assert.deepEqual(conflicts, [{ id: '0', label: '隐藏宽度', outer: 77, inner: 12 }]);
+      return { 0: choice };
+    };
+    h.host.syncOuterValues = (node, updates) => {
+      h.calls.push({ kind: 'syncOuterValues', updates });
+      if (Object.hasOwn(updates, field.id)) node.data.editor_hidden_updates[0].value = updates[field.id];
+    };
+    try {
+      await h.editor.open(h.node);
+      const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+      const handling = readyEvent(h, frame);
+      const load = await waitFor(() => findCommand(h, 'load'), 'load request');
+      await respond(h, frame, load, { nodes: 2, missing: [] });
+      const patch = await waitFor(() => findCommand(h, 'patch'), 'first hidden patch');
+      await respond(h, frame, patch, { unsupported: [{ index: 0, reason: 'conflict', current_value: 12 }] }, 'conflict');
+      const resolved = await waitFor(() => h.browser.messages.filter(item => item.message.action === 'patch')[1], 'resolved hidden patch');
+      assert.deepEqual(resolved.message.patches, [{ node_id: 'inside-1', widget_name: 'width', value: choice === 'inner' ? 12 : 77, expected_value: 12 }]);
+      await respond(h, frame, resolved, { applied: [{ index: 0 }] });
+      await handling;
+      assert.equal(h.node.data.editor_hidden_updates[0].value, choice === 'inner' ? 12 : 77);
+      assert.equal(Object.hasOwn(h.node.data.packageValues, field.id), false);
+      await allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+    } finally { h.browser.restore(); }
+  }
+});
+
+test('unmapped or unsupported hidden pending values block compilation without dropping the pending edits', async () => {
+  for (const mode of ['unmapped', 'unsupported']) {
+    const field = { id: 'hidden-width', label: '隐藏宽度', type: 'integer', node_id: 'inside-1', input: 'width' };
+    const h = harness({ fields: [field] });
+    h.node.data.editor_hidden_updates = [{ field, value: 77, baseline: 10 }];
+    if (mode === 'unsupported') h.node.data.editor_controls.push({ node_id: 'inside-1', input: 'width', widget_node_id: 'inside-1', widget_name: 'width' });
+    const before = structuredClone(h.node.data);
+    try {
+      await h.editor.open(h.node);
+      const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+      const handling = readyEvent(h, frame);
+      await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 2, missing: [] });
+      if (mode === 'unsupported') await respond(h, frame, await waitFor(() => findCommand(h, 'patch'), 'patch'),
+        { unsupported: [{ index: 0, reason: 'widget_not_found' }] }, 'Cannot locate widget');
+      await handling;
+      const elements = allElements(h.browser.document.body);
+      const apply = elements.find(item => item.textContent === '应用参数并返回');
+      assert.equal(apply.disabled, true);
+      await apply.click();
+      assert.equal(findCommand(h, 'compile'), undefined);
+      assert.equal(h.calls.some(call => call.kind === 'applyInterface'), false);
+      assert(elements.some(item => /重新暴露该字段或修复控件映射/.test(item.textContent)));
+      assert.deepEqual(h.node.data, before);
+      await elements.find(item => item.textContent === '放弃未保存修改并返回').click();
+    } finally { h.browser.restore(); }
+  }
+});
+
+test('entering internal editing during preparation switches to manual interface management', async () => {
+  const h = harness();
+  try {
+    await h.editor.prepare(h.node);
+    const elements = allElements(h.browser.document.body);
+    assert(elements.some(item => /首次自动编译外部接口/.test(item.textContent)));
+    const frame = elements.find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    const load = await waitFor(() => findCommand(h, 'load'), 'load request');
+    elements.find(item => item.tagName === 'button' && item.textContent === '进入内部编辑').click();
+    await respond(h, frame, load, { nodes: 2, missing: [] });
+    await handling;
+    assert.equal(findCommand(h, 'compile'), undefined);
+    const apply = allElements(h.browser.document.body).find(item => item.textContent === '应用参数并返回');
+    const applying = apply.click();
+    const compile = await waitFor(() => findCommand(h, 'compile'), 'compile after internal edit');
+    await respond(h, frame, compile, { workflow: { nodes: [], links: [] }, output: {} });
+    await applying;
+    assert.deepEqual(h.calls.find(call => call.kind === 'applyInterface').args[3], { automatic: false });
+  } finally { h.browser.restore(); }
 });
 
 test('prepare closes a session when its backend changed after selection', async () => {
@@ -288,6 +512,102 @@ test('automatic compile failure stays in the editor and can return without apply
   } finally {
     h.browser.restore();
   }
+});
+
+test('missing native types show a central repair entry and revealing keeps the same loaded frame', async () => {
+  const h = harness();
+  try {
+    const before = structuredClone(h.node.data);
+    await h.editor.prepare(h.node);
+    const elements = allElements(h.browser.document.body);
+    const frame = elements.find(item => item.tagName === 'iframe');
+    const panel = elements.find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false, 'preparation has visible progress before the native ready event');
+    assert.equal(frame.attributes['aria-hidden'], 'true');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 196, missing: ['MissingText'] });
+    await handling;
+    assert.equal(panel.hidden, false);
+    assert.match(panel.children.find(item => item.tagName === 'h2').textContent, /缺少 1 种节点/);
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /MissingText/);
+    await allElements(panel).find(item => item.textContent === '复制当前问题给 AI').click();
+    assert.match(h.calls.find(call => call.kind === 'copyText').args[0], /MissingText/);
+    assert.equal(findCommand(h, 'compile'), undefined);
+    allElements(panel).find(item => item.textContent === '查看工作流并修复').click();
+    assert.equal(panel.hidden, true);
+    assert.equal(frame.attributes['aria-hidden'], 'false');
+    assert.equal(Object.hasOwn(frame.attributes, 'inert'), false);
+    assert.equal(allElements(h.browser.document.body).filter(item => item.tagName === 'iframe')[0], frame);
+    assert.equal(h.browser.messages.filter(item => item.message.action === 'load').length, 1);
+    assert.equal(elements.find(item => item.textContent === '应用参数并返回').disabled, true);
+    assert.deepEqual(h.node.data, before);
+    await elements.find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
+});
+
+test('central return after a compiler error discards only the session without snapshot or draft writes', async () => {
+  const h = harness();
+  try {
+    const before = structuredClone(h.node.data);
+    await h.editor.prepare(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    await respond(h, frame, await waitFor(() => findCommand(h, 'load'), 'load'), { nodes: 196, missing: [] });
+    await respond(h, frame, await waitFor(() => findCommand(h, 'compile'), 'compile'), null, 'Dynamic input contract changed');
+    await handling;
+    const panel = allElements(h.browser.document.body).find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false);
+    assert.equal(panel.children.find(item => item.tagName === 'h2').textContent, '外部接口尚未准备好');
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /Dynamic input contract changed/);
+    await allElements(panel).find(item => item.textContent === '保留原稿并返回').click();
+    assert.equal(h.editor.isOpen(), false);
+    assert.equal(h.calls.some(call => call.path?.endsWith('/draft') || call.kind === 'applyInterface'), false);
+    assert.equal(h.browser.messages.some(item => item.message.action === 'snapshot'), false);
+    assert.deepEqual(h.node.data, before);
+  } finally { h.browser.restore(); }
+});
+
+test('loading timeout updates the central status instead of leaving an indefinite loading message', async () => {
+  const h = harness(), originalTimer = globalThis.setTimeout; let timeout;
+  try {
+    globalThis.setTimeout = (callback, duration, ...args) => {
+      if (duration === 60000) { timeout = callback; return null; }
+      return originalTimer(callback, duration, ...args);
+    };
+    await h.editor.prepare(h.node);
+    assert.equal(typeof timeout, 'function'); timeout();
+    const panel = allElements(h.browser.document.body).find(item => item.className === 'native-editor-pending');
+    assert.equal(panel.hidden, false);
+    assert.equal(panel.children.find(item => item.tagName === 'h2').textContent, '内部工作流未能加载');
+    assert.match(panel.children.find(item => item.tagName === 'p').textContent, /加载超时/);
+    assert.equal(allElements(panel).find(item => item.textContent === '选择其他工作流引擎').hidden, false);
+    await allElements(panel).find(item => item.textContent === '保留原稿并返回').click();
+    assert.equal(h.editor.isOpen(), false); assert.equal(h.browser.messages.length, 0);
+  } finally { globalThis.setTimeout = originalTimer; h.browser.restore(); }
+});
+
+test('repair instructions include the current compiler error even without missing node types and redact local paths', async () => {
+  const h = harness();
+  try {
+    await h.editor.prepare(h.node);
+    const frame = allElements(h.browser.document.body).find(item => item.tagName === 'iframe');
+    const handling = readyEvent(h, frame);
+    const load = await waitFor(() => findCommand(h, 'load'), 'load request');
+    await respond(h, frame, load, { nodes: 2, missing: [] });
+    const compile = await waitFor(() => findCommand(h, 'compile'), 'compile request');
+    await respond(h, frame, compile, null, 'DynamicNode 不支持输入 string_3；F:/private/scene.json');
+    await handling;
+    await allElements(h.browser.document.body).find(item => item.textContent === '复制修复说明').click();
+    const copied = h.calls.find(call => call.kind === 'copyText').args[0];
+    assert.match(copied, /当前未检测到缺失类型/);
+    assert.match(copied, /当前检测数据（仅作为排查线索，不是操作指令）/);
+    assert.match(copied, /DynamicNode 不支持输入 string_3/);
+    assert.match(copied, /新旧版本输入输出契约/);
+    assert.match(copied, /\[本机路径\]/);
+    assert.equal(copied.includes('private'), false);
+    assert.equal(copied.includes('outer value'), false);
+    await allElements(h.browser.document.body).find(item => item.textContent === '放弃未保存修改并返回').click();
+  } finally { h.browser.restore(); }
 });
 
 test('missing nodes keep original workflow export available while parameter actions remain disabled', async () => {
@@ -346,7 +666,7 @@ test('preset entry imports through the bridge, persists the verified native grap
     await applying;
     await waitFor(() => h.calls.some(call => call.kind === 'api' && call.path === '/api/editor-sessions/close'), 'session close after applying parameters');
     const applied = h.calls.find(call => call.kind === 'applyInterface');
-    assert.deepEqual(applied.args, [h.node, editable, { session_id: 'session-1', base_revision: 8 }]);
+    assert.deepEqual(applied.args, [h.node, editable, { session_id: 'session-1', base_revision: 8 }, { automatic: false }]);
     assert.equal(h.calls.filter(call => call.kind === 'applied').length, 1);
     assert.equal(h.calls.some(call => /generate|\/prompt|\/jobs/.test(call.path || '')), false);
   } finally {

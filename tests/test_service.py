@@ -49,18 +49,25 @@ class MockComfy:
             def log_message(self, *args):
                 pass
 
-            def send_json(self, value, status=200):
+            def send_json(self, value, status=200, *, close=False):
                 payload = json.dumps(value).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
+                if close:
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
                 self.end_headers()
                 self.wfile.write(payload)
 
             def do_GET(self):
                 parsed = urllib.parse.urlsplit(self.path)
                 state.calls.append(("GET", parsed.path, self.headers.get("Range")))
-                if parsed.path == "/object_info":
+                if parsed.path == "/ws":
+                    # This HTTP fixture deliberately does not provide a
+                    # WebSocket service. End its rejected upgrade cleanly.
+                    self.send_json({"error": "not found"}, 404, close=True)
+                elif parsed.path == "/object_info":
                     self.send_json(state.info)
                 elif parsed.path == "/system_stats":
                     self.send_json({"devices": [], "system": {"comfyui_version": "test"}})
@@ -204,6 +211,16 @@ class ServiceHTTPTests(unittest.TestCase):
         status, headers, body = self.request("POST", path, data, **kwargs)
         return status, headers, json.loads(body)
 
+    def test_mock_websocket_rejection_closes_the_http_connection(self):
+        with socket.create_connection(("127.0.0.1", self.backend.server.server_port), timeout=2) as connection:
+            connection.sendall(b"GET /ws?clientId=test HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            response = http.client.HTTPResponse(connection)
+            response.begin()
+            self.assertEqual(response.status, 404)
+            self.assertEqual(response.getheader("Connection"), "close")
+            self.assertEqual(json.loads(response.read()), {"error": "not found"})
+            self.assertEqual(connection.recv(1), b"")
+
     def test_engine_and_update_controls_require_csrf(self):
         for path in ('/api/engines/start', '/api/engines/register', '/api/updates/check',
                      '/api/updates/stage', '/api/updates/install', '/api/exit'):
@@ -278,6 +295,8 @@ class ServiceHTTPTests(unittest.TestCase):
         self.app.backend.url = "http://127.0.0.1:1"
         status, _, inspected = self.post("/api/packages/inspect", {"document": API_JOB["prompt"]})
         self.assertEqual(status, 200)
+        self.assertIn('schema_unavailable', {warning['code'] for warning in inspected['warnings']})
+        self.assertEqual(inspected['execution']['selected_outputs'], [])
         status, _, saved = self.post("/api/packages", {**inspected, "name": "Offline"})
         self.assertEqual(status, 200)
         self.assertFalse(self.backend.calls)
@@ -303,7 +322,7 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200, imported)
         self.assertEqual(imported["package"]["id"], package_id)
         self.assertEqual(len(self.app.packages.list()), 1)
-        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(self.backend.calls, [("GET", "/object_info", None)] * 2)
 
     def test_package_raw_transport_rejects_invalid_carriers_and_preserves_csrf(self):
         for path in ("/api/packages/inspect", "/api/packages"):
@@ -568,7 +587,8 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         status, _, result = self.post(f"/api/jobs/{job['id']}/cancel")
         self.assertEqual(status, 200, result)
-        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["cancellation"]["state"], "requested")
         self.assertEqual(self.backend.pending, ["foreign-job"])
         changes = [call for call in self.backend.calls if call[:2] == ("POST", "/queue")]
         self.assertEqual([call[2] for call in changes], [{"delete": [job["id"]]}])
@@ -578,8 +598,9 @@ class ServiceHTTPTests(unittest.TestCase):
         job = self.submit()
         self.backend.pending.remove(job["id"])
         self.backend.running.extend([job["id"], "foreign-running"])
-        status, _, _ = self.post(f"/api/jobs/{job['id']}/cancel")
-        self.assertEqual(status, 400)
+        status, _, result = self.post(f"/api/jobs/{job['id']}/cancel")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["cancellation"]["state"], "unavailable")
         self.assertEqual(self.backend.running, [job["id"], "foreign-running"])
         self.assertFalse(any(call[0] == "POST" and call[1] in ("/queue", "/interrupt") for call in self.backend.calls))
 
@@ -588,13 +609,13 @@ class ServiceHTTPTests(unittest.TestCase):
         self.backend.queue_available = False
         self.app.update_jobs()
         jobs = json.loads(self.request("GET", "/api/jobs")[2])["jobs"]
-        self.assertEqual(jobs[0]["status"], "queued")
+        self.assertEqual(jobs[0]["status"], "unknown")
         self.backend.queue_available = True
         self.stop_client()
         self.start_client()
         restored = json.loads(self.request("GET", "/api/jobs")[2])["jobs"]
         self.assertEqual(restored[0]["id"], job["id"])
-        self.assertEqual(restored[0]["status"], "queued")
+        self.assertEqual(restored[0]["status"], "unknown")
         url = self.complete(job)
         self.assertRegex(url, r"^/api/media/[a-f0-9]{32}$")
 
@@ -604,7 +625,39 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(self.app.backend.url, self.backend.url)
         self.post(f"/api/jobs/{job['id']}/cancel")
+        self.assertEqual(self.post("/api/settings", {"backend_url": "http://127.0.0.1:9"})[0], 400)
+        self.backend.history[job['id']] = {"status": {"status_str": "success", "completed": True}, "outputs": {}}
+        self.app.update_jobs()
         self.assertEqual(self.post("/api/settings", {"backend_url": "http://127.0.0.1:9"})[0], 200)
+
+    def test_explicit_refresh_is_read_only_owned_original_task_and_requires_csrf(self):
+        job = self.submit()
+        self.post(f"/api/jobs/{job['id']}/cancel")
+        before = [call for call in self.backend.calls if call[0] == 'POST']
+        path = f"/api/jobs/{job['id']}/refresh"
+        status, _, result = self.post(path)
+        self.assertEqual(status, 200)
+        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(result['id'], job['id'])
+        self.assertEqual([call for call in self.backend.calls if call[0] == 'POST'], before)
+        self.assertEqual(self.post('/api/jobs/foreign/refresh')[0], 400)
+        self.assertEqual(self.post(path, {'request': API_JOB})[0], 400)
+        self.assertEqual(self.post(path, {}, csrf=False)[0], 403)
+        self.backend.history[job['id']] = {'status': {'status_str': 'success', 'completed': True}, 'outputs': {}}
+        status, _, result = self.post(path)
+        self.assertEqual((status, result['status'], result['cancellation']['state']), (200, 'completed', 'completed'))
+
+    def test_cancel_pending_intent_is_preserved_across_restart_without_resend(self):
+        job = self.submit()
+        result = self.post(f"/api/jobs/{job['id']}/cancel")[2]
+        cancel_id = result['cancellation']['id']
+        self.stop_client()
+        self.start_client()
+        before = [call for call in self.backend.calls if call[0] == 'POST']
+        result = self.post(f"/api/jobs/{job['id']}/cancel")[2]
+        self.assertEqual(result['cancellation']['id'], cancel_id)
+        self.assertNotEqual(result['status'], 'cancelled')
+        self.assertEqual([call for call in self.backend.calls if call[0] == 'POST'], before)
 
     def test_unowned_media_cannot_proxy_backend_arbitrary_files(self):
         status, _, _ = self.request("GET", "/api/media/" + "0" * 32 + "?filename=private.txt")

@@ -1,0 +1,36 @@
+{
+  "application": "PrismCanvas",
+  "version": "0.11.5",
+  "candidate": "Phase8A",
+  "stable_release": false,
+  "source_archive_sha256": "c0c3d7a16ad3f9c5cbe68fa34919ce60ac31398dbd366d007b0df3d62e200092",
+  "exe_sha256": "8ee0bacf66a5efd418a57dbfb9faffb467f052b49ea33e2239520d59b6b16874",
+  "packages": [
+    {
+      "filename": "PrismCanvas-Phase8A-Source.zip",
+      "bytes": 1539174,
+      "sha256": "c0c3d7a16ad3f9c5cbe68fa34919ce60ac31398dbd366d007b0df3d62e200092"
+    },
+    {
+      "filename": "PrismCanvas-0.11.5-Phase8A-Windows-x64-candidate.zip",
+      "bytes": 11101784,
+      "sha256": "7f195445e16e48eb225397b1825a5d4f380ebfa70003fbea1b96cf389f300325"
+    }
+  ],
+  "validation": {
+    "python_passed": 1197,
+    "python_skipped": 3,
+    "node_passed": 1589,
+    "actual_exe_preview_assertions": 96,
+    "actual_exe_cpu_assertions": 5,
+    "actual_exe_cpu_jobs": 1,
+    "actual_exe_cpu_outputs_pixel_exact": 2,
+    "existing_state_copy_two_starts": true,
+    "new_gpu_generation_test": false,
+    "human_audio_acceptance": false
+  },
+  "unpacked_exe_two_starts": true,
+  "stable_update_feed_changed": false,
+  "contains_model_weights": false,
+  "contains_user_data": false
+}

@@ -51,6 +51,80 @@ function harness(options = {}) {
   return { make: () => createWorkflowRunner(config), config, calls, saves, accepted, jobs, requests, control, changes, jobEvents, disk: () => copy(disk) };
 }
 
+test('a cancellation intent pauses downstream until explicit resume acknowledges its durable identity', async () => {
+  const cancellation = { id: crypto.randomUUID(), state: 'requested' };
+  const h = harness({ control: { status: 'running' }, apiHook: async (path, _body, { jobs }) => {
+    if (path === '/api/jobs' && jobs.has('job-1')) jobs.get('job-1').cancellation ||= copy(cancellation);
+  } });
+  const paused = await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  assert.equal(paused.status, 'paused'); assert.equal(paused.steps[0].cancellation_id, cancellation.id);
+  assert.equal(h.accepted.length, 1); assert(!h.calls.some(call => call.path.includes('image-input')));
+  h.jobs.get('job-1').status = 'completed'; h.jobs.get('job-1').cancellation.state = 'completed'; h.control.status = 'completed';
+  const restored = h.make(); assert.equal(h.accepted.length, 1);
+  const done = await restored.resume(); assert.equal(done.status, 'completed'); assert.equal(h.accepted.length, 2);
+  assert.equal(done.steps[0].acknowledged_cancellation_id, cancellation.id);
+  assert.equal(h.calls.filter(call => call.path === '/api/generate' && call.body.request_id === paused.steps[0].request_id).length, 1);
+});
+
+test('natural completion with a cancellation identity still pauses before any downstream upload', async () => {
+  const id = crypto.randomUUID();
+  const h = harness({ apiHook: async (path, _body, { jobs }) => {
+    if (path === '/api/jobs') jobs.get('job-1').cancellation = { id, state: 'completed' };
+  } });
+  const result = await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  assert.equal(result.status, 'paused'); assert.equal(result.steps[0].job_status, 'completed');
+  assert.equal(h.accepted.length, 1); assert(!h.calls.some(call => /image-input|media-input/.test(call.path)));
+});
+
+test('a new cancellation identity cannot reuse acknowledgement of an earlier request', async () => {
+  let id = crypto.randomUUID();
+  const h = harness({ control: { status: 'running' }, apiHook: async (path, _body, { jobs }) => {
+    if (path === '/api/jobs') jobs.get('job-1').cancellation = { id, state: 'unavailable' };
+  } });
+  await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  const firstId = id; id = crypto.randomUUID();
+  const paused = await h.make().resume(); assert.equal(paused.status, 'paused');
+  assert.equal(paused.steps[0].acknowledged_cancellation_id, firstId); assert.equal(paused.steps[0].cancellation_id, id);
+  assert.equal(h.accepted.length, 1);
+});
+
+test('unknown native job survives reload and explicit refresh never resubmits its original request', async () => {
+  let refreshedStatus = 'unknown';
+  const h = harness({ control: { status: 'unknown' }, apiHook: async (path, _body, { jobs }) => {
+    if (path === '/api/jobs/job-1/refresh') { jobs.get('job-1').status = refreshedStatus; return copy(jobs.get('job-1')); }
+  } });
+  const first = await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  assert.equal(first.status, 'paused'); const restored = h.make();
+  await assert.rejects(restored.clear(), /未结束任务/); await assert.rejects(restored.start({ graph: chain(), backend: BACKEND }), /未结束/);
+  assert.equal((await restored.resume()).status, 'paused'); assert.equal(h.accepted.length, 1);
+  assert.equal(h.calls.filter(call => call.path === '/api/jobs/job-1/refresh').length, 1);
+  refreshedStatus = 'completed'; h.control.status = 'completed';
+  const done = await h.make().resume(); assert.equal(done.status, 'completed'); assert.equal(h.accepted.length, 2);
+  assert.equal(done.steps[0].request_id, first.steps[0].request_id);
+  assert.equal(h.calls.filter(call => call.path === '/api/generate' && call.body.request_id === first.steps[0].request_id).length, 1);
+});
+
+test('confirmed cancel or failure never permits downstream even after explicitly acknowledging the cancellation', async () => {
+  for (const status of ['cancelled', 'failed']) {
+    const h = harness({ control: { status }, apiHook: async (path, _body, { jobs }) => {
+      if (path === '/api/jobs') jobs.get('job-1').cancellation ||= { id: crypto.randomUUID(), state: status === 'cancelled' ? 'confirmed' : 'failed' };
+    } });
+    assert.equal((await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND })).status, 'paused');
+    assert.equal((await h.make().resume()).status, 'failed'); assert.equal(h.accepted.length, 1);
+    assert(!h.calls.some(call => /image-input|media-input/.test(call.path)));
+  }
+});
+
+test('cancellation acknowledgement must persist before completed output can run downstream', async () => {
+  const h = harness({ apiHook: async (path, _body, { jobs }) => {
+    if (path === '/api/jobs') jobs.get('job-1').cancellation ||= { id: crypto.randomUUID(), state: 'completed' };
+  } });
+  await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  h.control.failSave = state => !!state?.steps[0].acknowledged_cancellation_id;
+  assert.equal((await h.make().resume()).status, 'paused'); assert.equal(h.accepted.length, 1);
+  assert.equal(h.disk().steps[0].acknowledged_cancellation_id, undefined);
+});
+
 test('a pending native node blocks a whole run before earlier nodes can submit', async () => {
   const h = harness(), runner = h.make();
   const ready = createNode('generation',0,0,{kind:'sdxl',positive:'Ready'});
@@ -221,7 +295,131 @@ test('typed video workflow transfers the video-only output index and keeps submi
   const graph={nodes:[first,next],edges:[]};connect(graph,first.id,next.id,{targetField:'clip',sourceField:'video'});
   const state=await h.make().start({graph,targetIds:[next.id],backend:BACKEND});
   assert.equal(state.status,'completed');
-  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/media-input')).body,{output_index:0,package_id:'p-video',field_id:'clip'});
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/media-input')).body,{output_index:0,media_type:'video',package_id:'p-video',field_id:'clip'});
   assert.equal(h.calls.filter(c=>c.path==='/api/generate')[1].body.request.values.clip,'clip.webm');
   assert.equal(state.steps[1].image_inputs[graph.edges[0].id].media_type,'video');
+});
+
+function audioChain({ legacy = false, viaResult = false, fields = ['voice'] } = {}) {
+  const source = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-source',
+    ...(legacy ? {} : { editor_output_fields: [{ id: 'sink-a', mediaType: 'audio' }, { id: 'sink-b', mediaType: 'audio' }] }) });
+  source.id = 'audio-source';
+  const target = createNode('generation', 400, 0, { kind: 'package', package_id: 'p-target',
+    packageFields: fields.map(id => ({ id, type: 'audio', label: id })) }); target.id = 'audio-target';
+  const preview = createNode('result', 200, 0, { jobId: 'historical-job', outputs: [{ type: 'audio', node_id: 'sink-b', filename: 'old.wav', url: '/old', output_id: 'historical-id' }] });
+  preview.id = 'audio-preview';
+  const graph = { nodes: [source, target, ...(viaResult ? [preview] : [])], edges: [] };
+  if (viaResult) connect(graph, source.id, preview.id);
+  fields.forEach((field, index) => {
+    const options = { targetField: field, sourceField: 'audio', sourceOutput: 'sink-b', outputIndex: 1 };
+    if (legacy) graph.edges.push({ id: `legacy-audio-${index}`, source: viaResult ? preview.id : source.id, target: target.id, ...options });
+    else connect(graph, viaResult ? preview.id : source.id, target.id, options);
+  });
+  return graph;
+}
+const mixedOutputs = [
+  { type: 'image', node_id: 'image', filename: 'frame.png', output_id: 'image-id' },
+  { type: 'audio', node_id: 'sink-a', filename: 'other.wav', output_id: 'other-id' },
+  { type: 'video', node_id: 'video', filename: 'clip.webm', output_id: 'video-id' },
+  { type: 'audio', node_id: 'sink-b', filename: 'first.wav', output_id: 'first-id' },
+  { type: 'audio', node_id: 'sink-b', filename: 'chosen.wav', output_id: 'chosen-id' },
+];
+
+test('audio handoff selects one batch item of the bound sink from this run and validates each fan-out field', async () => {
+  const h = harness({ control: { outputs: mixedOutputs }, apiHook: (path, body) => path.endsWith('/media-input')
+    ? { name: `input/${body.field_id}.wav`, media_type: 'audio', output_id: body.output_id, backend: BACKEND } : undefined });
+  const graph = audioChain({ viaResult: true, fields: ['voice', 'another'] });
+  const state = await h.make().start({ graph, targetIds: ['audio-target'], backend: BACKEND });
+  assert.equal(state.status, 'completed');
+  const calls = h.calls.filter(call => call.path.endsWith('/media-input'));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(call => call.body), ['voice', 'another'].map(field_id => ({
+    output_index: 2, output_id: 'chosen-id', media_type: 'audio', package_id: 'p-target', field_id,
+  })));
+  assert(calls.every(call => call.path === '/api/jobs/job-1/media-input'));
+  assert.deepEqual(h.calls.filter(call => call.path === '/api/generate')[1].body.request.values,
+    { voice: 'input/voice.wav', another: 'input/another.wav' });
+  assert(Object.values(state.steps[1].image_inputs).every(input => input.output_id === 'chosen-id' && input.backend === BACKEND));
+  assert.equal(graph.nodes.find(node => node.id === 'audio-preview').data.outputs[0].output_id, 'historical-id');
+  assert(!graph.edges.some(edge => Object.hasOwn(edge, 'sourceOutputId')));
+});
+
+test('legacy unknown audio edges use completed file evidence; wrong or unknown file types stop downstream', async () => {
+  const success = harness({ control: { outputs: mixedOutputs }, apiHook: path => path.endsWith('/media-input') ? { name: 'input/fresh.wav' } : undefined });
+  assert.equal((await success.make().start({ graph: audioChain({ legacy: true }), targetIds: ['audio-target'], backend: BACKEND })).status, 'completed');
+  for (const outputs of [[{ type: 'image', node_id: 'sink-b', filename: 'wrong.png' }], [{ type: 'unknown', node_id: 'sink-b', filename: 'voice.wav' }]]) {
+    const h = harness({ control: { outputs } });
+    const state = await h.make().start({ graph: audioChain({ legacy: true }), targetIds: ['audio-target'], backend: BACKEND });
+    assert.equal(state.status, 'failed'); assert.equal(h.accepted.length, 1);
+    assert(!h.calls.some(call => call.path.endsWith('/media-input')));
+  }
+});
+
+test('audio lost submission reply restores the exact downstream request and retains prepared media evidence', async () => {
+  let loseDownstream = true;
+  const h = harness({ control: { outputs: mixedOutputs }, apiHook: (path, body, { control }) => {
+    if (path.endsWith('/media-input')) return { name: 'input/chosen.wav', backend: BACKEND, output_id: body.output_id, media_type: 'audio' };
+    if (path === '/api/generate' && body.request.package_id === 'p-target' && loseDownstream) { loseDownstream = false; control.loseReply = true; }
+  } });
+  const paused = await h.make().start({ graph: audioChain(), targetIds: ['audio-target'], backend: BACKEND });
+  assert.equal(paused.status, 'paused'); assert.equal(paused.steps[1].state, 'uncertain');
+  const before = copy(paused.steps[1]);
+  const completed = await h.make().resume();
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.steps[1].request_id, before.request_id);
+  assert.deepEqual(completed.steps[1].request, before.request);
+  assert.deepEqual(completed.steps[1].image_inputs, before.image_inputs);
+  assert.equal(h.calls.filter(call => call.path.endsWith('/media-input')).length, 1);
+  assert.equal(h.calls.filter(call => call.path === '/api/generate').length, 2);
+});
+
+test('audio acknowledgement identity, type and backend mismatches prevent downstream submission', async () => {
+  for (const ack of [{ output_id: 'foreign-id' }, { media_type: 'image' }, { backend: 'http://127.0.0.1:9000' }]) {
+    const h = harness({ control: { outputs: mixedOutputs }, apiHook: path => path.endsWith('/media-input') ? { name: 'input/voice.wav', ...ack } : undefined });
+    const state = await h.make().start({ graph: audioChain(), targetIds: ['audio-target'], backend: BACKEND });
+    assert.equal(state.status, 'failed'); assert.equal(h.accepted.length, 1);
+    assert.deepEqual(state.steps[1].image_inputs, {});
+  }
+});
+
+test('backend switch during media transfer pauses before the name is persisted or the downstream request is built', async () => {
+  const h = harness({ control: { outputs: mixedOutputs }, apiHook: (path, body, { control }) => {
+    if (path.endsWith('/media-input')) { control.backend = 'http://127.0.0.1:9000'; return { name: 'input/voice.wav', backend: BACKEND, output_id: body.output_id }; }
+  } });
+  const state = await h.make().start({ graph: audioChain(), targetIds: ['audio-target'], backend: BACKEND });
+  assert.equal(state.status, 'paused'); assert.equal(h.accepted.length, 1);
+  assert.deepEqual(state.steps[1].image_inputs, {}); assert.equal(state.steps[1].request_id, null);
+});
+
+test('image wrapper receives a current output identity when present while old image-only indices stay valid', async () => {
+  const h = harness({ control: { outputs: [{ type: 'video', filename: 'movie.webm' }, { type: 'image', filename: 'fresh.png', output_id: 'fresh-id' }] } });
+  const state = await h.make().start({ graph: chain(), targetIds: ['second'], backend: BACKEND });
+  assert.equal(state.status, 'completed');
+  assert.deepEqual(h.calls.find(call => call.path.endsWith('/image-input')).body, { output_index: 0, output_id: 'fresh-id' });
+  assert.equal(Object.values(state.steps[1].image_inputs)[0].output_id, 'fresh-id');
+});
+
+test('prepared file identity survives output reorder during recovery and a missing identity never falls back to a batch index', async () => {
+  for (const missing of [false, true]) {
+    let blockSecond = true;
+    const h = harness({ control: { outputs: mixedOutputs }, apiHook: (path, body) => {
+      if (!path.endsWith('/media-input')) return;
+      if (body.field_id === 'another' && blockSecond) throw new Error('temporary upload failure');
+      return { name: `input/${body.field_id}.wav`, output_id: body.output_id, backend: BACKEND };
+    } });
+    const paused = await h.make().start({ graph: audioChain({ fields: ['voice', 'another'] }), targetIds: ['audio-target'], backend: BACKEND });
+    assert.equal(paused.status, 'paused');
+    const initial = h.disk();
+    initial.steps[0].outputs = missing ? mixedOutputs.filter(output => output.output_id !== 'chosen-id') : mixedOutputs.toReversed();
+    blockSecond = false;
+    const restored = createWorkflowRunner({ ...h.config, load: () => initial });
+    const state = await restored.resume();
+    assert.equal(state.status, missing ? 'failed' : 'completed');
+    // First field was frozen and already uploaded; reordered item 1 cannot replace it.
+    assert.equal(h.calls.filter(call => call.path.endsWith('/media-input') && call.body.field_id === 'voice').length, 1);
+    if (!missing) {
+      assert.equal(Object.values(state.steps[1].image_inputs)[0].output_id, 'chosen-id');
+      assert.equal(state.steps[1].request.values.voice, 'input/voice.wav');
+    } else assert.equal(h.accepted.length, 1);
+  }
 });

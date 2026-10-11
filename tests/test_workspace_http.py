@@ -42,9 +42,13 @@ class WorkspaceHTTPTests(unittest.TestCase):
         self.assertEqual(self.post('/api/upload-audio',{},csrf=False)[0],403)
 
     def test_audio_path_rejection_and_result_ownership(self):
-        raw=b'fLaC'+b'0'*20
-        with patch.object(self.app.backend,'upload',return_value={'name':'../bad.flac','type':'input'}):
+        stream=io.BytesIO()
+        with wave.open(stream,'wb') as writer:
+            writer.setnchannels(1);writer.setsampwidth(2);writer.setframerate(8000);writer.writeframes(b'\0'*160)
+        raw=stream.getvalue()
+        with patch.object(self.app.backend,'upload',return_value={'name':'../bad.wav','type':'input'}) as upload:
             self.assertEqual(self.post('/api/upload-audio',{'data':base64.b64encode(raw).decode()})[0],400)
+            upload.assert_called_once()
         self.assertEqual(self.post('/api/jobs/not-owned/output-location',{'index':0})[0],400)
 
     def test_job_list_retains_only_validated_loopback_backend_identity(self):

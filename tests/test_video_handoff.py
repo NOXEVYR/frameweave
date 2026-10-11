@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from frameweave.backend import Backend
+from frameweave.server import output_identity
 import test_service as service_fixture
 
 
@@ -145,6 +146,20 @@ class VideoHandoffTests(unittest.TestCase):
         self.assertIn(video_b, self.uploads()[0][2])
         self.assert_no_generation()
 
+    def test_video_identity_selects_original_file_after_reorder_and_retains_legacy_default(self):
+        self.set_outputs([("other.mp4", "video"), ("result.mp4", "video")])
+        chosen = self.job["outputs"][1]
+        chosen["node_id"] = "video-sink"
+        identity = output_identity(self.job_id, chosen)
+        self.job["outputs"].reverse()
+        status, _, result = self.handoff({"output_index": 1, "output_id": identity,
+                                         "package_id": self.package["id"], "field_id": "clip"})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["output_id"], identity)
+        self.assertEqual(result["media_type"], "video")
+        self.assertEqual(self.views()[0][2]["filename"], ["result.mp4"])
+        self.assert_no_generation()
+
     def test_repeated_handoff_reuses_local_output_and_backend_upload(self):
         self.package = self.make_package(
             prompt={"7": {"class_type": "LoadVideo", "inputs": {"file": ""}},
@@ -270,6 +285,7 @@ class VideoHandoffTests(unittest.TestCase):
         self.view["contents"]["result.mov"] = content
         self.view["mime"] = "video/quicktime"
         self.job["status"] = "running"
+        self.job["outputs"] = []  # Replace the unrelated completed-MP4 fixture with a fresh run.
         self.backend.history[self.job_id] = {
             "status": {"status_str": "success", "completed": True},
             "outputs": {"9": {"videos": [{"filename": "result.mov", "subfolder": "results", "type": "output"}]}}

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runBackend, workflowBackendTarget, chooseWorkflowBackend } from '../web/editor-backend-picker.mjs';
+import { runBackend, workflowBackendTarget, workflowRootBackendTarget, chooseWorkflowBackend } from '../web/editor-backend-picker.mjs';
 import { createNode, connect } from '../web/graph.mjs';
 
 test('bound workflow selects its remembered engine independently of the current one', async () => {
@@ -15,6 +15,16 @@ test('execution includes upstream bindings and refuses incompatible multi-engine
   assert.throws(()=>runBackend(graph,[a.id,b.id]),/多个推理引擎/);
   delete b.data.editor_backend;graph.edges.push({id:'edge',source:a.id,target:b.id});
   assert.equal(runBackend(graph,[b.id]),a.data.editor_backend);
+});
+
+test('initial engine anchor uses explicit roots before inactive upstream branches are known', () => {
+  const a = createNode('generation', 0, 0, {editor_backend:'http://127.0.0.1:8189'});
+  const b = createNode('generation', 0, 0, {editor_backend:'http://127.0.0.1:8188'});
+  const graph = {nodes:[a,b],edges:[{id:'old-edge',source:a.id,target:b.id}]};
+  assert.equal(workflowRootBackendTarget(graph,[b.id],'http://127.0.0.1:8187'),b.data.editor_backend);
+  assert.throws(() => workflowRootBackendTarget(graph,[a.id,b.id],'http://127.0.0.1:8187'), /多个推理引擎/);
+  delete b.data.editor_backend;
+  assert.equal(workflowRootBackendTarget(graph,[b.id],'http://127.0.0.1:8187'),'http://127.0.0.1:8187');
 });
 
 test('backend preparation refuses switching when a required reference belongs to another engine', () => {

@@ -1,0 +1,25 @@
+/* The management view preserves the editor and its draft without displaying it. */
+body[data-workspace="canvas"][data-canvas-view="management"] .workbench,
+body[data-workspace="canvas"][data-canvas-view="management"].inspector-open .workbench {
+  grid-template-columns:102px minmax(0,1fr);
+}
+body[data-workspace="canvas"][data-canvas-view="management"] .toolrail,
+body[data-workspace="canvas"][data-canvas-view="management"] .canvas-shell,
+body[data-workspace="canvas"][data-canvas-view="management"] .inspector,
+body[data-workspace="canvas"][data-canvas-view="management"] .project-actions,
+body[data-workspace="canvas"][data-canvas-view="management"] .workspace-heading .project-name,
+body[data-workspace="canvas"][data-canvas-view="management"] .workspace-heading .workspace-slash {
+  display:none;
+}
+body:not([data-workspace="canvas"]) #canvas-manager { display:none; }
+#canvas-back-to-manager { white-space:nowrap; }
+.canvas-switch-modal .modal-actions .button { white-space:normal; }
+@media(max-width:1100px) {
+  body[data-workspace="canvas"][data-canvas-view="management"] .workbench,
+  body[data-workspace="canvas"][data-canvas-view="management"].inspector-open .workbench { grid-template-columns:84px minmax(0,1fr); }
+}
+@media(max-width:760px) {
+  body[data-workspace="canvas"][data-canvas-view="management"] .workbench,
+  body[data-workspace="canvas"][data-canvas-view="management"].inspector-open .workbench { grid-template-columns:52px minmax(0,1fr); }
+  .project-actions #canvas-back-to-manager { font-size:10px; padding:5px; }
+}

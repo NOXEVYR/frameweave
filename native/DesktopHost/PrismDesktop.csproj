@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>PrismDesktop</AssemblyName>
+    <AssemblyTitle>棱光</AssemblyTitle>
+    <Product>棱光</Product>
+    <ApplicationIcon>../../assets/frameweave.ico</ApplicationIcon>
+    <DebugType>none</DebugType>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WebView2SdkDir Condition="'$(WebView2SdkDir)'==''">$(MSBuildThisFileDirectory)..\webview2</WebView2SdkDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Microsoft.Web.WebView2.Core" HintPath="$(WebView2SdkDir)/Microsoft.Web.WebView2.Core.dll" />
+    <Reference Include="Microsoft.Web.WebView2.Wpf" HintPath="$(WebView2SdkDir)/Microsoft.Web.WebView2.Wpf.dll" />
+    <Content Include="$(WebView2SdkDir)/WebView2Loader.dll" CopyToOutputDirectory="PreserveNewest" Link="WebView2Loader.dll" />
+    <Content Include="$(WebView2SdkDir)/WEBVIEW2-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" Link="WEBVIEW2-LICENSE.txt" />
+    <EmbeddedResource Include="../../web/**/*"><LogicalName>Prism.Ui/%(RecursiveDir)%(Filename)%(Extension)</LogicalName></EmbeddedResource>
+    <Resource Include="../../assets/frameweave.ico" Link="frameweave.ico" />
+  </ItemGroup>
+</Project>

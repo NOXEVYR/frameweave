@@ -69,6 +69,30 @@ export function coerceFieldValue(field, raw) {
   return raw;
 }
 
+/** Historical enum literals may be displayed/stored for repair, never executed. */
+export function isSafeSelectLiteral(value) {
+  return typeof value === 'string' && value.length <= 64000 || typeof value === 'boolean' ||
+    typeof value === 'number' && Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value));
+}
+
+export function coerceEditorFieldValue(field, raw, { previousValue, allowPreservedLiteral = false } = {}) {
+  if (fieldType(field) === 'select' && allowPreservedLiteral && Object.is(raw, previousValue) && isSafeSelectLiteral(raw)) return raw;
+  return coerceFieldValue(field, raw);
+}
+
+/** Choices contain real candidates only; a preserved display item is not a choice. */
+export function selectFieldState(field, value) {
+  if (!isSafeSelectLiteral(value)) throw new Error(`「${field.label || field.id || '输入'}」的原选择不是安全字面量`);
+  const options = Array.isArray(field.options) ? field.options : null;
+  const selectedIndex = options ? options.findIndex(option => Object.is(option, value)) : -1;
+  const state = !options ? 'unproven' : !options.length ? 'empty' : selectedIndex < 0 ? 'stale' : 'ready';
+  return { state, selectedIndex, currentLabel: value === '' ? '（原值为空）' : String(value),
+    help: state === 'empty' ? '目录为空；保留原值。补齐资源后，请在“管理外部接口”重新编译候选。当前不能用于生成。'
+      : state === 'unproven' ? '未提供可验证的候选目录；保留原值。请在“管理外部接口”重新编译候选，当前不能用于生成。'
+        : state === 'stale' ? '当前名称不可用；保留原值，请明确选择一个可用候选。' : '',
+    choices: (options || []).map((option, index) => ({ value: String(index), label: String(option) })) };
+}
+
 export function validateValues(fields, values) {
   const source = packageValues(values);
   return Object.fromEntries(fields.map(field => [field.id, coerceFieldValue(field,
@@ -76,10 +100,59 @@ export function validateValues(fields, values) {
 }
 
 export function parseJSONWithSafeNumbers(text) {
+  if (typeof text !== 'string') throw new Error('工作流内容必须是 JSON 文本');
+  // Inspect object keys before JSON.parse discards duplicate members. Grammar and
+  // values are still parsed by the native parser; quoted values are never logged.
+  const stack = [];
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index], frame = stack.at(-1);
+    if (char === '"') {
+      const start = index++;
+      while (index < text.length && text[index] !== '"') {
+        if (text[index] === '\\') index++;
+        index++;
+      }
+      if (frame?.keys && frame.keyExpected && text[index] === '"') {
+        const key = JSON.parse(text.slice(start, index + 1));
+        if (frame.keys.has(key)) throw new Error(`JSON 对象存在重复字段（字符位置 ${start + 1}）；请保留明确的一项后重新导入`);
+        frame.keys.add(key);
+      }
+    } else if (char === '{' || char === '[') {
+      if (stack.length >= 256) throw new Error('工作流 JSON 嵌套超过 256 层');
+      stack.push(char === '{' ? { keys: new Set(), keyExpected: true } : {});
+    } else if (char === '}' || char === ']') stack.pop();
+    else if (char === ':' && frame?.keys) frame.keyExpected = false;
+    else if (char === ',' && frame?.keys) frame.keyExpected = true;
+  }
   return JSON.parse(text, (_key, value) => {
     if (typeof value === 'number' && (!Number.isFinite(value) || Number.isInteger(value) && !Number.isSafeInteger(value))) throw new Error('随机种子或整数超出浏览器安全范围，请先改为不超过 9007199254740991 的整数');
     return value;
   });
+}
+
+/** Extract a standard API carrier without changing its graph or wrapper metadata. */
+export function apiPromptFromDocument(document) {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('请导入 ComfyUI API JSON 对象');
+  const isPrompt = value => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length &&
+    Object.values(value).every(node => node && typeof node.class_type === 'string' && node.class_type &&
+      node.inputs && typeof node.inputs === 'object' && !Array.isArray(node.inputs));
+  // These are legal node IDs too; a bare graph is not a wrapper.
+  if (isPrompt(document)) return document;
+  if (Object.hasOwn(document, 'prompt') && Object.hasOwn(document, 'workflow')) {
+    const equal = (a, b, depth = 0) => {
+      if (a === b) return true;
+      if (depth > 256 || !a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+      const keys = Object.keys(a);
+      return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equal(a[key], b[key], depth + 1));
+    };
+    if (!equal(document.prompt, document.workflow)) throw new Error('JSON 同时包含不同的 prompt 和 workflow 内容；请明确导出所需的单一 API 图后重新导入，原文件未修改');
+  }
+  const prompt = Object.hasOwn(document, 'prompt') ? document.prompt :
+    Object.hasOwn(document, 'workflow') ? document.workflow : document;
+  if (!isPrompt(prompt)) {
+    throw new Error('未识别到可执行的 ComfyUI API 节点。请使用「导出 API」JSON。');
+  }
+  return prompt;
 }
 
 export function parsePackageDocument(text) {
@@ -91,8 +164,7 @@ export function parsePackageDocument(text) {
     return document;
   }
   if (Array.isArray(document.nodes) || Array.isArray(document.links)) throw new Error('这是普通 ComfyUI 画布。请在 ComfyUI 开启开发者模式，选择「Save (API Format) / 导出 API」，再导入这里。');
-  const prompt = document.prompt || document;
-  if (!prompt || Array.isArray(prompt) || typeof prompt !== 'object' || !Object.keys(prompt).length || !Object.values(prompt).every(node => node && typeof node.class_type === 'string' && node.inputs && typeof node.inputs === 'object' && !Array.isArray(node.inputs))) throw new Error('未识别到可执行的 ComfyUI API 节点。请使用「导出 API」JSON。');
+  apiPromptFromDocument(document);
   return document;
 }
 
@@ -102,7 +174,7 @@ export function redactLocalText(value, knownPaths = []) {
   for (const path of [...knownPaths].filter(path => typeof path === 'string' && path.length > 3).sort((a, b) => b.length - a.length)) {
     text = text.split(path).join('[本机路径]').split(path.replaceAll('\\', '/')).join('[本机路径]');
   }
-  return text.replace(/[A-Za-z]:[\\/][^\n\r"'<>|，。；]*/g, '[本机路径]')
+  return text.replace(/(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\n\r"'<>|，。；]*/g, '[本机路径]')
     .replace(/\\\\[^\n\r"'<>|，。；]+/g, '[本机路径]')
     .replace(/\/(?:Users|home|mnt|media|Volumes)\/[^\n\r"'<>|，。；]+/g, '[本机路径]');
 }

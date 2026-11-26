@@ -49,6 +49,42 @@ def params_prompt(text="hello", seed=10, mode="fast"):
 
 
 class EditorInterfaceTests(unittest.TestCase):
+    def test_custom_file_sinks_infer_only_a_unique_live_media_input_kind(self):
+        for media in ("IMAGE", "AUDIO", "VIDEO"):
+            with self.subTest(media=media):
+                info = {"Source": {"input": {"required": {}}, "output": [media]},
+                        "CustomSink": {"input": {"required": {"asset": [media], "prefix": ["STRING"]},
+                                                "optional": {"preview": [media]}},
+                                       "output": [], "output_node": True}}
+                prompt = {"1": {"class_type": "Source", "inputs": {}},
+                          "2": {"class_type": "CustomSink", "inputs": {"asset": ["1", 0], "prefix": "result"}}}
+                self.assertEqual(inspect_interface(prompt, info)["outputs"][0]["mediaType"], media.lower())
+                info["CustomSink"]["input"]["optional"]["other"] = ["AUDIO" if media != "AUDIO" else "VIDEO"]
+                self.assertEqual(inspect_interface(prompt, info)["outputs"][0]["mediaType"], "unknown")
+                del info["CustomSink"]["input"]["optional"]["other"]
+                info["CustomSink"]["output"] = ["CUSTOM_DATA"]
+                self.assertEqual(inspect_interface(prompt, info)["outputs"][0]["mediaType"], "unknown")
+
+    def test_sink_inference_preserves_known_image_to_video_transforms_and_ignores_enums(self):
+        info = {"Source": {"input": {"required": {}}, "output": ["IMAGE"]},
+                "VHS_VideoCombine": {"input": {"required": {"images": ["IMAGE"]}}, "output": [], "output_node": True},
+                "CustomSink": {"input": {"required": {"format": [["IMAGE", "AUDIO", "VIDEO"]]}}, "output": [], "output_node": True}}
+        prompt = {"1": {"class_type": "Source", "inputs": {}},
+                  "2": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["1", 0]}},
+                  "3": {"class_type": "CustomSink", "inputs": {"format": "IMAGE"}}}
+        self.assertEqual({output["id"]: output["mediaType"] for output in inspect_interface(prompt, info)["outputs"]},
+                         {"2": "video", "3": "unknown"})
+
+    def test_custom_sink_inference_reads_only_the_active_dynamic_media_branch(self):
+        info = {"Source": {"input": {"required": {}}, "output": ["AUDIO"]},
+                "CustomSink": {"input": {"required": {"format": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+                    {"key": "audio", "inputs": {"required": {"asset": ["AUDIO"]}}},
+                    {"key": "video", "inputs": {"required": {"asset": ["VIDEO"]}}},
+                ]}]}}, "output": [], "output_node": True}}
+        prompt = {"1": {"class_type": "Source", "inputs": {}},
+                  "2": {"class_type": "CustomSink", "inputs": {"format": "audio", "format.asset": ["1", 0]}}}
+        self.assertEqual(inspect_interface(prompt, info)["outputs"][0]["mediaType"], "audio")
+
     def test_inspection_includes_model_encoder_lora_and_prompt_roles(self):
         prompt = params_prompt()
         prompt["2"] = {"class_type": "Text", "inputs": {"text": "positive"},
@@ -79,6 +115,34 @@ class EditorInterfaceTests(unittest.TestCase):
             param_info(),
         )
         self.assertEqual(result["outputs"], [])
+
+    def test_media_labels_use_only_explicit_custom_node_titles(self):
+        info = {
+            "LoadImage": {"display_name": "Load Image", "input": {"required": {
+                "image": [["input.png"], {"image_upload": True}],
+            }}, "output": ["IMAGE"]},
+            "AudioLoaderCustom": {"display_name": "Load Audio", "input": {"required": {
+                "audio": ["STRING", {"audio_upload": True}],
+            }}, "output": ["AUDIO"]},
+            "LoadVideo": {"display_name": "Load Video", "input": {"required": {
+                "file": ["COMBO", {"options": ["input.mp4"], "video_upload": True}],
+            }}, "output": ["VIDEO"]},
+        }
+        for node_type, input_name, value in (
+            ("LoadImage", "image", "input.png"),
+            ("AudioLoaderCustom", "audio", "input.wav"),
+            ("LoadVideo", "file", "input.mp4"),
+        ):
+            prompt = {"7": {"class_type": node_type, "inputs": {input_name: value}}}
+            original_label = inspect_interface(prompt, info)["fields"][0]["label"]
+            for title in ("  主参考素材  ", node_type, info[node_type]["display_name"], " ", None):
+                with self.subTest(node_type=node_type, title=title):
+                    prompt["7"]["_meta"] = {"title": title}
+                    before = copy.deepcopy(prompt)
+                    field = inspect_interface(prompt, info)["fields"][0]
+                    self.assertEqual(field["label"], "主参考素材 · 7" if title == "  主参考素材  "
+                                     else original_label)
+                    self.assertEqual(prompt, before)
 
     def test_inspection_reports_known_and_schema_inferred_output_media(self):
         prompt = {
@@ -127,11 +191,14 @@ class EditorInterfaceTests(unittest.TestCase):
                       "mode": "fast",
                   }}}
         info = param_info()
+        info["Params"]["input"]["required"].update({
+            f"custom_{index}": ["INT"] for index in range(70)
+        })
 
         default_fields = inspect_document(prompt, info)["fields"]
         all_fields = inspect_document(prompt, info, field_limit=None)["fields"]
         limited = inspect_document(prompt, info, field_limit=1)["fields"]
-        self.assertEqual(len(default_fields), 64)
+        self.assertEqual(default_fields, all_fields)
         self.assertGreater(len(all_fields), 64)
         self.assertEqual(len(limited), 1)
         self.assertEqual(limited[0]["type"], "image")
@@ -139,8 +206,12 @@ class EditorInterfaceTests(unittest.TestCase):
         oversized = {"1": {"class_type": "Params", "inputs": {
             f"value_{index}": index for index in range(4097)
         }}}
+        oversized_info = param_info()
+        oversized_info["Params"]["input"]["required"].update({
+            name: ["INT"] for name in oversized["1"]["inputs"]
+        })
         with self.assertRaisesRegex(ValueError, "4096"):
-            inspect_document(oversized, info, field_limit=None)
+            inspect_document(oversized, oversized_info, field_limit=None)
         with self.assertRaisesRegex(ValueError, "field_limit"):
             inspect_document(prompt, info, field_limit=4097)
 

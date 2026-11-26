@@ -75,6 +75,24 @@ class MCPHTTPTests(unittest.TestCase):
                 status, _, _ = self.rpc("tools/list", headers={"Authorization": auth, "X-FW-Token": self.app.csrf})
                 self.assertEqual(status, 403)
 
+    def test_cancel_and_explicit_refresh_share_nonterminal_contract(self):
+        generated = self.tool('fw_generate', {'request_id': 'cancel-flow-test', 'request': API_JOB})
+        self.assertFalse(generated['isError'])
+        job_id = generated['structuredContent']['id']
+        first = self.tool('fw_cancel', {'job_id': job_id})['structuredContent']
+        self.assertEqual(first['cancellation']['state'], 'requested')
+        self.assertNotEqual(first['status'], 'cancelled')
+        before = [call for call in self.backend.calls if call[0] == 'POST']
+        again = self.tool('fw_cancel', {'job_id': job_id})['structuredContent']
+        self.assertEqual(first['cancellation']['id'], again['cancellation']['id'])
+        result = self.tool('fw_jobs', {'job_id': job_id, 'refresh': True})
+        self.assertFalse(result['isError'])
+        self.assertEqual(result['structuredContent']['status'], 'unknown')
+        for args in ({'refresh': True}, {'request_id': 'cancel-flow-test', 'refresh': True},
+                     {'job_id': job_id, 'request_id': 'cancel-flow-test', 'refresh': True}):
+            self.assertTrue(self.tool('fw_jobs', args)['isError'])
+        self.assertEqual([call for call in self.backend.calls if call[0] == 'POST'], before)
+
     def test_raw_package_transport_preserves_identity_over_mcp_http_without_generation(self):
         inspected = self.tool("fw_package_inspect", {"source_json": json.dumps(API_JOB["prompt"])})
         self.assertFalse(inspected["isError"], inspected)
@@ -92,7 +110,7 @@ class MCPHTTPTests(unittest.TestCase):
             "source_json": exported["source_json"]}}, headers={"Authorization": ""})
         self.assertEqual(status, 403)
         self.assertEqual(len(self.app.packages.list()), 1)
-        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(self.backend.calls, [("GET", "/object_info", None)])
 
     def test_host_origin_and_cross_site_are_rejected(self):
         for headers in ({"Host": "attacker.test"}, {"Origin": "https://attacker.test"}, {"Sec-Fetch-Site": "cross-site"}):

@@ -3,7 +3,7 @@
 - FrameWeave 原创客户端：MIT，见 LICENSE。
 - Windows 便携包包含 Python 3.11 运行库：Python Software Foundation License，见包内 PYTHON-LICENSE.txt；[官方许可](https://docs.python.org/3/license.html)。
 - PyInstaller 用于打包：[GPL 及构建产物例外](https://pyinstaller.org/en/stable/license.html)。PyInstaller 不改变原创应用的 MIT 许可。
-- 系统 Microsoft Edge 由操作系统/用户提供，不随包分发。客户端不访问用户登录数据或浏览记录。
+- 独立 Windows 窗口使用系统 .NET 8 Desktop Runtime 和 WebView2 Runtime。随包分发的 Microsoft.Web.WebView2 SDK 组件遵循 [Microsoft WebView2 SDK 许可](native/webview2/WEBVIEW2-LICENSE.txt)，Windows 包内另附 WEBVIEW2-LICENSE.txt。
 - ComfyUI 是独立安装的外部推理服务：[官方项目与许可](https://github.com/Comfy-Org/ComfyUI)。客户端通过本机 HTTP API 交互，不分发 ComfyUI 或其插件。
 - **MiniMax H3** 是 MiniMax 的模型，受 [H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE) 约束。
 - **Krea 2** 受 [Krea 2 Community License](https://www.krea.ai/krea-2-licensing) 约束。

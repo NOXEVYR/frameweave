@@ -4,7 +4,7 @@ import copy
 import unittest
 
 from frameweave.editor_interfaces import inspect_interface
-from frameweave.workflows import validate_prompt
+from frameweave.workflows import validate_editor_prompt, validate_prompt
 
 
 def video_info():
@@ -112,6 +112,40 @@ class VideoFormatInputTests(unittest.TestCase):
         widgets.append(["save_output", "STRING"])
         with self.assertRaisesRegex(ValueError, "必须为布尔值"):
             validate_prompt(video_prompt(save_output="yes"), info)
+
+    def test_dictionary_format_profiles_are_metadata_not_input_widgets(self):
+        info = {"GenericInput": {"input": {"required": {"format": [["None", "Wan"], {
+            "formats": {"None": {}, "Wan": {"target_rate": 16, "dim": [8, 0, 8, 0], "frames": [4, 1]}},
+        }]}}, "output": ["IMAGE"]}}
+        for selected in ("None", "Wan"):
+            prompt = {"1": {"class_type": "GenericInput", "inputs": {"format": selected}}}
+            before = copy.deepcopy((info, prompt))
+            validate_prompt(prompt, info)
+            self.assertEqual(validate_editor_prompt(prompt, info)["issues"], [])
+            self.assertEqual(inspect_interface(prompt, info)["fields"][0]["options"], ["None", "Wan"])
+            self.assertEqual((info, prompt), before)
+        for inputs in ({"format": "missing"}, {"format": "Wan", "frames": 4},
+                       {"format": "Wan", "target_rate": 16}):
+            with self.subTest(inputs=inputs), self.assertRaises(ValueError):
+                validate_editor_prompt({"1": {"class_type": "GenericInput", "inputs": inputs}}, info)
+
+    def test_dictionary_profile_cannot_declare_extra_inputs_or_override_enum(self):
+        info = video_info()
+        formats = info["VHS_VideoCombine"]["input"]["required"]["format"][1]["formats"]
+        formats["video/h264-mp4"] = {"inputs": {"required": {"evil": ["STRING"]}}, "save_output": "STRING"}
+        validate_prompt(video_prompt(), info)
+        with self.assertRaisesRegex(ValueError, "不支持输入"):
+            validate_prompt(video_prompt(evil="ignored metadata"), info)
+        with self.assertRaisesRegex(ValueError, "必须为布尔值"):
+            validate_prompt(video_prompt(save_output="yes"), info)
+
+    def test_scalar_or_non_json_format_profiles_remain_invalid(self):
+        for value in ("widget=code", 1, True, None, {"frames": float("nan")}, {"frames": object()}):
+            info = video_info()
+            formats = info["VHS_VideoCombine"]["input"]["required"]["format"][1]["formats"]
+            formats["video/h264-mp4"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_editor_prompt(video_prompt(), info)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,67 @@
+/* Shared palette hierarchy. Color-only rules keep the existing responsive layout. */
+body { background:var(--bg); color:var(--text); }
+a,.text-link { color:var(--accent-text); }
+input,textarea,select,.studio-field input,.studio-field textarea,.studio-field select {
+  background:var(--surface); color:var(--text);
+}
+input::placeholder,textarea::placeholder { color:var(--muted); opacity:1; }
+input[type=checkbox],input[type=radio],progress { accent-color:var(--accent); }
+button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible {
+  outline-color:var(--focus);
+}
+.topbar,.workspace-bar,.app-navigation,.toolrail,.inspector,
+body[data-canvas-view=management][data-workspace=canvas] .topbar,
+body[data-workspace=canvas][data-canvas-view=management] .app-navigation {
+  background:var(--panel); border-color:var(--line);
+}
+.brand,.project-name,.workspace-heading,.node,.node-title,.node-header strong,
+.canvas-manager-heading,.canvas-manager-toolbar,.studio-heading,.studio-section h2,
+.studio-field,.modal,.modal h2,.modal h3 { color:var(--text); }
+.canvas-manager,#studio-root,.studio-results,
+body[data-workspace=canvas][data-canvas-view=editor] .canvas-shell,.canvas-shell>.canvas {
+  background-color:var(--bg);
+}
+.canvas-manager-search-box input { background:var(--panel); }
+.canvas-cover>img,.canvas-manager-card-visual { background-color:var(--panel); }
+.canvas-manager-current-badge:not(.is-unsaved) { background:var(--accent-dim); border-color:var(--prism-ice); color:var(--accent-text); }
+.workspace-nav,.button,.rail-button,.canvas-action-button,.canvas-menu-item,.canvas-node-search-result,
+.canvas-manager-text-button,.footer-button,.tab { color:var(--text); }
+.workspace-nav.active,
+body[data-workspace=canvas][data-canvas-view=management] .workspace-nav.active {
+  background:var(--accent-dim); border-color:var(--prism-ice); color:var(--accent-text); box-shadow:inset 3px 0 var(--prism-cobalt);
+}
+.workspace-nav:hover,.button:hover,.rail-button:hover,.canvas-menu-item:hover { background:var(--surface-hover); }
+.button.primary,.studio-generate,#editor-command-deck #workflow-run-all {
+  background:var(--accent); border-color:var(--accent); color:var(--on-accent);
+}
+.button.primary:hover,.studio-generate:hover,#editor-command-deck #workflow-run-all:hover { background:var(--prism-indigo); color:var(--on-accent); }
+#save-version,#editor-create-menu>summary,#editor-command-deck .pointer-tools button[aria-pressed=true] {
+  background:var(--accent-dim); border-color:var(--accent-line); color:var(--accent-text);
+}
+.node { background:var(--panel); }
+.node-header,.node-generation .node-header { background:var(--surface); }
+.node textarea,.node-body input,.node-body select { background:var(--surface); color:var(--text); }
+.node.selected { border-color:var(--accent-line); box-shadow:0 0 0 2px #5677de3d,0 8px 24px var(--shadow); }
+.node-header .node-badge { background:var(--surface-hover); color:var(--text); }
+.selection-box { border-color:var(--accent-line); background:#5677de19; }
+.engine-status { background:var(--surface); color:var(--text); }
+.status-dot { background:var(--muted); }
+.engine-status.online .status-dot,.inspector-foot .status-dot { background:var(--success); }
+.engine-status.offline .status-dot { background:var(--warning); }
+.framed-modal .modal-heading,.modal,.editor-interface-dialog,.workflow-connect-dialog { background:var(--panel); }
+dialog::backdrop,.modal::backdrop,.editor-interface-dialog::backdrop,.workflow-connect-dialog::backdrop { background:#17234170; }
+.inspector-scroll { scrollbar-color:var(--line) transparent; }
+/* Semantic states remain distinct from the white application surfaces. */
+.job-tag.completed,.check-row.ok .check-symbol { color:var(--success); background:var(--success-bg); }
+.job-tag.queued { color:var(--warning); background:var(--warning-bg); }
+.job-tag.running,.studio-job-state { color:var(--accent-text); background:var(--accent-dim); }
+.job-tag.failed { color:var(--danger); background:var(--danger-bg); }
+.job-error,.node-status.error,.reference-import-state.error,.media-error,.toast.error,.workflow-run-error { color:var(--danger); }
+.job-warning,.audio-diagnostics,.audio-empty-state,.disabled-capability,.editor-interface-required { color:var(--warning); }
+.audio-diagnostics,.audio-empty-state,.disabled-capability { background:var(--warning-bg); border-color:var(--warning-line); }
+.audio-empty-state strong { color:var(--warning); }
+.audio-package-ready { color:var(--success); background:var(--success-bg); border-color:var(--success-line); }
+
+.canvas-card-more { background:var(--panel); border-color:var(--line); color:var(--text); }
+.canvas-card-more:hover,.canvas-card-more[aria-expanded=true],.canvas-card-menu button:hover,.canvas-card-menu button:focus-visible { background:var(--surface-hover); color:var(--text); }
+.canvas-card-more:focus-visible { outline-color:var(--focus); }

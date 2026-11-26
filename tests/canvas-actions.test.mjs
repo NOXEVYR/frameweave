@@ -1,9 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNode, connect, parseGraph, serializeGraph } from '../web/graph.mjs';
+import { createNode, connect, parseGraph, serializeGraph, generationPayload } from '../web/graph.mjs';
 import { selectionBounds, copySelection, pasteSelection, moveSelection, arrangeSelection, clampMenuPosition } from '../web/canvas-actions.mjs';
 
 const sizeOf = node => ({ width: node.width || 100, height: node.height || 80 });
+
+test('actual clipboard path keeps second legacy reference in its original slot', () => {
+  const first=createNode('reference',0,0,{name:'target.png'}), second=createNode('reference',0,400,{name:'person.png'}), edit=createNode('generation',400,0,{kind:'qwen21_edit'});
+  const graph={nodes:[first,second,edit],edges:[]};
+  connect(graph,first.id,edit.id);connect(graph,second.id,edit.id);
+  const fragment=pasteSelection(copySelection(graph,[second.id,edit.id]),{x:0,y:0},0);
+  assert.equal(fragment.edges[0].targetField,'image_2');
+  assert.throws(()=>generationPayload(fragment,fragment.nodes.find(n=>n.type==='generation').id),/image_1/);
+  assert.equal(graph.edges[1].targetField,undefined);
+});
 
 test('copy/paste carries only selected internal connections and detaches result jobs', () => {
   const prompt = createNode('prompt', 20, 40, { text: '保留提示词' });

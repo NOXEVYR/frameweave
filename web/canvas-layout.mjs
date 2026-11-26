@@ -1,3 +1,46 @@
+const visibleIn = (canvas, rect) => rect && [rect.left, rect.top, rect.right, rect.bottom, rect.width, rect.height].every(Number.isFinite) && rect.width > 0 && rect.height > 0 && rect.right > canvas.left && rect.left < canvas.right && rect.bottom > canvas.top && rect.top < canvas.bottom;
+const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+
+/** Actual chrome positions only; this never changes a viewport or a node. */
+export function canvasChromeOffsets(canvas, { topline, banner, actions } = {}) {
+  const topEnd = Math.max(0, ...[topline, banner].filter(rect => visibleIn(canvas, rect)).map(rect => rect.bottom - canvas.top));
+  const actionTop = Math.max(60, topEnd + 12);
+  const actionHeight = visibleIn(canvas, actions) ? actions.height : 44;
+  return { actionTop, workflowTop: actionTop + actionHeight + 8 };
+}
+
+/** Clear view rectangle, ranked by content fit when given a size, otherwise area. */
+export function canvasContentArea(canvas, overlays = [], contentSize) {
+  const width = Math.max(0, canvas.width), height = Math.max(0, canvas.height);
+  const visible = overlays.filter(rect => visibleIn(canvas, rect));
+  const margin = Math.min(32, width / 8);
+  const top = clamp(Math.max(28, ...visible.filter(rect => !rect.kind || rect.kind === 'top').map(rect => rect.bottom - canvas.top + 18)), 0, height);
+  const bottomOverlays = visible.filter(rect => rect.kind === 'bottom');
+  const end = clamp(bottomOverlays.length ? Math.min(...bottomOverlays.map(rect => rect.top - canvas.top - 12)) : height - 72, top, height);
+  let candidates = [{ x: margin, y: top, width: Math.max(0, width - margin * 2), height: end - top }];
+  // Only fixed canvas chrome is accepted here, never workflow nodes. Bound work
+  // independently of workflow size, even if a caller accidentally supplies more.
+  const obstacles = visible.filter(rect => rect.kind === 'obstacle');
+  if (obstacles.length > 8) return { x: margin, y: top, width: 0, height: 0 };
+  for (const rect of obstacles) {
+    const obstacle = { left: rect.left - canvas.left - 12, right: rect.right - canvas.left + 12, top: rect.top - canvas.top - 12, bottom: rect.bottom - canvas.top + 12 };
+    const next = [];
+    for (const area of candidates) {
+      const right = area.x + area.width, bottom = area.y + area.height;
+      if (obstacle.right <= area.x || obstacle.left >= right || obstacle.bottom <= area.y || obstacle.top >= bottom) { next.push(area); continue; }
+      if (obstacle.left > area.x) next.push({ ...area, width: obstacle.left - area.x });
+      if (obstacle.right < right) next.push({ ...area, x: obstacle.right, width: right - obstacle.right });
+      if (obstacle.top > area.y) next.push({ ...area, height: obstacle.top - area.y });
+      if (obstacle.bottom < bottom) next.push({ ...area, y: obstacle.bottom, height: bottom - obstacle.bottom });
+    }
+    candidates = next;
+    if (!candidates.length) return { x: margin, y: top, width: 0, height: 0 };
+  }
+  const fit = contentSize && Number.isFinite(contentSize.width) && contentSize.width > 0 && Number.isFinite(contentSize.height) && contentSize.height > 0
+    ? area => Math.min(area.width / contentSize.width, area.height / contentSize.height) : () => 0;
+  return candidates.sort((a, b) => fit(b) - fit(a) || b.width * b.height - a.width * a.height || b.width - a.width)[0];
+}
+
 /** Find a nearby empty rectangle without moving existing canvas content. */
 export function findFreePosition(occupied, size, preferred, gap = 36) {
   const limit = 1e7;

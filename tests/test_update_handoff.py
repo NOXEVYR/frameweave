@@ -86,7 +86,7 @@ class UpdateHandoffTests(unittest.TestCase):
             "version": "0.10.0", "filename": self.archive.name,
             "path": str(self.archive.resolve()), "bytes": self.archive.stat().st_size,
             "sha256": hashlib.sha256(self.archive.read_bytes()).hexdigest(),
-            "exe_bytes": 8, "exe_sha256": hashlib.sha256(b"new exe").hexdigest(),
+            "exe_bytes": len(b"new exe"), "exe_sha256": hashlib.sha256(b"new exe").hexdigest(),
             "verified": True, "installed": False,
         }
         updates = self.data / "updates"
@@ -99,6 +99,9 @@ class UpdateHandoffTests(unittest.TestCase):
             "current_exe": str(self.old_exe), "install_base": str(self.install_base),
             "data_dir": str(self.data), "staged": self.staged, "port": 8765,
             "open_browser": True,
+            "current_version": "0.9.0",
+            "current_sha256": hashlib.sha256(self.old_exe.read_bytes()).hexdigest(),
+            "candidate_nonce": "f" * 64, "old_processes": [],
         }
         self.write_plan()
         self.new_exe = self.install_base / "PrismCanvas-0.10.0" / "PrismCanvas.exe"
@@ -135,6 +138,23 @@ class UpdateHandoffTests(unittest.TestCase):
             "lock_timeout": 0,
         }
         defaults.update(overrides)
+        original_probe = defaults["probe_fn"]
+        metadata = {}
+
+        def bound_probe(port, version):
+            value = original_probe(port, version)
+            if isinstance(value, dict):
+                value = dict(value)
+                instance = {"nonce": self.plan["candidate_nonce"] if version == "0.10.0" else "",
+                            "pid": 321, "data_dir": str(self.data),
+                            "executable": str(self.new_exe if version == "0.10.0" else self.old_exe)}
+                value.setdefault("instance", instance)
+                metadata.update({"instance": value["instance"], "pid": 321,
+                                 "url": f"http://127.0.0.1:{port}/", "version": value["version"]})
+            return value
+
+        defaults["probe_fn"] = bound_probe
+        defaults.setdefault("metadata_fn", lambda _: dict(metadata))
         return handoff.run_handoff(self.plan_path, **defaults), defaults
 
     def test_launch_copies_helper_writes_plan_and_starts_hidden_without_user_command(self):
@@ -144,7 +164,7 @@ class UpdateHandoffTests(unittest.TestCase):
             launch_args.append((args, kwargs))
             return FakeProcess()
 
-        with patch.object(handoff.subprocess, "Popen", side_effect=fake_popen):
+        with patch.object(handoff.subprocess, "Popen", side_effect=fake_popen), patch.object(handoff, "__version__", "0.9.0"):
             queued = handoff.launch_handoff(self.old_exe, self.data, self.staged, 8765)
         self.assertTrue(queued["queued"])
         self.assertEqual(queued["version"], "0.10.0")
@@ -180,6 +200,7 @@ class UpdateHandoffTests(unittest.TestCase):
         self.assertNotIn("--backend", args)
         self.assertEqual(spawn.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(spawn.call_args.kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertEqual(spawn.call_args.kwargs["env"]["PRISMCANVAS_UPDATE_NONCE"], self.plan["candidate_nonce"])
         shortcut.assert_called_once_with(
             str(self.old_exe), str(self.new_exe), "0.10.0",
             backup_dir=self.data / "updates" / "shortcut-backups",
@@ -245,7 +266,7 @@ class UpdateHandoffTests(unittest.TestCase):
         spawn = Mock(side_effect=[FakeProcess(code=1), FakeProcess()])
         result, _ = self.run_with(spawn=spawn, probe_fn=lambda *_: None, health_timeout=0,
                                   port_in_use_fn=lambda _port: False)
-        self.assertEqual(result["state"], "recovered-old-version")
+        self.assertEqual(result["state"], "recovery-unverified")
         self.assertEqual(spawn.call_count, 2)
         self.assertEqual(spawn.call_args.args[0][0], str(self.old_exe))
 
@@ -282,13 +303,15 @@ class UpdateHandoffTests(unittest.TestCase):
     def test_shortcut_failure_shuts_down_only_after_fresh_candidate_identity(self):
         spawn = Mock(side_effect=[FakeProcess(), FakeProcess()])
         ports = iter([False, False, False])
-        shutdown = Mock(return_value=True)
+        candidate = FakeProcess()
+        spawn = Mock(side_effect=[candidate, FakeProcess()])
+        shutdown = Mock(side_effect=lambda *args: setattr(candidate, "code", 0) or True)
         with patch.object(handoff, "_post_shutdown", shutdown):
             # The handoff's safe shutdown path calls _post_shutdown only after
             # a fresh exact-version/token identity probe succeeds.
             result, _ = self.run_with(spawn=spawn,
                                       shortcut_fn=Mock(side_effect=OSError("desktop read-only")),
-                                      port_in_use_fn=lambda _port: next(ports),
+                                      port_in_use_fn=lambda _port: next(ports, False),
                                       probe_fn=lambda port, version: {
                                           "application": "PrismCanvas", "version": version, "csrf": TOKEN,
                                       })
@@ -363,6 +386,100 @@ class UpdateHandoffTests(unittest.TestCase):
         self.write_plan()
         result, _ = self.run_with()
         self.assertEqual(result["state"], "failed")
+
+    def test_same_version_listener_with_wrong_nonce_does_not_switch_or_shutdown(self):
+        shortcut = Mock()
+        shutdown = Mock()
+        payload = {"application": "PrismCanvas", "version": "0.10.0", "csrf": TOKEN,
+                   "instance": {"nonce": "0" * 64, "pid": 321, "data_dir": str(self.data),
+                                "executable": str(self.new_exe)}}
+        with patch.object(handoff, "_post_shutdown", shutdown):
+            result, _ = self.run_with(probe_fn=lambda *_: payload, shortcut_fn=shortcut)
+        self.assertEqual(result["state"], "candidate-unverified")
+        shortcut.assert_not_called()
+        shutdown.assert_not_called()
+
+    def test_bootstrap_must_match_persistent_data_directory_metadata(self):
+        shortcut = Mock()
+        result, _ = self.run_with(metadata_fn=lambda _: {}, shortcut_fn=shortcut)
+        self.assertEqual(result["state"], "candidate-unverified")
+        shortcut.assert_not_called()
+
+    def test_original_process_parent_must_exit_before_extraction(self):
+        prepare = Mock()
+        waiter = Mock(return_value=False)
+        result, _ = self.run_with(process_wait_fn=waiter, prepare_install_fn=prepare)
+        self.assertEqual(result["state"], "instance-busy")
+        prepare.assert_not_called()
+        waiter.assert_called_once()
+
+    def test_finished_transaction_is_idempotent_and_keeps_durable_phases(self):
+        first, _ = self.run_with()
+        spawn = Mock()
+        second, _ = self.run_with(spawn=spawn)
+        self.assertEqual(first, second)
+        spawn.assert_not_called()
+        journal = json.loads(self.plan_path.with_suffix(".transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "finished")
+        self.assertEqual(journal["previous_exe"], str(self.old_exe))
+        self.assertEqual(journal["candidate_exe"], str(self.new_exe))
+        self.assertNotIn(TOKEN, json.dumps(journal))
+
+    def test_interrupted_launch_is_preserved_and_not_replayed(self):
+        journal = self.plan_path.with_suffix(".transaction.json")
+        journal.write_text(json.dumps({"phase": "launching-candidate"}), encoding="utf-8")
+        spawn = Mock()
+        result, _ = self.run_with(spawn=spawn)
+        self.assertEqual(result["state"], "transaction-interrupted")
+        spawn.assert_not_called()
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["phase"], "launching-candidate")
+
+    def test_missing_candidate_poll_cannot_count_as_exited(self):
+        spawn = Mock(return_value=object())
+        result, _ = self.run_with(spawn=spawn, probe_fn=lambda *_: None)
+        self.assertEqual(result["state"], "candidate-unverified")
+        self.assertEqual(spawn.call_count, 1)
+
+    def test_equal_version_plan_is_rejected_without_starting(self):
+        self.plan["current_version"] = self.staged["version"]
+        self.write_plan()
+        spawn = Mock()
+        result, _ = self.run_with(spawn=spawn)
+        self.assertEqual(result["state"], "failed")
+        spawn.assert_not_called()
+
+    def test_pyinstaller_environment_is_reset_and_nonce_is_not_inherited_by_rollback(self):
+        spawn = Mock(return_value=FakeProcess())
+        with patch.dict(os.environ, {"PRISMCANVAS_UPDATE_NONCE": "old-value"}):
+            handoff._spawn_candidate(self.old_exe, self.data, 8765, False,
+                                     self.data / "updates" / "test.log", spawn)
+        self.assertNotIn("PRISMCANVAS_UPDATE_NONCE", spawn.call_args.kwargs["env"])
+        self.assertEqual(spawn.call_args.kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+    def test_unknown_port_status_prevents_old_restart(self):
+        def port_status(_):
+            if spawn.call_count:
+                raise OSError("port unavailable")
+            return False
+        spawn = Mock(return_value=FakeProcess(code=1))
+        result, _ = self.run_with(spawn=spawn, probe_fn=lambda *_: None, port_in_use_fn=port_status)
+        self.assertEqual(result["state"], "recovery-blocked")
+        self.assertEqual(spawn.call_count, 1)
+
+    def test_bound_identity_rejects_wrong_executable_data_dir_and_missing_metadata(self):
+        instance = {"nonce": "f" * 64, "pid": 321, "data_dir": str(self.data),
+                    "executable": str(self.new_exe)}
+        payload = {"application": "PrismCanvas", "version": "0.10.0", "csrf": TOKEN,
+                   "instance": instance}
+        metadata = {"instance": instance, "pid": 321, "version": "0.10.0",
+                    "url": "http://127.0.0.1:8765/"}
+        self.assertTrue(handoff._bound_identity(payload, metadata, "0.10.0", self.new_exe,
+                                               self.data, 8765, "f" * 64))
+        for field, value in (("executable", str(self.old_exe)), ("data_dir", str(self.root)),
+                             ("pid", False), ("nonce", "0" * 64)):
+            changed = {**instance, field: value}
+            self.assertFalse(handoff._bound_identity({**payload, "instance": changed},
+                {**metadata, "instance": changed}, "0.10.0", self.new_exe, self.data, 8765, "f" * 64))
 
 
 if __name__ == "__main__":

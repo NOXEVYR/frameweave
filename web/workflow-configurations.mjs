@@ -1,5 +1,7 @@
 import { parseGraph, serializeGraph } from './graph.mjs';
 import { frameDialog } from './workspace-tools.mjs';
+import { validateCanvasStructure } from './workflow-canvas.mjs';
+import { normalizeTextCompositions, composeTextInput, recordTextContribution } from './text-input-composition.mjs';
 
 /** Reusable settings are local canvas snapshots, independent of job history. */
 export function configurationBundle(bundle, nodeId, name) {
@@ -12,25 +14,36 @@ export function configurationBundle(bundle, nodeId, name) {
   if (!pack || copy.data.editor_id && !editor) throw new Error('配置缺少工作流定义，原画布未更改');
   // Prompt wires have stable text values. Media and upstream generation outputs
   // are deliberately not captured as reusable file references.
+  const compositions = normalizeTextCompositions(copy.data.packageTextCompositions, copy.data.packageFields);
+  const textInputs = new Map();
+  const contributions = new Set();
   for (const edge of source.edges.filter(item => item.target === nodeId)) {
     const parent = source.nodes.find(item => item.id === edge.source);
     const field = (copy.data.packageFields || []).find(item => item.id === edge.targetField);
+    recordTextContribution(contributions, edge, { sourceType: parent?.type, fieldType: field?.type, composition: compositions[field?.id] });
     if (parent?.type === 'prompt' && field?.type === 'text') {
       const value = parent.data[edge.sourceField || 'text'];
       if (typeof value !== 'string' || value.length > 64000) throw new Error('连接的提示词超出工作流字段允许的文本范围');
-      copy.data.packageValues[field.id] = value;
+      if (compositions[field.id]) {
+        if (!textInputs.has(field.id)) textInputs.set(field.id, []);
+        textInputs.get(field.id).push(value);
+      } else copy.data.packageValues[field.id] = value;
     }
   }
-  for (const field of copy.data.packageFields || []) if (['image', 'audio'].includes(field.type)) copy.data.packageValues[field.id] = '';
+  for (const [id, incoming] of textInputs) copy.data.packageValues[id] = composeTextInput(compositions[id], incoming, copy.data.packageValues[id] ?? '');
+  for (const field of copy.data.packageFields || []) if (['image', 'audio', 'video'].includes(field.type)) copy.data.packageValues[field.id] = '';
   copy.data.packageMediaBackends = {};
   copy.data.title = name; copy.x = 80; copy.y = 80;
-  return {schema:'prismcanvas.project.v1', version:1, name, configuration:true,
+  const document = {schema:'prismcanvas.project.v1', version:1, name, configuration:true,
     canvas:JSON.parse(serializeGraph({nodes:[copy],edges:[]},{x:30,y:30,scale:1})),
     packages:[structuredClone(pack)], editors:editor ? [structuredClone(editor)] : []};
+  validateCanvasStructure(document);
+  return document;
 }
 
 export function configuredNodes(bundle) {
   if (bundle?.schema !== 'prismcanvas.project.v1' || bundle.version !== 1) throw new Error('配置记录格式无效');
+  validateCanvasStructure(bundle);
   return parseGraph(bundle.canvas).nodes.filter(node => node.type === 'generation' && node.data.kind === 'package' && node.data.package_id);
 }
 
@@ -48,7 +61,7 @@ export function createWorkflowConfigurations(host) {
     const dialog = openDialog('保存工作流配置');
     const label=el('label','配置名称'); label.className='field';
     const name=el('input');name.value=node.data.title;name.maxLength=120;name.setAttribute('aria-label','配置名称');label.append(name);
-    const note=el('p','保存外层参数、输入定义和完整内部工作流，不依赖生成队列。图片、音频与外部连线不随配置保存，下次重新上传或连接。');note.className='form-note';
+    const note=el('p','保存外层参数、输入定义和完整内部工作流，不依赖生成队列。图片、音频、视频与外部连线不随配置保存，下次重新上传或连接。');note.className='form-note';
     const status=el('p');status.className='form-note';status.setAttribute('role','status');
     const button=el('button','保存为新配置');button.className='button primary';
     button.onclick=async()=>{
@@ -62,18 +75,17 @@ export function createWorkflowConfigurations(host) {
   async function choose(target = null) {
     const dialog = openDialog('我的工作流配置');
     const note=el('p',target ? '选择已保存配置替换当前未配置节点。使用的是该配置的完整工作流，原导入文件仍保留在本机。已有连线时会添加为新节点。' : '选择已保存配置或画布中的工作流，添加到当前画布。无需从生成队列恢复。'); note.className='form-note';
-    const search=el('input');search.type='search';search.placeholder='搜索配置或画布名称';search.setAttribute('aria-label','搜索工作流配置');
+    const search=el('input');search.type='search';search.maxLength=120;search.placeholder='搜索配置或画布名称';search.setAttribute('aria-label','搜索工作流配置');
     const status=el('p','正在读取本地配置…');status.setAttribute('role','status');
     const list=el('div');list.className='workspace-library-list';
     dialog.append(note,search,status,list);frameDialog(dialog);dialog.showModal();
     try {
-      let response=await host.api('/api/canvases');if(!dialog.isConnected)return;
-      let loading=false, searchRevision=0;
-      status.textContent='按名称搜索全部已保存记录；仅载入参数，不启动生成。';
+      let response, searchRevision=0, timer, composing=false;
+      const current = revision => dialog.open && revision === searchRevision;
       function render(){
         list.replaceChildren();
         const rows=response.canvases;
-        if(!rows.length)list.append(el('p','暂无已保存配置。先建立外层参数，再点“保存此工作流配置”；已有“我的画布”记录也会出现在这里。'));
+        if(!rows.length)list.append(el('p',search.value ? '没有匹配的配置或画布。' : '暂无已保存配置。先建立外层参数，再点“保存此工作流配置”；已有“我的画布”记录也会出现在这里。'));
         for(const item of rows){
           const row=el('div');row.className='workflow-configuration-row';
           const title=el('strong',item.name), detail=el('p',new Date(item.created_at*1000).toLocaleString());detail.className='field-help';
@@ -89,26 +101,43 @@ export function createWorkflowConfigurations(host) {
                   await host.install(configurationBundle(stored.document,node.id,node.data.title),target);dialog.close();
                 }catch(error){status.textContent=error.message;}finally{pick.disabled=false;}};children.append(pick);
               }
-            }catch(error){status.textContent=error.message;}finally{inspect.disabled=false;}
+            }catch(error){if(inspect.isConnected && dialog.open)status.textContent=error.message;}finally{inspect.disabled=false;}
           };
           row.append(title,detail,inspect,children);list.append(row);
         }
         if(response.next_offset != null){
           const more=el('button','加载更早的配置');more.className='button quiet';
-          more.onclick=async()=>{if(loading)return;loading=true;more.disabled=true;const revision=searchRevision;
+          more.onclick=async()=>{if(more.disabled || !more.isConnected)return;more.disabled=true;const revision=searchRevision;
             try{const next=await host.api(`/api/canvases?offset=${response.next_offset}&q=${encodeURIComponent(search.value)}`);
-              if(dialog.isConnected&&revision===searchRevision){response={...next,canvases:[...response.canvases,...next.canvases]};render();}
-            }catch(error){if(dialog.isConnected&&revision===searchRevision)status.textContent=error.message;}finally{loading=false;more.disabled=false;}};
+              if(current(revision)){response={...next,canvases:[...response.canvases,...next.canvases]};render();}
+            }catch(error){if(current(revision))status.textContent=error.message;}finally{more.disabled=false;}};
           list.append(more);
         }
       }
-      let timer;
-      search.oninput=()=>{const revision=++searchRevision;clearTimeout(timer);timer=setTimeout(async()=>{
-        try{const result=await host.api(`/api/canvases?q=${encodeURIComponent(search.value)}`);
-          if(dialog.isConnected&&revision===searchRevision){response=result;render();}
-        }catch(error){if(dialog.isConnected&&revision===searchRevision)status.textContent=error.message;}
-      },200);};
-      dialog.addEventListener('close',()=>clearTimeout(timer),{once:true});render();
+      async function load(revision, query) {
+        if (!current(revision)) return;
+        try {
+          const result = await host.api(query ? `/api/canvases?q=${encodeURIComponent(query)}` : '/api/canvases');
+          if (!current(revision)) return;
+          response = result;
+          status.textContent = '按名称搜索全部已保存记录。';
+          render();
+        } catch (error) {
+          if (current(revision)) status.textContent = error.message;
+        }
+      }
+      function queueSearch() {
+        clearTimeout(timer);
+        const revision = ++searchRevision, query = search.value;
+        list.replaceChildren();
+        status.textContent = composing ? '输入法编辑中…' : '正在读取本地配置…';
+        if (!composing) timer = setTimeout(() => load(revision, query), 200);
+      }
+      search.oninput = queueSearch;
+      search.addEventListener('compositionstart', () => { composing = true; queueSearch(); });
+      search.addEventListener('compositionend', () => { composing = false; queueSearch(); });
+      dialog.addEventListener('close',()=>clearTimeout(timer),{once:true});
+      await load(searchRevision, '');
     }catch(error){status.textContent=error.message;}
   }
   return {save,choose};

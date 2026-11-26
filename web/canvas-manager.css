@@ -1,0 +1,84 @@
+.canvas-manager { grid-column:2/-1; grid-row:2; min-width:0; min-height:0; overflow:auto; padding:38px clamp(24px,4vw,64px) 36px; background:var(--panel); color:var(--text); scrollbar-gutter:stable; }
+.canvas-manager[hidden] { display:none; }
+.canvas-manager > * { max-width:1460px; margin-left:auto; margin-right:auto; }
+.canvas-manager-heading { margin-bottom:23px; }
+.canvas-manager-heading h1 { margin:0; font-size:32px; line-height:1.35; font-weight:700; letter-spacing:-.7px; }
+.canvas-manager-launch { display:grid; grid-template-columns:minmax(0,1fr); }
+.canvas-manager-create {
+  position:relative; isolation:isolate; display:flex; align-items:center; gap:18px; overflow:hidden;
+  width:100%; min-height:190px; padding:32px; border:1px solid var(--prism-ice); border-radius:18px;
+  background-color:var(--panel);
+  background-image:linear-gradient(114deg,transparent 53%,#b7c9ff33 53.2%,transparent 64%),
+    linear-gradient(114deg,transparent 68%,#d5ddff91 68.2%,transparent 82%),
+    linear-gradient(100deg,#fff 12%,#f8faff 57%,#e8eeff 100%);
+  color:var(--prism-indigo); text-align:left; transition:border-color .18s,transform .18s,box-shadow .18s;
+}
+.canvas-manager-create:hover { border-color:var(--accent-line); box-shadow:0 8px 25px var(--shadow); transform:translateY(-2px); }
+.canvas-manager-create-plus {
+  display:grid; place-items:center; flex-shrink:0; width:50px; height:50px; border-radius:15px;
+  background:linear-gradient(143deg,var(--prism-cobalt),var(--prism-indigo)); color:var(--on-accent);
+  box-shadow:0 4px 12px #34478924; font-size:35px; font-weight:400; line-height:1;
+}
+.canvas-manager-create-copy { position:relative; z-index:1; display:grid; gap:10px; }
+.canvas-manager-create-title { font-size:29px; line-height:1.3; font-weight:650; letter-spacing:-.5px; }
+.canvas-manager-create-art {
+  position:absolute; z-index:-1; right:8%; top:50%; width:clamp(150px,22%,245px); aspect-ratio:1.65;
+  transform:translateY(-50%); filter:drop-shadow(0 8px 8px #34478919); pointer-events:none;
+}
+.canvas-manager-art-sheet,.canvas-manager-art-dot,.canvas-manager-create-art::after { position:absolute; inset:0; }
+.canvas-manager-art-sheet:first-child {
+  clip-path:polygon(2% 59%,52% 2%,59% 51%,28% 81%);
+  background:linear-gradient(150deg,#93aff9,var(--prism-cobalt) 62%,var(--prism-indigo));
+}
+.canvas-manager-art-sheet:nth-child(2) {
+  clip-path:polygon(52% 2%,98% 24%,59% 51%);
+  background:linear-gradient(128deg,#ffdec9 30%,var(--prism-peach) 57%,var(--prism-ice) 92%);
+}
+.canvas-manager-art-dot {
+  clip-path:polygon(98% 24%,66% 96%,59% 51%);
+  background:linear-gradient(124deg,var(--prism-cobalt),var(--prism-indigo) 75%);
+}
+.canvas-manager-create-art::after {
+  content:""; clip-path:polygon(28% 81%,59% 51%,66% 96%,47% 73%);
+  background:linear-gradient(130deg,#fff,var(--prism-ice) 59%,#a7baf0);
+}
+.canvas-manager-action-state { margin-top:12px; color:var(--muted); font-size:14px; line-height:1.7; }
+.canvas-manager-action-state:empty { display:none; }
+.canvas-manager-recent { margin-top:25px; }
+.canvas-manager-toolbar { display:flex; align-items:center; gap:14px; }
+.canvas-manager-toolbar h2 { margin:0 auto 0 0; font-size:22px; line-height:1.5; font-weight:650; }
+.canvas-manager-search-box { position:relative; flex:0 1 250px; min-width:0; }
+.canvas-manager-search-box input { width:100%; min-height:40px; padding:9px 53px 9px 14px; border:1px solid var(--line); border-radius:10px; background:var(--panel); font-size:14px; }
+.canvas-manager-search-box input::-webkit-search-cancel-button { display:none; }
+.canvas-manager-text-button { min-height:38px; padding:8px 10px; border:0; border-radius:7px; background:transparent; color:var(--muted); font-size:14px; line-height:1.5; }
+.canvas-manager-text-button:hover { color:var(--muted); background:var(--surface-hover); }
+.canvas-manager-search-box .canvas-manager-text-button { position:absolute; right:4px; top:4px; min-height:32px; padding:5px 8px; font-size:12px; }
+.canvas-manager-list-state { margin:5px 0 13px; min-height:20px; color:var(--muted); font-size:13px; line-height:1.6; }
+.canvas-manager-list-state:empty { display:none; }
+.canvas-manager-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr)); gap:25px 22px; }
+.canvas-manager-list:has(> .canvas-manager-card:nth-child(2):last-child) { max-width:782px; }
+.canvas-manager-list:has(> .canvas-manager-card:only-child) { max-width:380px; grid-template-columns:minmax(0,1fr); }
+.canvas-manager-card { min-width:0; }
+.canvas-manager-project { display:block; width:100%; padding:0; border:0; border-radius:13px; background:transparent; text-align:left; }
+.canvas-manager-card-visual { position:relative; display:block; aspect-ratio:16/10; overflow:hidden; border:1px solid var(--line); border-radius:13px; background:var(--panel); transition:border-color .18s,box-shadow .18s; }
+.canvas-manager-card-visual > :first-child { width:100%; height:100%; object-fit:cover; }
+.canvas-manager-project:hover .canvas-manager-card-visual { border-color:var(--accent-line); box-shadow:0 7px 22px var(--shadow); }
+
+.canvas-manager-current-badge { position:absolute; top:12px; left:12px; padding:5px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--muted); font-size:12px; }
+.canvas-manager-current-badge.is-unsaved { background:var(--panel); color:var(--warning); border-color:var(--warning-line); }
+.canvas-manager-card-caption { display:block; padding:13px 2px 0; }
+.canvas-manager-card-title { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); font-size:16px; font-weight:600; line-height:1.6; }
+.canvas-manager-card-meta { display:flex; flex-wrap:wrap; align-items:center; gap:5px 14px; margin-top:4px; color:var(--muted); font-size:12px; line-height:1.6; font-variant-numeric:tabular-nums; }
+.canvas-manager-draft-state { color:var(--muted); }
+.canvas-manager-empty { grid-column:1/-1; display:grid; justify-items:center; gap:11px; border:1px dashed var(--line); border-radius:14px; padding:36px 20px 40px; background:var(--panel); text-align:center; }
+.canvas-manager-empty-symbol { display:grid; place-items:center; width:46px; height:46px; margin-bottom:3px; border:1px solid var(--line); border-radius:14px; background:var(--panel); color:var(--muted); font-size:25px; }
+.canvas-manager-empty h3 { margin:0; color:var(--muted); font-size:17px; font-weight:600; }
+.canvas-manager-empty p { color:var(--muted); font-size:14px; line-height:1.8; }
+.canvas-manager button:focus-visible,.canvas-manager input:focus-visible { outline:3px solid var(--focus); outline-offset:4px; }
+@media(min-width:1550px) { .canvas-manager-create { min-height:210px; }  }
+@media(max-width:1100px) { .canvas-manager { padding:28px 28px 32px; }  .canvas-manager-create { padding:26px; min-height:180px; gap:13px; } .canvas-manager-create-art { right:5%; } .canvas-manager-create-title { font-size:26px; }  }
+@media(max-width:900px) { .canvas-manager-create { min-height:170px; } .canvas-manager-create-art { right:5%; } }
+@media(max-width:760px) { .canvas-manager { grid-column:1/-1; grid-row:3; padding:25px 20px 30px; } .canvas-manager-heading h1 { font-size:28px; } .canvas-manager-recent { margin-top:24px; } }
+@media(max-width:560px) { .canvas-manager { padding:24px 16px; } .canvas-manager-heading { margin-bottom:21px; } .canvas-manager-create { padding:25px 21px; min-height:155px; border-radius:14px; } .canvas-manager-create-plus { width:42px; height:42px; font-size:29px; } .canvas-manager-create-title { font-size:26px; } .canvas-manager-create-art { width:clamp(90px,25%,130px); right:5%; } .canvas-manager-toolbar { flex-wrap:wrap; gap:10px; } .canvas-manager-toolbar h2 { font-size:21px; } .canvas-manager-search-box { flex:1 1 100%; order:3; } .canvas-manager-list { grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px 12px; } .canvas-manager-card-title { font-size:14px; } .canvas-manager-card-meta { font-size:11px; gap:2px 8px; } .canvas-manager-current-badge { top:7px; left:7px; padding:3px 6px; font-size:10px; }  }
+@media(max-width:390px) { .canvas-manager-list { grid-template-columns:1fr; } .canvas-manager-card-title { font-size:16px; } .canvas-manager-card-meta { font-size:12px; } }
+@media(prefers-reduced-motion:reduce) { .canvas-manager-create,.canvas-manager-card-visual { transition:none; } .canvas-manager-create:hover { transform:none; } }

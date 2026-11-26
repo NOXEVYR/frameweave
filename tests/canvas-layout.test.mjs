@@ -1,10 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findFreePosition, placeFragment } from '../web/canvas-layout.mjs';
+import { findFreePosition, placeFragment, canvasContentArea } from '../web/canvas-layout.mjs';
 
 function separate(first, second, gap = 36) {
   return first.x + first.width + gap <= second.x || second.x + second.width + gap <= first.x || first.y + first.height + gap <= second.y || second.y + second.height + gap <= first.y;
 }
+
+test('fitting and centering leave node headers below actual wrapped toolbars and status panels', () => {
+  const canvas = { left: 165, top: 124, right: 920, bottom: 720, width: 755, height: 596 };
+  const toolbar = { left: 190, top: 242, right: 500, bottom: 286, width: 310, height: 44 };
+  const panel = { left: 540, top: 242, right: 900, bottom: 340, width: 360, height: 98 };
+  const area = canvasContentArea(canvas, [toolbar, panel]);
+  assert.ok(canvas.top + area.y > panel.bottom);
+  assert.ok(canvas.top + area.y + area.height <= canvas.bottom - 60);
+  const hidden = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+  const outside = { ...panel, left: 950, right: 1310 };
+  assert.deepEqual(canvasContentArea(canvas, [toolbar, hidden, outside]), canvasContentArea(canvas, [toolbar]));
+});
 
 test('adding at the same viewport location preserves existing nodes and finds distinct space', () => {
   const occupied = [{ x: 0, y: 0, width: 338, height: 340 }, { x: 400, y: 0, width: 304, height: 480 }];

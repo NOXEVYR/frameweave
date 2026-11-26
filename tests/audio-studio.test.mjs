@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { audioIntegrationRequest, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields } from '../web/audio-studio.mjs';
+import { audioIntegrationRequest, audioMediaIssue, audioPackageChoices, audioUploadContextMatches, buildAudioPackageRequest, renderAudioFields } from '../web/audio-studio.mjs';
 
 const backend = 'http://127.0.0.1:8188';
 const packageDoc = { id: 'p-audio', name: '参考音频配音', fields: [
@@ -97,9 +97,9 @@ function walk(element, predicate) {
 }
 
 function deferred() {
-  let resolve;
-  const promise = new Promise(yes => { resolve = yes; });
-  return { promise, resolve };
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 function audioUploadView(t, { pack, draft, api, currentBackend = () => backend, isCurrent = () => true, errors = [] }) {
@@ -200,4 +200,68 @@ test('audio picker advertises and accepts only WAV, MP3, FLAC, and OGG', async t
   assert.equal(uploaded.length, 4);
   assert.equal(errors.length, 2);
   assert.ok(errors.every(error => /WAV、MP3、FLAC、OGG/.test(error.message)));
+});
+
+test('audio and image field callbacks block old values until upload succeeds or the user explicitly keeps them', async t => {
+  for (const type of ['audio', 'image']) await t.test(type, async t => {
+    const field = { id: 'ref', label: '参考素材', type, required: true };
+    const pack = { id: `p-${type}`, eligible: true, fields: [field] };
+    const draft = { package_id: pack.id, values: { ref: `old.${type === 'audio' ? 'wav' : 'png'}` }, mediaBackends: { ref: backend } };
+    const before = structuredClone(draft), result = deferred(), started = deferred();
+    const view = audioUploadView(t, { pack, draft, api: () => { started.resolve(); return result.promise; } });
+    view.input.files = [{ name: type === 'audio' ? 'new.wav' : 'new.png', size: 20, type: type === 'audio' ? 'audio/wav' : 'image/png' }];
+    const uploading = view.input.listeners.change(); await started.promise;
+    assert.deepEqual(draft, before);
+    assert.match(audioMediaIssue(draft), /正在上传/);
+    assert.throws(() => buildAudioPackageRequest(pack, draft, backend), /正在上传/);
+    result.reject(new Error('测试上传中断')); await uploading;
+    assert.deepEqual(draft, before);
+    assert.throws(() => buildAudioPackageRequest(pack, draft, backend), /上传失败/);
+    assert.match(walk(view.container, item => item.className === 'audio-upload-name').textContent, /原值.*已保留/);
+    const keep = walk(view.container, item => item.className?.includes('audio-keep-media'));
+    assert.equal(keep.hidden, false); keep.listeners.click();
+    assert.equal(buildAudioPackageRequest(pack, draft, backend).values.ref, before.values.ref);
+    assert.equal(audioMediaIssue(draft), '');
+  });
+});
+
+test('reselecting after failure commits the new media and reopening the form retains the recovery state', async t => {
+  const pack = { ...packageDoc, eligible: true, fields: [packageDoc.fields[1]] };
+  const draft = { package_id: pack.id, values: { voice_audio: 'old.wav' }, mediaBackends: { voice_audio: backend } };
+  let attempts = 0;
+  const api = async () => { if (++attempts === 1) throw new Error('上传失败'); return { name: 'new.wav', backend }; };
+  const view = audioUploadView(t, { pack, draft, api });
+  view.input.files = [{ name: 'new.wav', size: 20, type: 'audio/wav' }]; await view.input.listeners.change();
+  const reopened = new FakeElement('div');
+  renderAudioFields(reopened, { pack, draft, api, backend, onChange() {}, reportError() {} });
+  assert.equal(walk(reopened, item => item.className?.includes('audio-keep-media')).hidden, false);
+  assert.throws(() => buildAudioPackageRequest(pack, draft, backend), /上传失败/);
+  const input = walk(reopened, item => item.tagName === 'INPUT' && item.type === 'file');
+  input.files = [{ name: 'new.wav', size: 20, type: 'audio/wav' }]; await input.listeners.change();
+  assert.equal(buildAudioPackageRequest(pack, draft, backend).values.voice_audio, 'new.wav');
+  assert.equal(draft.mediaBackends.voice_audio, backend);
+});
+
+test('explicitly keeping the old value invalidates an in-flight response', async t => {
+  const pack = { ...packageDoc, eligible: true, fields: [packageDoc.fields[1]] };
+  const draft = { package_id: pack.id, values: { voice_audio: 'old.wav' }, mediaBackends: { voice_audio: backend } };
+  const result = deferred(), started = deferred();
+  const { container, input, errors } = audioUploadView(t, { pack, draft, api: () => { started.resolve(); return result.promise; } });
+  input.files = [{ name: 'new.wav', size: 20, type: 'audio/wav' }];
+  const uploading = input.listeners.change(); await started.promise;
+  walk(container, item => item.className?.includes('audio-keep-media')).listeners.click();
+  assert.equal(buildAudioPackageRequest(pack, draft, backend).values.voice_audio, 'old.wav');
+  result.resolve({ name: 'new.wav', backend }); await uploading;
+  assert.equal(draft.values.voice_audio, 'old.wav'); assert.equal(errors.length, 0);
+});
+
+test('failed media tickets are scoped to their package and do not affect another package', async t => {
+  const pack = { ...packageDoc, eligible: true, fields: [packageDoc.fields[1]] };
+  const draft = { package_id: pack.id, values: { voice_audio: 'old.wav' }, mediaBackends: { voice_audio: backend } };
+  const { input } = audioUploadView(t, { pack, draft, api: async () => { throw new Error('失败'); } });
+  input.files = [{ name: 'new.wav', size: 20, type: 'audio/wav' }]; await input.listeners.change();
+  draft.package_id = 'another';
+  assert.equal(buildAudioPackageRequest({ ...pack, id: 'another' }, draft, backend).values.voice_audio, 'old.wav');
+  draft.package_id = pack.id;
+  assert.throws(() => buildAudioPackageRequest(pack, draft, backend), /上传失败/);
 });

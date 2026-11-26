@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><AssemblyName>PrismDesktopChecks</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../native/DesktopHost/PrismDesktop.csproj" />
+    <Reference Include="Microsoft.Web.WebView2.Core" HintPath="../../native/webview2/Microsoft.Web.WebView2.Core.dll" />
+    <Reference Include="Microsoft.Web.WebView2.Wpf" HintPath="../../native/webview2/Microsoft.Web.WebView2.Wpf.dll" />
+  </ItemGroup>
+</Project>

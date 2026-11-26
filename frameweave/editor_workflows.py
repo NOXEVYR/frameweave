@@ -7,6 +7,7 @@ ComfyUI editor remains responsible for compiling its graph to an API prompt.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -14,45 +15,57 @@ import secrets
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from .packages import normalize_prompt
+from .packages import encoded, normalize_prompt
+from .input_contracts import normalize_additional_inputs
+from .editor_repairs import normalize_repair_overlay, repair_sources, fingerprint
+from .editor_sources import source_kind, source_receipt, source_receipts, source_reference, validate_package_id
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_NODES = 10_000
 MAX_LINKS = 50_000
 MAX_DEPTH = 80
 MAX_ITEMS = 500_000
+MAX_META_BYTES = 256 * 1024
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 ID_PATTERN = re.compile(r"e-[0-9a-f]{24}\Z")
 REVISION_PATTERN = re.compile(r"revision-([0-9]{8})\.json\Z")
+
+
+class _JSONContractError(ValueError):
+    """A safe parser diagnostic, without source text or user field values."""
 
 
 def _pairs_no_duplicates(items):
     value = {}
     for key, item in items:
         if key in value:
-            raise ValueError("JSON 不能包含重复键")
+            raise _JSONContractError("JSON 不能包含重复键")
         value[key] = item
     return value
 
 
 def _parse_integer(token):
-    value = int(token)
+    try:
+        value = int(token)
+    except ValueError:
+        raise _JSONContractError("JSON 整数位数超出解析上限") from None
     if abs(value) > MAX_SAFE_INTEGER:
-        raise ValueError("JSON 整数超过浏览器的精确范围")
+        raise _JSONContractError("JSON 整数超过浏览器的精确范围（绝对值不能超过 9007199254740991）")
     return value
 
 
 def _parse_float(token):
     value = float(token)
     if not math.isfinite(value):
-        raise ValueError("JSON 数字必须有限")
+        raise _JSONContractError("JSON 数字必须有限，不能使用 NaN 或 Infinity")
     return value
 
 
 def _reject_constant(_token):
-    raise ValueError("JSON 数字必须有限")
+    raise _JSONContractError("JSON 数字必须有限，不能使用 NaN 或 Infinity")
 
 
 def _walk_json(value):
@@ -126,7 +139,11 @@ def _parse_document(source):
                               object_pairs_hook=_pairs_no_duplicates,
                               parse_int=_parse_integer, parse_float=_parse_float,
                               parse_constant=_reject_constant)
-    except (json.JSONDecodeError, TypeError, ValueError, OverflowError,
+    except _JSONContractError as exc:
+        raise ValueError(f"ComfyUI 工作流无法导入：{exc}；请从原工具修复或重新导出，原文件未修改") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ComfyUI 工作流 JSON 语法错误（第 {exc.lineno} 行，第 {exc.colno} 列）；请检查该位置后重新导入，原文件未修改") from None
+    except (TypeError, ValueError, OverflowError,
             UnicodeError, RecursionError):
         raise ValueError("ComfyUI 工作流 JSON 无效或嵌套过深") from None
     _validate_document(document)
@@ -245,6 +262,7 @@ class EditorWorkflowStore:
         return {
             "id": meta["id"],
             "name": meta["name"],
+            "source_kind": meta.get("source_kind", "unknown"),
             "revision": revision,
             "nodes": len(nodes),
             "links": len(links),
@@ -261,11 +279,11 @@ class EditorWorkflowStore:
     def _read_meta(self, record_dir, workflow_id):
         path = self._safe_file(record_dir, "meta.json")
         try:
-            if path.stat().st_size > 64 * 1024:
+            if path.stat().st_size > MAX_META_BYTES:
                 raise ValueError("记录元数据超过大小上限")
             with path.open("rb") as stream:
-                raw = stream.read(64 * 1024 + 1)
-            if len(raw) > 64 * 1024:
+                raw = stream.read(MAX_META_BYTES + 1)
+            if len(raw) > MAX_META_BYTES:
                 raise ValueError("记录元数据超过大小上限")
             meta = json.loads(raw,
                                   object_pairs_hook=_pairs_no_duplicates,
@@ -294,6 +312,10 @@ class EditorWorkflowStore:
                     or not math.isfinite(meta["compiled_updated_at"])
                     or meta["compiled_updated_at"] <= 0):
                 raise ValueError("compiled 时间元数据无效")
+            source_kind(meta.get('source_kind', 'unknown'))
+            receipts = source_receipts(meta.get('package_sources', []))
+            if any(item['revision'] > meta['current_revision'] for item in receipts):
+                raise ValueError('工作流来源修订超过当前已提交修订')
             return meta
         except (OSError, json.JSONDecodeError, TypeError, ValueError,
                 OverflowError, UnicodeError, RecursionError) as exc:
@@ -341,9 +363,24 @@ class EditorWorkflowStore:
                     or not math.isfinite(data["updated_at"])
                     or data["updated_at"] <= 0):
                 raise ValueError("compiled prompt 元数据无效")
-            prompt = normalize_prompt(data.get("prompt"))
-            return {"prompt": prompt, "revision": revision,
-                    "updated_at": data["updated_at"]}
+            # This is the saved full editor graph. Validate dependency closure only
+            # for selected outputs at execution; unfinished islands remain editable.
+            prompt = normalize_prompt(data.get("prompt"), check_dependencies=False)
+            result = {"prompt": prompt, "revision": revision,
+                      "updated_at": data["updated_at"]}
+            if "additional_inputs" in data:
+                contract = normalize_additional_inputs(data["additional_inputs"], prompt)
+                if contract is not None:
+                    result["additional_inputs"] = {"version": contract["version"], "nodes": contract["nodes"]}
+            if "contract_proof" in data:
+                proof = data["contract_proof"]
+                if not isinstance(proof, dict):
+                    raise ValueError("compiled 端口证明元数据须为对象")
+                encoded(proof)
+                result["contract_proof"] = proof
+            if "repair_overlay" in data:
+                result["repair_overlay"] = normalize_repair_overlay(data["repair_overlay"])
+            return result
         except (OSError, json.JSONDecodeError, TypeError, ValueError,
                 OverflowError, UnicodeError, RecursionError) as exc:
             reason = str(exc) or "compiled prompt 无法读取"
@@ -400,8 +437,9 @@ class EditorWorkflowStore:
                 "compiled_revision": compiled_revision,
                 "compiled_updated_at": compiled_updated_at}
 
-    def create(self, name, document, source_json=None):
+    def create(self, name, document, source_json=None, *, origin='native'):
         name = _name(name)
+        origin = source_kind(origin)
         if source_json is None:
             _validate_document(document)
             raw = _encode_document(document)
@@ -431,6 +469,7 @@ class EditorWorkflowStore:
                     temporary_dir / "revisions" / "revision-00000001.json", raw)
                 now = time.time()
                 meta = self._make_meta(workflow_id, name, 1, now)
+                meta['source_kind'] = origin
                 self._write_atomic(temporary_dir / "meta.json", _json_bytes(meta))
                 os.replace(temporary_dir, target)
             except BaseException:
@@ -452,8 +491,7 @@ class EditorWorkflowStore:
         meta = self._read_meta(record_dir, workflow_id)
         document, source = self._read_revision(record_dir, meta["current_revision"])
         compiled_revision = meta["compiled_revision"]
-        if compiled_revision is not None:
-            self._read_compiled(record_dir, compiled_revision)
+        compiled_data = self._read_compiled(record_dir, compiled_revision) if compiled_revision is not None else None
         result = self._summary(meta, document)
         result.update({"created_at": meta["created_at"],
                        "document": document, "source_json": source,
@@ -461,6 +499,11 @@ class EditorWorkflowStore:
                                     "revision": compiled_revision,
                                     "stale": (compiled_revision is not None
                                               and compiled_revision != meta["current_revision"])}})
+        if compiled_data and compiled_data.get("repair_overlay"):
+            result["repair_sources"] = repair_sources(
+                compiled_data["repair_overlay"],
+                "stale" if compiled_revision != meta["current_revision"] else "saved",
+                "source_revision_changed" if compiled_revision != meta["current_revision"] else None)
         return result
 
     def get(self, workflow_id):
@@ -481,7 +524,7 @@ class EditorWorkflowStore:
                         record = self._get(path.name)
                         workflows.append({key: record[key] for key in
                                           ("id", "name", "revision", "nodes", "links",
-                                           "updated_at", "summary")})
+                                           "updated_at", "summary", "source_kind")})
                     except (OSError, ValueError) as exc:
                         unreadable.append({"id": path.name, "reason": str(exc)})
             workflows.sort(key=lambda item: item["updated_at"], reverse=True)
@@ -509,18 +552,35 @@ class EditorWorkflowStore:
                 largest = max(largest, int(match.group(1)))
         return largest + 1
 
-    def save_revision(self, workflow_id, document, prompt=None):
+    def save_revision(self, workflow_id, document, prompt=None, *, additional_inputs=None,
+                      contract_proof=None, repair_overlay=None):
         _validate_document(document)
         raw = _encode_document(document)
         normalized_prompt = None
         if prompt not in (None, {}):
-            normalized_prompt = normalize_prompt(prompt)
+            normalized_prompt = normalize_prompt(prompt, check_dependencies=False)
+        if normalized_prompt is None and (additional_inputs is not None or contract_proof is not None or repair_overlay is not None):
+            raise ValueError("额外输入契约和证明元数据须与正式编译 prompt 一起保存")
+        contract = normalize_additional_inputs(additional_inputs, normalized_prompt)
+        repairs = normalize_repair_overlay(repair_overlay)
+        if repairs is not None and repairs["document_sha256"] != fingerprint(document):
+            raise ValueError("缺项补参来源与当前原生工作流不一致")
+        if contract_proof is not None:
+            if not isinstance(contract_proof, dict):
+                raise ValueError("compiled 端口证明元数据须为对象")
+            encoded(contract_proof)
         with self.lock:
             record_dir = self._record_dir(workflow_id)
             if not record_dir.is_dir():
                 raise ValueError("editor workflow 不存在")
             meta = self._read_meta(record_dir, workflow_id)
-            self._read_revision(record_dir, meta["current_revision"])
+            current_document, current_source = self._read_revision(record_dir, meta["current_revision"])
+            if current_document == document:
+                # An API-only repair must not canonicalize the user's original
+                # native JSON or change its exact byte/hash identity.
+                raw = current_source.encode("utf-8")
+            if repairs is not None:
+                repairs["source_sha256"] = hashlib.sha256(raw).hexdigest()
             if meta["compiled_revision"] is not None:
                 self._read_compiled(record_dir, meta["compiled_revision"])
             revision = self._next_revision(record_dir, meta["current_revision"])
@@ -536,6 +596,12 @@ class EditorWorkflowStore:
                 compiled_dir.mkdir(exist_ok=True)
                 compiled_data = {"revision": revision, "updated_at": now,
                                  "prompt": normalized_prompt}
+                if contract is not None:
+                    compiled_data["additional_inputs"] = {"version": contract["version"], "nodes": contract["nodes"]}
+                if contract_proof is not None:
+                    compiled_data["contract_proof"] = contract_proof
+                if repairs is not None:
+                    compiled_data["repair_overlay"] = repairs
                 self._write_new_atomic(
                     compiled_dir / f"revision-{revision:08d}.json",
                     _json_bytes(compiled_data))
@@ -544,17 +610,222 @@ class EditorWorkflowStore:
                 workflow_id, meta["name"], revision, now,
                 compiled_revision=compiled_revision,
                 compiled_updated_at=compiled_updated_at)
+            new_meta['created_at'] = meta['created_at']
+            new_meta['source_kind'] = meta.get('source_kind', 'unknown')
+            if 'package_sources' in meta:
+                new_meta['package_sources'] = meta['package_sources']
             self._write_atomic(record_dir / "meta.json", _json_bytes(new_meta))
             return self._summary(new_meta, document)
 
-    def get_compiled(self, workflow_id):
+    @contextmanager
+    def revision_transaction(self, workflow_id, document, prompt=None, *, package_id=None, backend_url=None,
+                             additional_inputs=None, contract_proof=None, repair_overlay=None):
+        """Restore exact visible metadata if a coordinated package publish fails.
+
+        Revision/compiled files remain immutable, including unreferenced failed
+        attempts. This is an exception transaction for one locked service, not a
+        crash-atomic transaction across both stores.
+        """
+        with self._meta_transaction(workflow_id):
+            revision = self.save_revision(workflow_id, document, prompt,
+                                          additional_inputs=additional_inputs, contract_proof=contract_proof,
+                                          repair_overlay=repair_overlay)
+            if package_id is not None:
+                self._record_package_source(workflow_id, package_id, revision['revision'], backend_url)
+            yield revision
+
+    @contextmanager
+    def package_source_transaction(self, workflow_id, package_id, revision, backend_url):
+        """Associate a reconfigured package with a proven existing revision."""
+        with self._meta_transaction(workflow_id):
+            self._record_package_source(workflow_id, package_id, revision, backend_url)
+            yield
+
+    @contextmanager
+    def _meta_transaction(self, workflow_id):
+        with self.lock:
+            record_dir = self._record_dir(workflow_id)
+            self._read_meta(record_dir, workflow_id)
+            meta_path = self._safe_file(record_dir, Path('meta.json'))
+            original = meta_path.read_bytes()
+            backup = None
+            keep_backup = False
+            try:
+                with tempfile.NamedTemporaryFile('wb', prefix='.apply-meta-', suffix='.backup',
+                                                 dir=record_dir, delete=False) as stream:
+                    backup = Path(stream.name)
+                    stream.write(original)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    yield
+                except BaseException as apply_error:
+                    try:
+                        if meta_path.read_bytes() != original:
+                            os.replace(backup, meta_path)
+                    except OSError as rollback_error:
+                        keep_backup = True
+                        raise OSError(
+                            f'工作流应用失败（{apply_error}）；恢复原revision也失败（{rollback_error}）。'
+                            f'原meta完整备份已保留：{backup}；请停止写入并恢复该备份') from apply_error
+                    raise
+            finally:
+                if backup is not None and not keep_backup:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    def _record_package_source(self, workflow_id, package_id, revision, backend_url):
+        source_reference(package_id, revision, backend_url)
+        record_dir = self._record_dir(workflow_id)
+        meta = self._read_meta(record_dir, workflow_id)
+        if revision > meta['current_revision']:
+            raise ValueError('不能关联尚未提交的工作流修订')
+        _, raw_source = self._read_revision(record_dir, revision)
+        compiled = self._read_compiled(record_dir, revision)
+        receipt = source_receipt(package_id, revision, backend_url,
+            hashlib.sha256(raw_source.encode('utf-8')).hexdigest(),
+            hashlib.sha256(encoded(compiled['prompt'])).hexdigest())
+        history = meta.get('package_sources', [])
+        if receipt in history:
+            return
+        meta['package_sources'] = source_receipts([*history, receipt])
+        raw = _json_bytes(meta)
+        if len(raw) > MAX_META_BYTES:
+            raise ValueError('工作流来源历史已满；请另存工作流后继续，原记录已保留')
+        self._write_atomic(record_dir / 'meta.json', raw)
+
+    def package_sources(self, package_id, prompt=None, *, workflow_id=None):
+        """Find committed receipts for a package already verified by PackageStore.
+
+        Names are display-only. Failed/unreferenced immutable revisions are never
+        discovered by scanning revision files. This method never rewrites data.
+        Optional prompt limits reconfiguration to an exact compiled baseline;
+        exported package prompts may deliberately clear private media defaults.
+        """
+        validate_package_id(package_id)
+        expected = encoded(normalize_prompt(prompt, check_dependencies=False)) if prompt is not None else None
+        with self.lock:
+            self._ensure_root()
+            paths = ([self._record_dir(workflow_id)] if workflow_id else
+                     sorted(self.directory.iterdir(), key=lambda path: path.name) if self.directory.is_dir() else [])
+            candidates, unreadable = [], []
+            for path in paths:
+                if not ID_PATTERN.fullmatch(path.name):
+                    continue
+                try:
+                    record_dir = self._record_dir(path.name)
+                    meta = self._read_meta(record_dir, path.name)
+                    matches = [item for item in meta.get('package_sources', []) if item['package_id'] == package_id]
+                except (OSError, ValueError):
+                    unreadable.append({'workflow_id': path.name, 'reason': 'source_record_unavailable'})
+                    continue
+                for receipt in matches:
+                    try:
+                        _, raw_source = self._read_revision(record_dir, receipt['revision'])
+                        compiled = self._read_compiled(record_dir, receipt['revision'])
+                        document_hash = hashlib.sha256(raw_source.encode('utf-8')).hexdigest()
+                        compiled_bytes = encoded(compiled['prompt'])
+                        prompt_hash = hashlib.sha256(compiled_bytes).hexdigest()
+                        if (document_hash != receipt['document_sha256'] or prompt_hash != receipt['prompt_sha256']
+                                or expected is not None and compiled_bytes != expected):
+                            raise ValueError('执行图与包内容不一致')
+                        candidates.append({**receipt, 'workflow_id': path.name, 'name': meta['name'],
+                            'source_kind': meta.get('source_kind', 'unknown'),
+                            'current_revision': meta['current_revision'],
+                            'draft_newer': meta['current_revision'] != receipt['revision']})
+                    except (OSError, ValueError):
+                        unreadable.append({'workflow_id': path.name, 'revision': receipt['revision'],
+                                           'reason': 'source_revision_unavailable'})
+            candidates.sort(key=lambda item: (item['workflow_id'], -item['revision'], item['backend_url']))
+            return {'package_id': package_id, 'sources': candidates, 'unreadable': unreadable,
+                    'ambiguous': len(candidates) > 1}
+
+    def fork_package_source(self, package_id, selection):
+        expected_keys = {'workflow_id', 'revision', 'backend_url', 'document_sha256', 'prompt_sha256'}
+        if not isinstance(selection, dict) or set(selection) != expected_keys:
+            raise ValueError('请选择完整的工作流来源回执后再创建编辑副本')
+        if any(not isinstance(selection[key], str) or not re.fullmatch(r'[0-9a-f]{64}', selection[key])
+               for key in ('document_sha256', 'prompt_sha256')):
+            raise ValueError('工作流来源摘要无效')
+        source_reference(package_id, selection['revision'], selection['backend_url'])
+        with self.lock:
+            report = self.package_sources(package_id, workflow_id=selection['workflow_id'])
+            matches = [item for item in report['sources'] if all(item[key] == selection[key] for key in expected_keys)]
+            if len(matches) != 1:
+                raise ValueError('工作流来源已变化或无法核实；未创建编辑副本，请刷新来源')
+            matched = matches[0]
+            record_dir = self._record_dir(matched['workflow_id'])
+            document, source = self._read_revision(record_dir, matched['revision'])
+            if hashlib.sha256(source.encode('utf-8')).hexdigest() != matched['document_sha256']:
+                raise ValueError('工作流来源读取期间发生变化，未创建副本')
+            compiled = self._read_compiled(record_dir, matched['revision'])
+            overlay = compiled.get('repair_overlay')
+            if overlay is not None and (overlay['document_sha256'] != fingerprint(document)
+                                        or overlay['source_sha256'] != matched['document_sha256']
+                                        or overlay['backend_url'] != matched['backend_url']):
+                raise ValueError('补参来源与所选原生修订不一致；未创建副本，请重新检查来源')
+            forked = self.create(matched['name'], document, source, origin=matched['source_kind'])
+            if overlay is not None:
+                forked = self._attach_inert_repairs(forked, document, compiled, matched['workflow_id'])
+            return {'workflow': forked, 'source': matched}
+
+    def _attach_inert_repairs(self, forked, document, compiled, origin_workflow_id):
+        """Copy repair data on an explicit source clone; transfer no grants."""
+        overlay = normalize_repair_overlay(compiled['repair_overlay'])
+        for entry in overlay['entries']:
+            entry.setdefault('origin_workflow_id', origin_workflow_id)
+        with self._meta_transaction(forked['id']):
+            target_dir = self._record_dir(forked['id'])
+            target_meta = self._read_meta(target_dir, forked['id'])
+            now = time.time()
+            compiled_dir = target_dir / 'compiled'
+            compiled_dir.mkdir(exist_ok=True)
+            self._write_new_atomic(compiled_dir / 'revision-00000001.json', _json_bytes({
+                'revision': 1, 'updated_at': now, 'prompt': compiled['prompt'],
+                'repair_overlay': overlay,
+            }))
+            target_meta.update(compiled_revision=1, compiled_updated_at=now, updated_at=now)
+            self._write_atomic(target_dir / 'meta.json', _json_bytes(target_meta))
+        return self._summary(target_meta, document)
+
+    def fork_current(self, workflow_id, expected_revision):
+        """Clone exact latest source bytes, optionally carrying inert repairs.
+
+        This deliberately does not select a package's older applied revision.
+        A newer draft is preserved and never inherits an outdated repair overlay.
+        """
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError('编辑副本需要准确的当前来源修订')
+        with self.lock:
+            current = self._get(workflow_id)
+            if current['revision'] != expected_revision:
+                raise ValueError('工作流来源修订已变化，请刷新后再创建编辑副本')
+            compiled = self.get_compiled(workflow_id)
+            overlay = compiled.get('repair_overlay') if compiled and not compiled['stale'] else None
+            if overlay is not None and (overlay['document_sha256'] != fingerprint(current['document'])
+                                        or overlay['source_sha256'] != hashlib.sha256(current['source_json'].encode('utf-8')).hexdigest()):
+                raise ValueError('补参来源与当前原生修订不一致；未创建副本，请重新检查来源')
+            forked = self.create(current['name'], current['document'], current['source_json'],
+                                 origin=current['source_kind'])
+            if overlay is not None:
+                forked = self._attach_inert_repairs(forked, current['document'], compiled, workflow_id)
+            return {'workflow': forked, 'source': {'workflow_id': workflow_id, 'revision': current['revision']},
+                    'repair_sources': repair_sources(overlay) if overlay else []}
+
+    def get_compiled(self, workflow_id, revision=None):
+        """Read private compiled data for the latest or an exact saved revision."""
         with self.lock:
             record_dir = self._record_dir(workflow_id)
             if not record_dir.is_dir():
                 raise ValueError("editor workflow 不存在")
             meta = self._read_meta(record_dir, workflow_id)
             self._read_revision(record_dir, meta["current_revision"])
-            revision = meta["compiled_revision"]
+            if revision is not None and (type(revision) is not int or
+                                         not 1 <= revision <= meta["current_revision"]):
+                raise ValueError("compiled revision 须为现有的正整数版本")
+            revision = meta["compiled_revision"] if revision is None else revision
             if revision is None:
                 return None
             compiled = self._read_compiled(record_dir, revision)

@@ -1,7 +1,7 @@
 import unittest
 
 from frameweave.audio_workflows import audio_capabilities
-from frameweave.workflows import catalog, compile_workflow, generation_options
+from frameweave.workflows import catalog, compile_workflow, generation_options, validate_prompt
 
 
 def schema(required, output, optional=None, output_node=False):
@@ -254,6 +254,35 @@ class AudioCapabilityTests(unittest.TestCase):
         self.assertEqual(result["packages"][0]["fields"][0]["type"], "audio")
         self.assertFalse(result["packages"][1]["schema_supported"])
         self.assertNotIn("", strict_info["LoadAudio"]["input"]["required"]["audio"][0])
+        with self.assertRaisesRegex(ValueError, "尚未填写资源"):
+            validate_prompt(upload["prompt"], strict_info)
+
+    def test_pending_upload_capability_requires_an_exposed_matching_empty_media_field(self):
+        upload = audio_package("pkg-upload", {
+            "1": {"class_type": "LoadAudio", "inputs": {"audio": ""}},
+            "2": {"class_type": "AudioWriter", "inputs": {"audio": ["1", 0], "filename_prefix": "audio/result"}},
+        })
+        field = {"id": "source_audio", "type": "audio", "node_id": "1", "input": "audio", "default": ""}
+        for fields in ([], [{**field, "type": "image"}], [{**field, "node_id": "missing"}]):
+            with self.subTest(fields=fields):
+                upload["fields"] = fields
+                self.assertFalse(audio_capabilities(typed_audio_schema(), [upload])["packages"][0]["eligible"])
+        upload["fields"] = [field]
+        for name in ("missing.wav", "../unsafe.wav"):
+            with self.subTest(name=name):
+                upload["prompt"]["1"]["inputs"]["audio"] = name
+                self.assertFalse(audio_capabilities(typed_audio_schema(), [upload])["packages"][0]["eligible"])
+
+    def test_pending_string_upload_is_discoverable_without_accepting_real_submission(self):
+        info = typed_audio_schema()
+        info["LoadAudio"]["input"]["required"]["audio"] = ["STRING", {"audio_upload": True}]
+        upload = audio_package("pkg-upload", {
+            "1": {"class_type": "LoadAudio", "inputs": {"audio": ""}},
+            "2": {"class_type": "AudioWriter", "inputs": {"audio": ["1", 0], "filename_prefix": "audio/result"}},
+        }, fields=[{"id": "source_audio", "type": "audio", "node_id": "1", "input": "audio", "default": ""}])
+        self.assertTrue(audio_capabilities(info, [upload])["packages"][0]["eligible"])
+        with self.assertRaisesRegex(ValueError, "尚未填写资源"):
+            validate_prompt(upload["prompt"], info)
 
     def test_schema_without_audio_outputs_reports_unavailable_and_keeps_packages(self):
         result = audio_capabilities({"KSampler": schema({}, ["LATENT"])}, [self.good])

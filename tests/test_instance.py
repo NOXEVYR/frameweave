@@ -124,6 +124,9 @@ class InstanceTests(unittest.TestCase):
         url = f"http://127.0.0.1:{server.server_port}/"
         try:
             self.assertTrue(validate_prismcanvas_url(url))
+            with patch.object(_AppHandler, "payload", {**BOOTSTRAP, "version": "0.11.5"}):
+                self.assertFalse(validate_prismcanvas_url(url))
+                self.assertTrue(validate_prismcanvas_url(url, allow_previous_owner=True))
             with patch.object(_AppHandler, "payload", {**BOOTSTRAP, "version": "0.0.0"}):
                 self.assertFalse(validate_prismcanvas_url(url))
         finally:

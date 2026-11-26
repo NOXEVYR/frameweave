@@ -3,6 +3,8 @@
 import base64
 import binascii
 import copy
+import hashlib
+import hashlib
 import hmac
 import http.client
 import json
@@ -31,20 +33,43 @@ from .backend import Backend, BackendError, local_url
 from .diagnostics import diagnose, safe_relative
 from .environment import discover_environment
 from .engines import EngineManager
+from .workflow_models import workflow_models
+from .voice_environments import VoiceEnvironments
+from .hub_connection import HubConnection
+from .hub_profiles import prepare_offer
+from .h3_reference import prepare_h3_reference_package
 from .updates import UpdateManager, UpdateError
 from .progress import ProgressStream
+from .progress_identity import load_progress_identity, persist_progress_identity
+from .job_lifecycle import CANCEL_PENDING, cancel_state, new_cancellation, history_outcome, terminal_observed
 from .canvas_store import CanvasStore
-from .editor_workflows import EditorWorkflowStore, _parse_document as parse_editor_document
+from .editor_workflows import EditorWorkflowStore, _parse_document as parse_editor_document, _validate_document as validate_editor_document
 from .editor_proxy import EditorProxy
-from .editor_interfaces import inspect_interface, reconcile_interface, select_outputs
+from .editor_interfaces import (inspect_interface, reconcile_interface, select_outputs,
+                                normalize_editor_inputs, output_closure, apply_missing_interface_values)
 from .editor_backends import inspect_backend_fit
+from .editor_preparation import prepare_editor_document
+from .preset_editor_preparation import prepare_preset_editor
 from .local_assets import (LocalImageAssets, LocalMediaAssets, MAX_LOCAL_IMAGE_BYTES,
                            MAX_LOCAL_VIDEO_BYTES)
+from .media_contract import AUDIO_MIMES, MAX_AUDIO_BYTES, audio_content_info
 from .workspace_services import PROFILES, performance_plan, result_location
-from .packages import (PackageStore, apply_values, inspect_document,
-                       normalize_document, transport_document, validate_package_media_field)
-from .recovery import recover_records, job_record, media_record
-from .workflows import capabilities, catalog, compile_workflow, generation_options, validate_prompt
+from .workspace_storage import local_asset_summary
+from .desktop_shell import DesktopShell, DesktopExitUncertain, CLOSE_ACTIONS
+from .packages import (MAX_INTERFACE_FIELDS, PackageStore, apply_values, inspect_document,
+                       normalize_document, transport_document, validate_package_media_field,
+                       apply_editor_values, apply_planning_values, validate_planning_fields,
+                       api_prompt, encoded, validate_inspection_result, _stored_package_document)
+from .recovery import MAX_RECORD_BYTES, recover_records, job_record, media_record
+from .job_archive import JobArchive, media_key
+from .settings_recovery import load_settings
+from .workflows import (capabilities, catalog, compile_workflow, generation_options,
+                        validate_prompt, validate_editor_prompt, _expanded_inputs)
+from .input_contracts import (normalize_additional_inputs, crop_additional_inputs,
+                              resolved_inputs, contract_schema_digest)
+from .native_input_contracts import verify_native_additional_inputs
+from .editor_repairs import (build_repair_overlay, restore_repair_overlay,
+                             repair_sources)
 
 MAX_JSON = 28 * 1024 * 1024
 MAX_REJECT_DRAIN = 64 * 1024
@@ -52,6 +77,7 @@ REJECT_DRAIN_TIMEOUT = 0.25
 TERMINAL = {"completed", "failed", "cancelled"}
 MAX_RUN = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+INPUT_MEDIA_LIMIT = 10000
 REQUEST_FIELDS = {"kind", "positive", "negative", "models", "seed", "width", "height",
                   "steps", "cfg", "denoise", "sampler", "scheduler", "seconds", "fps",
                   "references", "reference_roles", "lora", "lora_strength", "loras", "shift_video", "editor_backend",
@@ -62,10 +88,27 @@ class SubmissionUncertain(BackendError):
     """The backend may have accepted the prompt; never repeat automatically."""
 
 
+class EditorPrewriteRejected(Exception):
+    """An editor apply failed before entering any persistence transaction."""
+
+    def __init__(self, error):
+        super().__init__("请求的 JSON 嵌套或数字超出限制" if isinstance(error, (RecursionError, OverflowError)) else str(error))
+        self.status = 502 if isinstance(error, (BackendError, OSError)) else 400
+
+
 def atomic_json(path, value):
     temp = path.with_name(path.name + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temp, path)
+
+
+def output_identity(job_id, output):
+    """Stable owned file identity; history ordering and display URLs are excluded."""
+    identity = [job_id, output.get("node_id", ""), output.get("filename", ""),
+                output.get("subfolder", ""), output.get("storage_type", "output"),
+                output.get("type", "")]
+    return "o-" + hashlib.sha256(json.dumps(identity, ensure_ascii=False,
+                                              separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 class App:
@@ -80,14 +123,11 @@ class App:
         self.transfer_locks = {}
         self.closed = threading.Event()
         self.last_seen = time.monotonic()
-        self.settings = {"backend_url": "http://127.0.0.1:8188", "model_roots": [], "comfy_roots": []}
-        try:
-            saved = json.loads((self.data_dir / "settings.json").read_text(encoding="utf-8"))
-            self.settings["backend_url"] = local_url(saved["backend_url"])
-            self.settings["model_roots"] = self.validate_roots(saved.get("model_roots", []))
-            self.settings["comfy_roots"] = self.validate_roots(saved.get("comfy_roots", []))
-        except (OSError, ValueError, KeyError, TypeError, RecursionError):
-            pass
+        self.desktop = DesktopShell(lambda: self.settings.get("desktop_close_action", "background"),
+                                    supported=os.name == "nt")
+        self.settings, self.recovery_warnings, protected = load_settings(
+            self.data_dir / 'settings.json', self.validate_roots)
+        self.recovery_protected_files = {'settings.json'} if protected else set()
         if backend_url:
             self.settings["backend_url"] = local_url(backend_url)
         if roots:
@@ -96,27 +136,25 @@ class App:
             self.settings["comfy_roots"] = self.validate_roots(comfy_roots)
         self.backend = Backend(self.settings["backend_url"])
         self.engines = EngineManager(self.data_dir)
-        saved_options = locals().get("saved", {})
-        self.settings["auto_start_engine"] = isinstance(saved_options, dict) and saved_options.get("auto_start_engine") is True
-        self.settings["auto_update"] = isinstance(saved_options, dict) and saved_options.get("auto_update") is True
-        self.settings["performance_profile"] = saved_options.get("performance_profile", "auto") if isinstance(saved_options, dict) else "auto"
-        if self.settings["performance_profile"] not in PROFILES:
-            self.settings["performance_profile"] = "auto"
+        if self.engines.load_error:
+            self.recovery_warnings.append(self.engines.load_error)
         self.updates = UpdateManager(__version__, self.data_dir, auto_check=self.settings["auto_update"])
         self.update_lock = threading.Lock()
         self.update_busy = False
         self.update_error = ""
         self.exit_pending = False
+        self.exit_handoff_pending = False
+        self._owner_exit = None
         self.listen_port = None
         self.info = {}
         self.info_at = 0
         self.jobs = {}
+        self.job_archive = JobArchive(self.data_dir)
         self.progress = ProgressStream(self)
         self.media = {}
         self.uploaded = set()
-        self.recovery_warnings = []
-        self.recovery_protected_files = set()
         self.packages = PackageStore(self.data_dir / "workflow-packages")
+        self.voice_environments = VoiceEnvironments(self.data_dir, self.engines, self.packages)
         self.canvases = CanvasStore(self.data_dir / "canvases")
         self.local_assets = LocalImageAssets(self.data_dir)
         self.local_media_assets = LocalMediaAssets(self.data_dir)
@@ -124,21 +162,29 @@ class App:
         self.local_media_upload_cache = {}
         self.editor_workflows = EditorWorkflowStore(self.data_dir / "editor-workflows")
         self.editor_sessions = {}
+        # Native evidence is current-application authority, never an exported
+        # JSON claim. Reopening after restart must compile in the native editor.
+        self.input_contract_grants = []
         threading.Thread(target=self._close_editors_on_exit, daemon=True).start()
         self.environment_lock = threading.Lock()
         self.environment_snapshot = None
         self.environment_at = 0
-        old, warnings, protected = recover_records(self.data_dir / 'jobs.json', job_record, 200)
+        old, warnings, protected = recover_records(self.data_dir / 'jobs.json', self.job_archive.restore_record, None)
         if protected:
             self.recovery_protected_files.add('jobs.json')
         self.recovery_warnings.extend(warnings)
         for job in old:
             self.jobs[job['id']] = job
             if job['backend'] != self.backend.url and job['status'] not in TERMINAL:
-                job['status'], job['error'] = 'failed', '后端地址已变化；请在原后端检查任务'
+                job['status'] = 'unknown'
+                job['status_warning'] = '当前引擎与原任务不同；正在只读查询原引擎，不会重新提交。'
             for output in job['outputs']:
                 output['url'] = self.register_media(output['filename'], output['subfolder'], output['storage_type'], job['backend'])
-        inputs, warnings, protected = recover_records(self.data_dir / 'input-media.json', media_record, 10000)
+                output['output_id'] = output_identity(job['id'], output)
+        self.client_id, progress_warning = load_progress_identity(self.data_dir, self.jobs, self.backend.url, persist=False)
+        if progress_warning:
+            self.recovery_warnings.append(progress_warning)
+        inputs, warnings, protected = recover_records(self.data_dir / 'input-media.json', media_record, INPUT_MEDIA_LIMIT)
         if protected:
             self.recovery_protected_files.add('input-media.json')
         self.recovery_warnings.extend(warnings)
@@ -149,6 +195,9 @@ class App:
             if item['backend'] == self.backend.url:
                 self.uploaded.add('/'.join(filter(None, [item['subfolder'], item['filename']])))
 
+        for warning in self.recovery_warnings:
+            logging.getLogger(__name__).warning('配置恢复：%s', warning)
+        self.hub_connection = HubConnection(self)
         if self.settings["auto_start_engine"]:
             threading.Thread(target=self.start_saved_engine, daemon=True).start()
         if self.settings["auto_update"]:
@@ -193,86 +242,532 @@ class App:
             candidates = list(pool.map(inspect, choices.values()))
         return {'current': current, 'candidates': candidates}
 
+    @staticmethod
+    def _contract_hash(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                         allow_nan=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    def _extra_contract(self, contract, prompt, info):
+        """Official definitions win; portable data alone provides no authority."""
+        contract = normalize_additional_inputs(contract, prompt)
+        if contract is None:
+            return None
+        nodes = {}
+        for node_id, entry in contract['nodes'].items():
+            node = prompt[node_id]
+            schema = info.get(node['class_type'])
+            if not isinstance(schema, dict):
+                raise ValueError('附加输入的后端节点定义不可用，请重新编译')
+            # Check every conflicting declaration before excluding it. A
+            # sidecar can never change required, enum, hidden or bounds.
+            resolved_inputs(node_id, node, schema, contract)
+            declared, _ = _expanded_inputs(schema, node['inputs'])
+            inputs = {name: definition for name, definition in entry['inputs'].items()
+                      if name not in declared}
+            if inputs:
+                nodes[node_id] = {'class_type': entry['class_type'], 'inputs': inputs}
+        return {'version': 1, 'nodes': nodes} if nodes else None
+
+    def _native_input_context(self, workflow_id, data, prompt, info):
+        if data.get('additional_inputs') is None:
+            return None, None
+        session = self.editor_sessions.get(data.get('session_id'))
+        current = self.editor_workflows.get(workflow_id)
+        if (not session or session.get('workflow_id') != workflow_id
+                or session.get('backend') != self.backend.url
+                or data.get('base_revision') != current['revision']):
+            raise ValueError('additional_input_contract_required：当前原生会话、后端或修订已失效，请重新进入编译')
+        document = data.get('document')
+        validate_editor_document(document)
+        contract = verify_native_additional_inputs(
+            document, prompt, info, data.get('additional_inputs'),
+            data.get('native_input_observations'))
+        # Unknown inactive islands stay portable editing data. Only live
+        # definitions participate in this audit fingerprint, never authority.
+        known_prompt = {key: node for key, node in prompt.items()
+                        if isinstance(info.get(node['class_type']), dict)}
+        proof = {'version': 1, 'workflow_id': workflow_id,
+                 'source_revision': current['revision'], 'backend_url': self.backend.url,
+                 'source_document_sha256': self._contract_hash(document),
+                 'schema_digest': contract_schema_digest(contract, known_prompt, info),
+                 'target_input_hashes': {node_id: self._contract_hash(prompt[node_id]['inputs'])
+                                         for node_id in (contract or {'nodes': {}})['nodes']}}
+        return contract, proof
+
+    @staticmethod
+    def _assert_contract_target_inputs(prompt, contract, proof):
+        if contract is not None and any(
+                App._contract_hash(prompt.get(node_id, {}).get('inputs')) != proof['target_input_hashes'].get(node_id)
+                for node_id in contract['nodes']):
+            raise ValueError('additional_input_contract_required：动态节点参数或连线已改变，请在内部重新编译端口')
+
+    def _prepare_input_contract_record(self, prompt, contract, info, proof):
+        if contract is None:
+            return None
+        self._assert_contract_target_inputs(prompt, contract, proof)
+        record = {'backend_url': self.backend.url, 'contract': copy.deepcopy(contract),
+                  'node_classes': {key: node['class_type'] for key, node in prompt.items()},
+                  'schema_hashes': {node['class_type']: self._contract_hash(info[node['class_type']])
+                                    for node in prompt.values() if node['class_type'] in info},
+                  'target_input_hashes': copy.deepcopy(proof['target_input_hashes'])}
+        size = len(json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False).encode('utf-8'))
+        if size > 4 * 1024 * 1024:
+            raise ValueError('当前动态连线证明超过 4 MiB，请拆分工作流')
+        key = self._contract_hash(record)
+        record.update(_bytes=size, _key=key)
+        return record
+
+    def _remember_input_contract(self, record):
+        # All serialization, validation and limits completed before publication.
+        if record is None:
+            return
+        with self.lock:
+            self.input_contract_grants = [item for item in self.input_contract_grants if item['_key'] != record['_key']]
+            self.input_contract_grants.append(record)
+            while (len(self.input_contract_grants) > 64
+                   or sum(item['_bytes'] for item in self.input_contract_grants) > 8 * 1024 * 1024):
+                self.input_contract_grants.pop(0)
+
+    def _authorized_additional_inputs(self, contract, prompt, info, *, backend_url=None):
+        contract = self._extra_contract(contract, prompt, info)
+        if contract is None:
+            return None
+        backend_url = self.backend.url if backend_url is None else backend_url
+        with self.lock:
+            records = list(self.input_contract_grants)
+        for record in reversed(records):
+            if record['backend_url'] != backend_url:
+                continue
+            if any(record['node_classes'].get(key) != node['class_type']
+                   or record['schema_hashes'].get(node['class_type']) != self._contract_hash(info[node['class_type']])
+                   for key, node in prompt.items()):
+                continue
+            if any(record['contract']['nodes'].get(node_id) != entry
+                   or record['target_input_hashes'].get(node_id) != self._contract_hash(prompt[node_id]['inputs'])
+                   for node_id, entry in contract['nodes'].items()):
+                continue
+            return contract
+        raise ValueError('additional_input_contract_required：附加连线没有当前后端的原生编译证明；请重新进入内部编译并应用')
+
+    def _inspection_contract(self, data, prompt, info):
+        contract = data.get('additional_inputs')
+        if contract is None and data.get('package_id'):
+            contract = self.packages.get(data['package_id']).get('additional_inputs')
+        execution = output_closure(prompt, data.get('output_nodes'), info, allow_no_outputs=True)
+        active = execution['node_ids']
+        return self._authorized_additional_inputs(
+            crop_additional_inputs(contract, active), {key: prompt[key] for key in active}, info)
+
+    def _editor_repair_context(self, workflow_id, data, prompt, info, contract=None):
+        current = self.editor_workflows.get(workflow_id)
+        compiled = self.editor_workflows.get_compiled(workflow_id)
+        overlay = compiled.get('repair_overlay') if compiled else None
+        context_error = None
+        session = self.editor_sessions.get(data.get('session_id'))
+        if overlay is not None:
+            if (not session or session.get('workflow_id') != workflow_id
+                    or session.get('backend') != self.backend.url):
+                context_error = 'current_native_session_required'
+            elif (data.get('base_revision') != current['revision'] or compiled.get('stale')
+                  or compiled.get('revision') != current['revision']):
+                context_error = 'source_revision_changed'
+            elif not isinstance(data.get('document'), dict):
+                context_error = 'compiled_native_document_required'
+        document = data.get('document') if isinstance(data.get('document'), dict) else current['document']
+        return restore_repair_overlay(
+            document, current['source_json'], prompt, info, overlay, self.backend.url,
+            output_nodes=data.get('output_nodes'), explicit_values=data.get('missing_values', {}),
+            additional_inputs=contract, context_error=context_error)
+
     def editor_interface(self, workflow_id, data):
         self.editor_workflows.get(workflow_id)
+        previous = self._interface_previous_package(data)
         prompt = data.get('prompt')
         if prompt is None:
             prompt = self._editor_package_prompt(data)
-        return inspect_interface(prompt, self.object_info(refresh=True))
+        info = self.object_info(refresh=True)
+        migrated = normalize_editor_inputs(prompt, info)
+        if data.get('additional_inputs') is not None and data.get('session_id'):
+            contract, proof = self._native_input_context(workflow_id, data, migrated['prompt'], info)
+        else:
+            contract, proof = self._inspection_contract(data, migrated['prompt'], info), None
+        restoration = self._editor_repair_context(workflow_id, data, migrated['prompt'], info, contract)
+        repaired = apply_missing_interface_values(restoration['prompt'], info, data.get('missing_values', {}),
+                                                  output_nodes=data.get('output_nodes'), additional_inputs=contract)
+        if proof is not None:
+            self._assert_contract_target_inputs(repaired['prompt'], contract, proof)
+        return validate_inspection_result({**inspect_interface(repaired['prompt'], info, output_nodes=data.get('output_nodes'),
+                                   previous_fields=previous['fields'] if previous else None,
+                                   previous_prompt=previous['prompt'] if previous else None, additional_inputs=contract),
+                'migrations': migrated['migrations'], 'repairs': restoration['repairs'] + repaired['repairs'],
+                'repair_sources': restoration['repair_sources']})
+
+    def _interface_previous_package(self, data):
+        """Resolve public identity from stored content, not caller field claims."""
+        package_id = data.get('previous_package_id') or data.get('package_id')
+        return self.packages.get(package_id) if package_id else None
+
+    def inspect_package(self, data):
+        """Shared data-only package discovery for HTTP and MCP."""
+        carrier = {key: value for key, value in data.items() if key != 'output_nodes'}
+        document = transport_document(carrier)
+        # Validate data before requesting backend metadata; offline discovery
+        # remains available without certifying any executable output roots.
+        fallback = inspect_document(document, check_dependencies=False)
+        schema_warning = None
+        try:
+            info = self.object_info(refresh=True)
+        except BackendError:
+            if data.get('output_nodes') is not None:
+                raise
+            info = {}
+            schema_warning = {'code': 'schema_unavailable',
+                              'message': '后端节点定义暂不可用；仅分析源数据，执行范围尚未验证'}
+        inspection = inspect_document(document, info, check_dependencies=False) if info else fallback
+        execution = output_closure(api_prompt(document), data.get('output_nodes'), info,
+                                   allow_no_outputs=True)
+        if schema_warning:
+            execution['warnings'].insert(0, schema_warning)
+        warnings = execution['warnings'] + inspection.get('opaque_inputs', [])
+        portable_contract = document.get('additional_inputs') if isinstance(document, dict) else None
+        if portable_contract is not None and info and execution['node_ids']:
+            try:
+                self._authorized_additional_inputs(
+                    crop_additional_inputs(portable_contract, execution['node_ids']),
+                    {key: api_prompt(document)[key] for key in execution['node_ids']}, info)
+            except ValueError as exc:
+                warnings.append({'code': 'additional_input_contract_required',
+                                 'message': str(exc)})
+        return validate_inspection_result({**inspection, 'execution': execution, 'warnings': warnings})
+
+    def prepare_h3_reference(self, data):
+        """Prepare a standard package from fresh schema; do not save or execute."""
+        if not isinstance(data, dict) or set(data) != {'backend_url', 'preset_request', 'layout'}:
+            raise ValueError('H3 装配需要 backend_url、preset_request 与 layout')
+        with self.lock:
+            backend = self.backend
+            if local_url(data['backend_url']) != backend.url:
+                raise ValueError('推理引擎已变化，请重新准备 H3 工作流')
+        info = self._object_info_for_backend(backend)
+        result = prepare_h3_reference_package(data['preset_request'], data['layout'], info)
+        with self.lock:
+            if self.backend is not backend:
+                raise ValueError('装配期间推理引擎已变化，未保存工作流')
+            return {**result, 'backend_url': backend.url}
 
     def _editor_package_prompt(self, data):
         package = self.packages.get(data.get('package_id'))
         baseline = data.get('previous_baseline')
-        return apply_values(package, baseline if isinstance(baseline, dict) and baseline else data.get('values', {}))
+        return apply_editor_values(_stored_package_document(package), baseline if isinstance(baseline, dict) and baseline else data.get('values', {}))
+
+    def prepare_editor(self, data):
+        """Read-only editing preparation; never use execution readiness here."""
+        with self.lock:
+            backend = self.backend
+            if local_url(data.get('backend_url')) != backend.url:
+                raise ValueError('推理引擎已变化，请重新准备编辑文档')
+            package_id = data.get('package_id')
+            preset = 'preset_request' in data
+            if preset:
+                if any(key in data for key in ('package_id', 'document', 'source_json', 'fields')):
+                    raise ValueError('内置预设编辑不能同时提交其他工作流来源或字段')
+                source_kind = 'preset'
+            elif any(key in data for key in ('reference_slots', 'input_intents', 'model_intents')):
+                raise ValueError('预设结构意图只能用于内置预设编辑')
+            elif package_id:
+                if any(key in data for key in ('document', 'source_json', 'fields')):
+                    raise ValueError('工作流包编辑使用本机完整字段定义，不能同时提交另一份来源')
+                document = _stored_package_document(self.packages.get(package_id))
+                fields = document['fields']
+                source_kind = 'package'
+            else:
+                document = transport_document({key: data[key] for key in ('document', 'source_json') if key in data})
+                fields = data.get('fields', [])
+                source_kind = 'api'
+        # A disconnected engine is a repair diagnostic, not an excuse to replace
+        # the source with a partial graph or to run/upload upstream dependencies.
+        try:
+            info = self._object_info_for_backend(backend)
+        except BackendError:
+            info = None
+        with self.lock:
+            if self.backend is not backend:
+                raise ValueError('准备期间推理引擎已变化，请重新进入工作流')
+            if preset:
+                return prepare_preset_editor(data, info=info, backend_url=backend.url)
+            result = prepare_editor_document(document, source_kind=source_kind,
+                fields=fields, overrides=data.get('overrides'), pending=data.get('pending'),
+                info=info, backend_url=backend.url)
+            return {**result, 'source_kind': source_kind, 'source_revision': package_id or None}
 
     def apply_editor(self, workflow_id, data, configure=False):
         with self.lock:
-            if configure:
-                if data.get('backend_url') != self.backend.url:
-                    raise ValueError('请切换到该工作流的原推理后端后配置参数')
-                prompt = self._editor_package_prompt(data)
-            else:
-                session = self.editor_sessions.get(data.get('session_id'))
-                if not session or session['workflow_id'] != workflow_id:
-                    raise ValueError('编辑会话已失效，请重新进入工作流')
-                if session['backend'] != self.backend.url:
-                    raise ValueError('编辑期间推理后端已变化，请重新进入工作流')
-                prompt = data.get('prompt')
-            info = self.object_info(refresh=True)
-            validate_prompt(prompt, info)
-            interface = inspect_interface(prompt, info)
-            candidates = {field['id']: field for field in interface['fields']}
-            requested = data.get('fields')
-            if requested is None:
-                requested = [field for field in interface['fields'] if field.get('recommended') or field['type'] in {'image', 'audio'}][:64]
-            if not isinstance(requested, list) or len(requested) > 64:
-                raise ValueError('外层最多开放 64 个参数')
-            fields = []
-            for selection in requested:
-                candidate = candidates.get(selection.get('id')) if isinstance(selection, dict) else None
-                if candidate is None or any(selection.get(key) != candidate[key] for key in ('node_id', 'input', 'type')):
-                    raise ValueError('参数接口已改变，请重新选择外层字段')
-                fields.append({**candidate, 'label': selection.get('label', candidate['label'])})
-            baseline = {f['id']: prompt[f['node_id']]['inputs'][f['input']] for f in fields}
-            values = copy.deepcopy(baseline)
-            previous = self.packages.get(data['previous_package_id']) if data.get('previous_package_id') else None
-            changes = {}
-            if previous:
-                mappings = data.get('rebindings') or {}
-                if not isinstance(mappings, dict):
-                    raise ValueError('接口重绑映射须为对象')
-                live_bindings = {(f['node_id'], f['input'], f['type']) for f in interface['fields']}
-                for old in previous['fields']:
-                    if (old['node_id'], old['input'], old['type']) not in live_bindings and old['id'] not in mappings:
-                        raise ValueError('旧字段已失效，请明确重绑或解除：' + old['label'])
-                reconciled = reconcile_interface(
-                    previous['fields'], data.get('previous_values', {}), fields,
-                    prompt, data.get('previous_baseline'), data.get('rebindings'))
-                values.update(reconciled['values'])
-                changes = reconciled['changes']
-                resolutions = data.get('resolutions', {})
-                if changes.get('conflicts'):
-                    for index, conflict in enumerate(changes['conflicts']):
-                        key = str(conflict.get('id', index))
-                        choice = resolutions.get(key)
-                        if choice not in conflict.get('allowed', ['outer', 'inner']):
-                            return {'requires_resolution': True, 'changes': changes}
-                        values[conflict.get('field_id', conflict.get('id'))] = conflict[choice]
-            output_nodes = data.get('output_nodes', [item['id'] for item in interface['outputs']])
-            select_outputs(prompt, output_nodes, info)
-            current = self.editor_workflows.get(workflow_id)
-            if data.get('base_revision', current['revision']) != current['revision']:
-                raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
-            package_document = normalize_document({
-                'name': current['name'],
-                'description': '内部调参后应用到外层；草稿不会自动替换已应用参数。',
-                'prompt': prompt, 'fields': fields,
-            })
-            validate_prompt(apply_values(package_document, values), info)
-            package = self.packages.save(package_document)
-            revision = current if configure else self.editor_workflows.save_revision(workflow_id, data.get('document'), prompt)
-        return {'workflow': revision, 'package': package, 'values': values, 'baseline': baseline,
-                'output_nodes': output_nodes, 'outputs': interface['outputs'], 'changes': changes, 'backend_url': self.backend.url}
+            try:
+                if configure:
+                    if data.get('backend_url') != self.backend.url:
+                        raise ValueError('请切换到该工作流的原推理后端后配置参数')
+                    prompt = self._editor_package_prompt(data)
+                else:
+                    session = self.editor_sessions.get(data.get('session_id'))
+                    if not session or session['workflow_id'] != workflow_id:
+                        raise ValueError('编辑会话已失效或后端已变化，请重新进入工作流')
+                    if session['backend'] != self.backend.url:
+                        raise ValueError('编辑期间推理后端已变化，请重新进入工作流')
+                    prompt = data.get('prompt')
+                current = self.editor_workflows.get(workflow_id)
+                if data.get('base_revision', current['revision']) != current['revision']:
+                    raise ValueError('另一窗口已保存此工作流，请先导出当前修改，再重新打开以免覆盖')
+                if not configure:
+                    # Reject malformed editor state before creating a reusable package.
+                    validate_editor_document(data.get('document'))
+                info = self.object_info(refresh=True)
+                base_prompt = normalize_editor_inputs(prompt, info)['prompt']
+                contract, proof = (self._native_input_context(workflow_id, data, base_prompt, info)
+                                   if not configure else (None, None))
+                restoration = (self._editor_repair_context(workflow_id, data, base_prompt, info, contract)
+                               if not configure else {'prompt': base_prompt, 'repairs': [],
+                                                      'repair_sources': [], 'origins': {}})
+                prompt = restoration['prompt']
+                result = self.apply_interface(prompt, data, current['name'], persist=False,
+                                              additional_inputs=contract, contract_proof=proof, info=info)
+                if result.get('requires_resolution'):
+                    return {**result, 'persisted': False, 'persistence_stage': 'prewrite'}
+                compiled_prompt = result.pop('_compiled_prompt')
+                result['repairs'] = restoration['repairs'] + result['repairs']
+                result['repair_sources'] = restoration['repair_sources']
+                overlay_origins = dict(restoration['origins'])
+                if not configure:
+                    # Current outer choices were freshly validated by
+                    # apply_interface. Persist their repaired scalar values,
+                    # while retaining the existing compiled baseline semantics.
+                    repair_prompt = apply_editor_values(result['_package_document'], result['values'])
+                    for repair in result['repairs']:
+                        before = compiled_prompt[repair['node_id']]['inputs'][repair['input']]
+                        after = repair_prompt[repair['node_id']]['inputs'][repair['input']]
+                        if type(before) is not type(after) or before != after:
+                            overlay_origins.pop(repair['id'], None)
+                overlay = (build_repair_overlay(
+                    data['document'], current['source_json'], base_prompt, repair_prompt, info,
+                    result['repairs'], self.backend.url, current['revision'], origins=overlay_origins,
+                    workflow_id=workflow_id)
+                    if not configure else None)
+                if overlay is not None:
+                    restored_ids = set(overlay_origins)
+                    result['repair_sources'] = [
+                        {**item, 'status': 'restored' if item['id'] in restored_ids else 'explicit'}
+                        for item in repair_sources(overlay)]
+                package_document = result.pop('_package_document')
+                contract = result.pop('_additional_inputs', None)
+                proof = result.pop('_contract_proof', proof)
+                grant = self._prepare_input_contract_record(compiled_prompt, contract, info, proof) if proof is not None else None
+            except (ValueError, KeyError, TypeError, RecursionError, OverflowError, BackendError, OSError) as exc:
+                raise EditorPrewriteRejected(exc) from exc
+            # Sources join the same metadata rollback as editor revisions. No
+            # provenance is inferred from names or an uncommitted revision file.
+            with self.packages.lock, self.editor_workflows.lock:
+                with self._stage_interface_package(package_document) as (package, publish):
+                    result['package'] = package
+                    if configure:
+                        revision = current
+                        report = self.editor_workflows.package_sources(data['package_id'], compiled_prompt,
+                                                                       workflow_id=workflow_id)
+                        matches = [item for item in report['sources'] if item['backend_url'] == self.backend.url]
+                        current_matches = [item for item in matches if item['revision'] == current['revision']]
+                        source = current_matches[0] if len(current_matches) == 1 else matches[0] if len(matches) == 1 else None
+                        if source:
+                            with self.editor_workflows.package_source_transaction(
+                                    workflow_id, package['id'], source['revision'], self.backend.url):
+                                publish()
+                        else:
+                            publish()
+                    else:
+                        with self.editor_workflows.revision_transaction(
+                                workflow_id, data.get('document'), compiled_prompt,
+                                package_id=package['id'], backend_url=self.backend.url,
+                                additional_inputs=contract, contract_proof=proof,
+                                repair_overlay=overlay) as revision:
+                            publish()
+                self._remember_input_contract(grant)
+        return {'workflow': revision, **result}
+
+    def package_editor_sources(self, package_id):
+        with self.lock, self.packages.lock, self.editor_workflows.lock:
+            self.packages.get(package_id)
+            return self.editor_workflows.package_sources(package_id)
+
+    def fork_package_editor_source(self, package_id, selection):
+        with self.lock, self.packages.lock, self.editor_workflows.lock:
+            self.packages.get(package_id)
+            return self.editor_workflows.fork_package_source(package_id, selection)
+
+    @contextmanager
+    def _stage_interface_package(self, document):
+        """Prepare an immutable package; the final link is the only publication."""
+        normalized = normalize_document(document)
+        raw = encoded(normalized)
+        package_id = 'p-' + hashlib.sha256(raw).hexdigest()[:24]
+        directory = self.packages.directory
+        directory.mkdir(exist_ok=True, parents=True)
+        target = self.packages._path(package_id)
+        if target.is_file():
+            yield self.packages.get(package_id), lambda: None
+            return
+        if sum(1 for _ in directory.glob('p-*.json')) >= 200:
+            raise ValueError('当前工作流包库最多保存 200 个包')
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile('wb', prefix='.editor-package-', suffix='.tmp',
+                                             dir=directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            modified = temporary.stat().st_mtime
+            metadata = self.packages._read_metadata().get(package_id, {})
+            package = {**normalized, 'id': package_id, 'created_at': modified,
+                       'updated_at': modified, 'favorite': metadata.get('favorite', False),
+                       'archived': metadata.get('archived', False),
+                       'requirements': {'nodes': sorted({node['class_type']
+                                                        for node in normalized['prompt'].values()})}}
+            # A competing destination is never overwritten. All response data
+            # and durable bytes are ready before this last fallible commit step.
+            yield package, lambda: os.link(temporary, target)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    # Hidden staging residue must not turn a committed apply
+                    # into a reported failure or undo an existing package.
+                    pass
+
+    def apply_interface(self, prompt, data, name, *, persist=True, additional_inputs=None,
+                        contract_proof=None, info=None):
+        """One editable interface contract for native, API, and package imports."""
+        previous = self._interface_previous_package(data)
+        info = self.object_info(refresh=True) if info is None else info
+        migrated = normalize_editor_inputs(prompt, info)
+        contract = additional_inputs
+        stored_contract = data.get('additional_inputs')
+        if stored_contract is None and previous:
+            stored_contract = previous.get('additional_inputs')
+        if contract_proof is not None:
+            # Same-compilation native evidence supersedes portable claims,
+            # including the empty result after official schema migration.
+            stored_contract = contract
+        else:
+            contract = self._inspection_contract({**data, 'additional_inputs': stored_contract}, migrated['prompt'], info)
+        repaired = apply_missing_interface_values(migrated['prompt'], info, data.get('missing_values', {}),
+                                                  output_nodes=data.get('output_nodes'), additional_inputs=contract)
+        prompt = repaired['prompt']
+        if contract_proof is not None:
+            self._assert_contract_target_inputs(prompt, contract, contract_proof)
+        interface = inspect_interface(prompt, info, output_nodes=data.get('output_nodes'),
+                                      previous_fields=previous['fields'] if previous else None,
+                                      previous_prompt=previous['prompt'] if previous else None, additional_inputs=contract)
+        execution = output_closure(prompt, data.get('output_nodes'), info)
+        output_nodes = execution['selected_outputs']
+        select_outputs(prompt, output_nodes, info, editing=True, additional_inputs=contract)
+        candidates = {field['id']: field for field in interface['fields']}
+        requested = data.get('fields')
+        if requested is None:
+            media = [field for field in interface['fields'] if field['type'] in {'image', 'audio', 'video'}]
+            # 64 is a recommendation budget, not the interface capacity. Every
+            # media input retains its upload entry, including batches over 64.
+            requested = media + [field for field in interface['fields']
+                                 if field['type'] not in {'image', 'audio', 'video'}
+                                 and field.get('recommended')][:max(0, 64 - len(media))]
+        if not isinstance(requested, list) or len(requested) > MAX_INTERFACE_FIELDS:
+            raise ValueError(f'外层最多开放 {MAX_INTERFACE_FIELDS} 个参数')
+        fields = []
+        for selection in requested:
+            candidate = candidates.get(selection.get('id')) if isinstance(selection, dict) else None
+            if candidate is None or any(selection.get(key) != candidate[key] for key in ('node_id', 'input', 'type')):
+                raise ValueError('参数接口已改变，请重新选择外层字段')
+            fields.append({**candidate, 'label': selection.get('label', candidate['label']),
+                           'presentation': selection.get('presentation', candidate.get('presentation', 'control'))})
+        selected_ids = {field['id'] for field in fields}
+        if any(field['type'] in {'image', 'audio', 'video'} and field['id'] not in selected_ids
+               for field in interface['fields']):
+            raise ValueError('素材输入必须保留上传入口；可改为侧栏控件，不能取消外露')
+        baseline = {f['id']: prompt[f['node_id']]['inputs'][f['input']] for f in fields}
+        values = copy.deepcopy(baseline)
+        changes = {}
+        hidden_fields, hidden_values = {}, {}
+        if previous:
+            mappings = data.get('rebindings') or {}
+            if not isinstance(mappings, dict):
+                raise ValueError('接口重绑映射须为对象')
+            live_bindings = {(f['node_id'], f['input'], f['type']) for f in interface['fields']
+                             if f['node_id'] not in interface.get('replaced_nodes', {})}
+            for old in previous['fields']:
+                if (old['node_id'], old['input'], old['type']) not in live_bindings and old['id'] not in mappings:
+                    raise ValueError('旧字段已失效，请明确重绑或解除：' + old['label'])
+            reconciled = reconcile_interface(
+                previous['fields'], data.get('previous_values', {}), fields,
+                prompt, data.get('previous_baseline'), data.get('rebindings'), previous_prompt=previous['prompt'])
+            values.update(reconciled['values'])
+            changes = reconciled['changes']
+            # Hiding an external control must not reset its current literal.
+            # Still-live bindings use the same three-way merge as visible ones;
+            # removed/replaced nodes and explicit moves are never guessed.
+            by_binding = {(f['node_id'], f['input'], f['type']): f for f in interface['fields']
+                          if f['node_id'] not in interface.get('replaced_nodes', {})}
+            selected_bindings = {(f['node_id'], f['input'], f['type']) for f in fields}
+            hidden_old = [old for old in previous['fields']
+                          if (old['node_id'], old['input'], old['type']) in by_binding
+                          and (old['node_id'], old['input'], old['type']) not in selected_bindings
+                          and mappings.get(old['id']) is None]
+            if any(old['type'] in {'image', 'audio', 'video'} for old in hidden_old):
+                raise ValueError('素材输入必须保留上传入口；可改为侧栏控件，不能取消外露')
+            if hidden_old:
+                hidden_candidates = [by_binding[(f['node_id'], f['input'], f['type'])] for f in hidden_old]
+                hidden_merge = reconcile_interface(hidden_old, data.get('previous_values', {}),
+                                                   fields + hidden_candidates, prompt, data.get('previous_baseline'))
+                hidden_fields = {f['id']: f for f in hidden_candidates}
+                hidden_values = {key: value for key, value in hidden_merge['values'].items() if key in hidden_fields}
+                for conflict in hidden_merge['changes']['conflicts']:
+                    conflict['id'] = 'hidden:' + conflict['id']
+                    conflict['hidden'] = True
+                    conflict['label'] += '（取消外露后保留的值）'
+                    changes.setdefault('conflicts', []).append(conflict)
+            resolutions = data.get('resolutions', {})
+            if changes.get('conflicts'):
+                for index, conflict in enumerate(changes['conflicts']):
+                    key = str(conflict.get('id', index))
+                    choice = resolutions.get(key)
+                    if choice not in conflict.get('allowed', ['outer', 'inner']):
+                        return {'requires_resolution': True, 'changes': changes}
+                    destination = hidden_values if conflict.get('hidden') else values
+                    destination[conflict.get('field_id', conflict.get('id'))] = conflict[choice]
+        hidden_updates = []
+        for field_id, value in hidden_values.items():
+            field = hidden_fields[field_id]
+            hidden_updates.append({'field': copy.deepcopy(field), 'value': copy.deepcopy(value),
+                                   'baseline': copy.deepcopy(prompt[field['node_id']]['inputs'][field['input']])})
+            prompt[field['node_id']]['inputs'][field['input']] = copy.deepcopy(value)
+        package_document = normalize_document({
+            'name': name,
+            'description': '通过管理外部接口调整连线入口与侧栏参数；生成前检查当前环境。',
+            'prompt': prompt, 'fields': fields,
+            **({'additional_inputs': stored_contract} if stored_contract else {}),
+        })
+        edited_prompt = apply_editor_values(package_document, values)
+        if contract_proof is not None:
+            self._assert_contract_target_inputs(edited_prompt, contract, contract_proof)
+        readiness = validate_editor_prompt(
+            {node_id: edited_prompt[node_id] for node_id in execution['node_ids']}, info,
+            additional_inputs=crop_additional_inputs(contract, execution['node_ids']))
+        package = self.packages.save(package_document) if persist else None
+        return {'package': package, 'values': values, 'baseline': baseline,
+                'output_nodes': output_nodes, 'outputs': interface['outputs'], 'changes': changes,
+                'backend_url': self.backend.url, 'readiness': readiness, 'migrations': migrated['migrations'], 'repairs': repaired['repairs'],
+                'execution': execution, 'warnings': interface['warnings'],
+                **({'additional_inputs': stored_contract} if stored_contract else {}),
+                '_additional_inputs': contract, '_contract_proof': contract_proof,
+                'hidden_updates': hidden_updates, 'hidden_updates_reset': data.get('prompt') is not None,
+                '_compiled_prompt': prompt,
+                **({'_package_document': package_document} if not persist else {})}
 
     def update_status(self):
         return {**self.updates.status(), "busy": self.update_busy, "error": self.update_error,
@@ -301,19 +796,23 @@ class App:
         threading.Thread(target=run, daemon=True).start()
         return self.update_status()
 
-    def prepare_exit(self, port, install=False):
+    def prepare_exit(self, port, install=False, *, dry_run=False, allow_update=True):
         """An owned client may exit only after its submissions are settled."""
         with self.lock, _ledger_lock(self):
             if self.exit_pending:
                 raise ValueError("棱光正在退出，请勿重复安装")
-            if self.update_busy:
+            if self.update_busy or "jobs.json" in self.recovery_protected_files:
+                return False
+            if not self.hub_connection.prepare_exit():
                 return False
             if any(job["status"] not in TERMINAL for job in self.jobs.values()):
                 return False
             if any(record["state"] in {"pending", "unknown"} for record in _read_ledger(self).values()):
                 return False
-            staged = self.updates.status().get("staged")
-            if install or (self.settings["auto_update"] and staged):
+            if dry_run:
+                return True
+            staged = self.updates.status().get("staged") if allow_update else None
+            if allow_update and (install or (self.settings["auto_update"] and staged)):
                 if self.update_busy:
                     return False
                 if not staged or not staged.get("verified"):
@@ -323,9 +822,28 @@ class App:
                         raise ValueError("自动安装仅支持 Windows 打包客户端，源码运行请使用版本管理更新")
                     return True
                 from .update_handoff import launch_handoff
-                launch_handoff(sys.executable, self.data_dir, staged, port)
+                # A failed/ambiguous helper launch cannot authorize an edit
+                # retry or a claim that the external handoff was rolled back.
+                self.exit_handoff_pending = True
+                self.exit_pending = True
+                try:
+                    launch_handoff(sys.executable, self.data_dir, staged, port)
+                except Exception:
+                    raise DesktopExitUncertain("更新交接结果尚未确认；请重新打开核实，不会自动重试退出或更新。") from None
             self.exit_pending = True
             return True
+
+    def complete_desktop_command(self, data, *, after_response=None):
+        return self.desktop.complete(
+            data, lambda: self.prepare_exit(self.listen_port, dry_run=True),
+            commit_exit=lambda: self._owner_exit(after_response=after_response))
+
+    def direct_desktop_exit(self, *, install=False, after_response=None,
+                            require_no_sessions=False, allow_update=True):
+        return self.desktop.direct_exit(
+            lambda: self.prepare_exit(self.listen_port, dry_run=True),
+            lambda: self._owner_exit(install=install, after_response=after_response, allow_update=allow_update),
+            require_no_sessions=require_no_sessions)
 
     def start_saved_engine(self):
         """Start only the user's selected, locally registered engine; never switch.
@@ -398,18 +916,43 @@ class App:
                     self.transfer_locks.pop(key, None)
 
     def status(self):
+        backend = self.backend
+        verified = False
         try:
-            stats = self.backend.request("/system_stats", timeout=4)
+            stats = backend.request("/system_stats", timeout=4)
             if not isinstance(stats, dict) or not isinstance(stats.get("system"), dict) or not isinstance(stats.get("devices"), list):
                 raise BackendError("此端口未返回有效的 ComfyUI 环境信息")
-            info = self.object_info()
+            verified = True
+            with self.lock:
+                if self.backend is not backend:
+                    raise BackendError("正在切换引擎，请稍后刷新")
+                info = self.object_info()
             models = catalog(info)
             models["checkpoints"] = models.get("checkpoint", [])
-            return {"online": True, "backend_url": self.backend.url, "devices": stats.get("devices", []),
+            return {"online": True, "backend_url": backend.url, "devices": stats.get("devices", []),
                     "system": stats.get("system", {}), "capabilities": capabilities(info), "models": models,
                     "generation_options": generation_options(info)}
         except BackendError as exc:
-            return {"online": False, "backend_url": self.backend.url, "devices": [], "capabilities": {}, "models": {}, "error": str(exc)}
+            state = ({"state": "catalog_unavailable"} if verified else
+                     self.engines.selected_status(backend.url))
+            return {"online": False, "backend_url": backend.url, "connection": state,
+                    "devices": [], "capabilities": {}, "models": {}, "error": str(exc)}
+
+    def workspace_storage(self):
+        # Snapshot registration under the task lock; filesystem I/O stays outside it.
+        with self.lock:
+            count = sum(query['type'] == 'input' for _, query in self.media.values())
+            protected = 'input-media.json' in self.recovery_protected_files
+        assets = local_asset_summary(self.local_assets.root, self.local_media_assets.root)
+        return {"version": 1, "measurement": "logical_file_bytes",
+                "status": "ok" if assets["status"] == "ok" and not protected
+                          else "unavailable" if assets["status"] == "unavailable" and protected
+                          else "partial",
+                "local_assets": assets,
+                "input_registration": {"status": "unavailable" if protected else "ok",
+                                       "count": count, "limit": INPUT_MEDIA_LIMIT,
+                                       "remaining": None if protected else max(0, INPUT_MEDIA_LIMIT - count),
+                                       "protected": protected}}
 
     def environment(self):
         with self.environment_lock:
@@ -425,19 +968,88 @@ class App:
                         return discovered | {"stale": True, "notes": discovered.get("notes", []) + ["扫描期间设置已变化，请重新检查"]}
             return copy.deepcopy(self.environment_snapshot)
 
-    def resolve_request(self, data):
+    def _package_execution(self, package, data, info, *, planning=False):
+        """One output closure and stored-field identity for planning and compile."""
+        document = _stored_package_document(package)
+        prompt = apply_planning_values(document, data.get("values", {}))
+        execution = output_closure(prompt, data.get('output_nodes'), info)
+        active_nodes = set(execution['node_ids'])
+        contract = self._authorized_additional_inputs(
+            crop_additional_inputs(document.get('additional_inputs'), active_nodes),
+            {key: prompt[key] for key in active_nodes}, info)
+        execution['active_field_ids'] = [field['id'] for field in package['fields']
+                                         if field['node_id'] in active_nodes]
+        if planning:
+            validate_planning_fields(package['fields'], prompt, info, active_nodes, additional_inputs=contract)
+            readiness = validate_editor_prompt({key: prompt[key] for key in execution['node_ids']}, info,
+                                               additional_inputs=contract)
+            deferred_media = {(field['node_id'], field['input']) for field in package['fields']
+                              if field['id'] in execution['active_field_ids']
+                              and field['type'] in {'image', 'audio', 'video'}
+                              and not prompt[field['node_id']]['inputs'][field['input']].strip()}
+            for issue in readiness['issues']:
+                # A fresh engine may have no uploaded files yet. Live field
+                # validation above proves these are media upload contracts;
+                # planning only selects scope, before upload and strict compile.
+                if (issue['code'] not in {'missing_media', 'enum_unavailable'}
+                        or (issue['node_id'], issue['input']) not in deferred_media):
+                    raise ValueError(issue['message'])
+        else:
+            prompt = apply_values(document, data.get("values", {}), active_nodes=active_nodes)
+            prompt = select_outputs(prompt, execution['selected_outputs'], info, additional_inputs=contract)
+        if contract is not None:
+            execution['_additional_inputs'] = contract
+        return prompt, execution
+
+    def execution_plan(self, data):
+        """Confirm a package's live scope without creating any durable work."""
+        encoded(data)
+        if not isinstance(data, dict) or set(data) != {'backend_url', 'request'}:
+            raise ValueError('执行计划需要 backend_url 和 request')
+        request = data['request']
+        if (not isinstance(request, dict) or request.get('kind') != 'package'
+                or set(request) - {'kind', 'package_id', 'values', 'output_nodes', 'editor_backend'}):
+            raise ValueError('执行计划目前仅支持工作流包及其已定义请求字段')
+        expected_url = local_url(data['backend_url'])
+        with self.lock:
+            backend = self.backend
+            backend_url = local_url(backend.url)
+            if expected_url != backend_url:
+                raise ValueError('推理引擎已变化，请重新确认执行范围')
+        if request.get('editor_backend') and local_url(request['editor_backend']) != backend_url:
+            raise ValueError('此工作流参数来自另一推理后端，请切回该后端')
+        package = self.packages.get(request.get('package_id'))
+        info = self._object_info_for_backend(backend)
+        _, execution = self._package_execution(package, request, info, planning=True)
+        execution.pop('_additional_inputs', None)
+        with self.lock:
+            if self.backend is not backend or local_url(backend.url) != backend_url:
+                raise ValueError('执行计划期间推理引擎已变化，请重新确认执行范围')
+            return {'backend_url': backend_url, 'package_id': package['id'], 'execution': execution}
+
+    def resolve_request(self, data, *, info=None, backend_url=None):
         if not isinstance(data, dict):
             raise ValueError("生成请求须为对象")
-        if 'output_nodes' in data and data.get('kind') != 'package':
-            raise ValueError('输出分支选择仅用于工作流包')
+        if 'output_nodes' in data and data.get('kind') not in {'package', 'api'}:
+            raise ValueError('输出分支选择仅用于工作流包或 API 工作流')
         if data.get("kind") == "package":
-            if data.get('editor_backend') and data['editor_backend'] != self.backend.url:
+            if data.get('editor_backend') and data['editor_backend'] != (backend_url if backend_url is not None else self.backend.url):
                 raise ValueError('此原生工作流的参数来自另一推理后端，请切回该后端或重新进入工作流应用参数')
             package = self.packages.get(data.get("package_id"))
-            prompt = apply_values(package, data.get("values", {}))
-            if 'output_nodes' in data:
-                prompt = select_outputs(prompt, data['output_nodes'], self.object_info())
-            return {"kind": "api", "prompt": prompt}
+            info = self.object_info() if info is None else info
+            prompt, execution = self._package_execution(package, data, info)
+            contract = execution.pop('_additional_inputs', None)
+            return {"kind": "api", "prompt": prompt, "execution": execution,
+                    **({'additional_inputs': contract} if contract else {})}
+        if data.get('kind') == 'api':
+            prompt = api_prompt(data)
+            info = self.object_info() if info is None else info
+            execution = output_closure(prompt, data.get('output_nodes'), info)
+            contract = self._authorized_additional_inputs(
+                crop_additional_inputs(data.get('additional_inputs'), execution['node_ids']),
+                {key: prompt[key] for key in execution['node_ids']}, info, backend_url=backend_url)
+            return {'kind': 'api', 'prompt': select_outputs(prompt, execution['selected_outputs'], info, additional_inputs=contract),
+                    'execution': execution, **({'additional_inputs': contract} if contract else {})}
         return data
 
     def diagnostics(self, data):
@@ -449,6 +1061,7 @@ class App:
     def save_settings(self, data):
         settings = {"backend_url": local_url(data.get("backend_url", "")),
                     "performance_profile": data.get("performance_profile", self.settings.get("performance_profile", "auto")),
+                    "desktop_close_action": data.get("desktop_close_action", self.settings.get("desktop_close_action", "background")),
                     "auto_start_engine": data.get("auto_start_engine", self.settings.get("auto_start_engine", False)),
                     "auto_update": data.get("auto_update", self.settings.get("auto_update", False)),
                     "model_roots": self.validate_roots(data.get("model_roots", [])),
@@ -457,19 +1070,32 @@ class App:
             raise ValueError("自动启动设置须为布尔值")
         if settings["performance_profile"] not in PROFILES:
             raise ValueError("显存预算选项无效")
+        if not isinstance(settings["desktop_close_action"], str) or settings["desktop_close_action"] not in CLOSE_ACTIONS:
+            raise ValueError("关闭页面后的行为设置无效")
         with self.lock:
+            if 'settings.json' in self.recovery_protected_files:
+                raise ValueError('设置原件未成功备份，未保存；请先手动备份或修复文件权限后重启')
             changed = settings["backend_url"] != self.backend.url
+            if changed and not self.hub_connection.can_switch_backend(settings['backend_url']):
+                raise ValueError('请先暂停 Hub 接收并完成当前操作；待恢复任务只能切回其共同的原推理引擎')
             enable_updates = settings["auto_update"] and not self.settings.get("auto_update", False)
-            if changed and any(j["status"] not in TERMINAL for j in self.jobs.values()):
+            if changed and any(j["status"] not in TERMINAL and j.get("backend") != settings["backend_url"] for j in self.jobs.values()):
                 raise ValueError("有任务尚未结束，请等待任务结束后切换推理后端")
             if changed:
                 with _ledger_lock(self):
-                    if any(record["state"] in {"pending", "unknown"} for record in _read_ledger(self).values()):
+                    if any(record["state"] in {"pending", "unknown"} and record.get("backend") != settings["backend_url"]
+                           for record in _read_ledger(self).values()):
                         raise ValueError("有提交结果尚未确认，请先在原引擎核实请求，不能切换后端")
             atomic_json(self.data_dir / "settings.json", settings)
             self.settings = settings
             self.updates.set_auto_check(settings["auto_update"])
             self.backend = Backend(settings["backend_url"])
+            if changed:
+                self.input_contract_grants = []
+                # Returning to the same URL cannot revive an old native session.
+                expired_sessions, self.editor_sessions = self.editor_sessions, {}
+                for session in expired_sessions.values():
+                    threading.Thread(target=session['proxy'].close, daemon=True).start()
             self.info, self.info_at = {}, 0
             self.environment_at = 0
             if changed:
@@ -485,8 +1111,7 @@ class App:
             raise ValueError("媒体路径无效")
         backend = local_url(backend or self.backend.url)
         # Stable opaque media id avoids leaking server path in browser URLs.
-        import hashlib
-        key = hashlib.sha256(f"{backend}|{kind}|{subfolder}|{filename}".encode()).hexdigest()[:32]
+        key = media_key(backend, kind, subfolder, filename)
         self.media[key] = (backend, {"filename": filename, "subfolder": subfolder, "type": kind})
         return f"/api/media/{key}"
 
@@ -501,7 +1126,7 @@ class App:
         records = [{'backend': backend, 'filename': query['filename'],
                     'subfolder': query['subfolder'], 'storage_type': 'input'}
                    for backend, query in self.media.values() if query['type'] == 'input']
-        if len(records) > 10000:
+        if len(records) > INPUT_MEDIA_LIMIT:
             raise ValueError('输入素材登记已达上限，请先备份工作区后整理素材')
         atomic_json(self.data_dir / 'input-media.json', records)
 
@@ -509,8 +1134,28 @@ class App:
         # Reject known persistence failures before creating a backend file.
         if 'input-media.json' in self.recovery_protected_files:
             raise ValueError('输入素材记录无法安全保存，未上传；请先备份本地工作区、修复磁盘问题并重启客户端')
-        if sum(query['type'] == 'input' for _, query in self.media.values()) >= 10000:
+        if sum(query['type'] == 'input' for _, query in self.media.values()) >= INPUT_MEDIA_LIMIT:
             raise ValueError('输入素材登记已达上限，未上传；请先备份工作区后整理素材')
+
+    def register_input_media(self, filename, subfolder="", *, backend=None):
+        """Publish an input receipt only after its durable registration succeeds."""
+        with self.lock:
+            backend = local_url(backend or self.backend.url)
+            prior_keys = set(self.media)
+            url = self.register_media(filename, subfolder, "input", backend=backend)
+            key = url.rsplit("/", 1)[-1]
+            try:
+                self.persist_input_media()
+            except (OSError, ValueError):
+                # Only undo this call's new registration. Existing inputs,
+                # outputs and registrations made before acquiring the lock stay.
+                if key not in prior_keys:
+                    self.media.pop(key, None)
+                raise
+            if self.backend.url == backend:
+                self.uploaded.add("/".join(filter(None, [subfolder, filename])))
+                self.info_at = 0
+            return url
 
     def _upload(self, data):
         if not isinstance(data.get("data"), str):
@@ -527,8 +1172,18 @@ class App:
         saved = self.local_assets.create(data.get("name"), data.get("data"))
         return {**saved, "url": f"/api/assets/images/{saved['asset_id']}"}
 
-    def sync_local_image_asset(self, asset_id):
+    def media_sync_backend(self, data):
+        """Pin a client-selected backend before any explicit asset transfer."""
         with self.lock:
+            backend = self.backend
+            if "expected_backend" in data and local_url(data["expected_backend"]) != backend.url:
+                raise ValueError("素材目标引擎已变化，未上传；请重新选择引擎后同步")
+            return backend
+
+    def sync_local_image_asset(self, asset_id, *, expected_backend=None):
+        with self.lock:
+            if expected_backend is not None and self.backend is not expected_backend:
+                raise ValueError("同步期间后端已变化，请重新选择输入素材")
             content, _mime = self.local_assets.read(asset_id)
             result = self._upload_content(content, complete=True)
             return {**result, "asset_id": asset_id}
@@ -538,10 +1193,17 @@ class App:
         return {**saved, "url": f"/api/assets/media/{saved['asset_id']}"}
 
     def sync_local_media_asset(self, asset_id, package_id=None, field_id=None, *, schema=None,
-                               expected_backend=None, source=None):
+                               expected_backend=None, source=None, values=None, field_ids=None, refresh=False):
+        if not isinstance(refresh, bool):
+            raise ValueError("媒体同步 refresh 必须是布尔值")
+        if field_ids is not None and (field_id is not None or not isinstance(field_ids, list)
+                or not 1 <= len(field_ids) <= 4096
+                or any(not isinstance(item, str) or not item or len(item) > 80 for item in field_ids)
+                or len(set(field_ids)) != len(field_ids)):
+            raise ValueError("媒体同步 field_ids 必须是非空、不重复的字段列表，不能与 field_id 同时使用")
         content, mime, media_type = self.local_media_assets.read(asset_id)
         if media_type == "image":
-            if package_id is not None or field_id is not None:
+            if package_id is not None or field_id is not None or field_ids is not None or values is not None:
                 raise ValueError("图片同步只接受空对象")
             with self.lock:
                 if expected_backend is not None and self.backend is not expected_backend:
@@ -549,135 +1211,163 @@ class App:
                 result = self._upload_content(content, complete=True)
                 return {**result, "asset_id": asset_id, "media_type": media_type}
 
-        if media_type != "video" or package_id is None or field_id is None:
-            raise ValueError("视频同步必须绑定工作流包字段")
+        if media_type not in {"video", "audio"} or package_id is None or field_id is None and field_ids is None:
+            raise ValueError("音视频同步必须绑定工作流包字段")
         with self.lock:
             backend = self.backend
             if expected_backend is not None and backend is not expected_backend:
                 raise ValueError("同步期间后端已变化，请重新选择输入素材")
         package = self.packages.get(package_id)
         live_schema = schema if schema is not None else self._object_info_for_backend(backend)
-        validate_package_media_field(package, field_id, live_schema, media_type)
-        cache_key = (asset_id, backend.url)
+        requested_fields = field_ids if field_ids is not None else [field_id]
+        for requested_field in requested_fields:
+            validate_package_media_field(_stored_package_document(package), requested_field, live_schema, media_type, values=values)
+        binding_receipt = {"package_id": package_id, **({"field_ids": list(field_ids)} if field_ids is not None else {"field_id": field_id})}
+        cache_key = (asset_id, backend)
 
         with self._transfer_lock(("local-media-upload", asset_id, backend.url)):
             with self.lock:
                 if self.backend is not backend:
                     raise ValueError("同步期间后端已变化，请重新选择输入素材")
                 if source is not None:
-                    self._check_video_source_locked(*source)
+                    self._check_media_source_locked(*source)
                 cached = self.local_media_upload_cache.get(cache_key)
-                if cached is not None:
+                if cached is not None and not refresh:
                     media_key = cached.get("url", "").rsplit("/", 1)[-1]
                     registered = self.media.get(media_key)
-                    if registered and registered[0] == backend.url and registered[1].get("type") == "input":
+                    if (registered and registered[0] == backend.url
+                            and registered[1].get("type") == "input"
+                            and "/".join(filter(None, [registered[1].get("subfolder", ""),
+                                                      registered[1].get("filename", "")])) == cached["name"]):
+                        self.persist_input_media()
                         self.uploaded.add(cached["name"])
                         self.info_at = 0
-                        self.persist_input_media()
                         return {**cached, "asset_id": asset_id, "media_type": media_type,
-                                "package_id": package_id, "field_id": field_id}
+                                **binding_receipt}
                     self.local_media_upload_cache.pop(cache_key, None)
                 self.check_input_storage()
 
             extension = {"video/mp4": ".mp4", "video/webm": ".webm",
-                         "video/quicktime": ".mov"}.get(mime)
+                         "video/quicktime": ".mov", "audio/wav": ".wav",
+                         "audio/mpeg": ".mp3", "audio/flac": ".flac", "audio/ogg": ".ogg"}.get(mime)
             if extension is None:
-                raise ValueError("视频媒体格式不受支持")
+                raise ValueError("音视频媒体格式不受支持")
             name = "prismcanvas-" + uuid.uuid4().hex + extension
             acknowledgement = backend.upload(name, content, mime)
             if (not isinstance(acknowledgement, dict)
                     or not isinstance(acknowledgement.get("name"), str)
                     or not acknowledgement["name"]
                     or acknowledgement.get("type", "input") != "input"):
-                raise BackendError("后端未确认视频输入上传")
+                raise BackendError("后端未确认音视频输入上传")
             returned_name = acknowledgement["name"]
             subfolder = acknowledgement.get("subfolder", "")
             relative = "/".join(filter(None, [subfolder, returned_name]))
             safe_relative(relative)
             with self.lock:
+                if self.backend is not backend:
+                    raise ValueError("同步期间后端已变化，请重新选择输入素材")
                 if source is not None:
-                    self._check_video_source_locked(*source)
-                url = self.register_media(returned_name, subfolder, "input", backend=backend.url)
-                if self.backend is backend:
-                    self.uploaded.add(relative)
-                    self.info_at = 0
+                    self._check_media_source_locked(*source)
+                url = self.register_input_media(returned_name, subfolder, backend=backend.url)
                 result = {"name": relative, "url": url, "backend": backend.url}
                 self.local_media_upload_cache[cache_key] = result
-                self.persist_input_media()
             return {**result, "asset_id": asset_id, "media_type": media_type,
-                    "package_id": package_id, "field_id": field_id}
+                    **binding_receipt}
 
-    def _check_video_source_locked(self, job_id, index, expected_backend, expected_output, expected_query):
-        if self.backend.url != expected_backend.url:
+    def _check_media_source_locked(self, job_id, media_type, index, output_id, expected_backend,
+                                   expected_output, expected_query):
+        if self.backend is not expected_backend:
             raise ValueError("结果来源后端已变化，请恢复原后端后重试")
-        job = self.jobs.get(job_id)
+        job = self.owned_job(job_id)
         if not job:
             raise ValueError("任务不属于此客户端")
         if job.get("status") != "completed":
-            raise ValueError("只能复用已完成任务的视频结果")
+            raise ValueError("只能复用已完成任务的媒体结果")
         if job.get("backend") != expected_backend.url:
             raise ValueError("结果来自另一个后端，请先恢复原后端连接")
         outputs = [output for output in job.get("outputs", [])
-                   if isinstance(output, dict) and output.get("type") == "video"]
-        if not 0 <= index < len(outputs):
-            raise ValueError("视频结果索引越界，或此任务没有视频输出")
-        output = outputs[index]
+                   if isinstance(output, dict) and output.get("type") == media_type]
+        if output_id is not None:
+            matches = [item for item in outputs if output_identity(job_id, item) == output_id]
+            if len(matches) != 1:
+                raise ValueError("媒体输出身份不存在或不唯一")
+            output = matches[0]
+        else:
+            if not 0 <= index < len(outputs):
+                raise ValueError("媒体结果索引越界，或此任务没有对应类型输出")
+            output = outputs[index]
         url = output.get("url", "")
         if not isinstance(url, str) or not re.fullmatch(r"/api/media/[0-9a-f]{32}", url):
-            raise ValueError("结果视频没有有效的本地媒体登记")
+            raise ValueError("结果没有有效的本地媒体登记")
         registered = self.media.get(url.rsplit("/", 1)[-1])
         if not registered:
-            raise ValueError("结果视频未登记或已不可用")
+            raise ValueError("结果未登记或已不可用")
         media_backend, query = registered
         if (media_backend != job["backend"] or query.get("type") not in {"output", "temp"}
                 or query.get("filename") != output.get("filename")
-                or query.get("subfolder", "") != output.get("subfolder", "")):
-            raise ValueError("结果视频与任务媒体登记不一致")
-        if expected_output is not None and output != expected_output:
-            raise ValueError("任务视频输出在传输期间发生变化")
+                or query.get("subfolder", "") != output.get("subfolder", "")
+                or query.get("type") != output.get("storage_type", "output")):
+            raise ValueError("结果与任务媒体登记不一致")
+        if expected_output is not None and (
+                output_identity(job_id, output) != output_identity(job_id, expected_output)
+                or output.get("url") != expected_output.get("url")):
+            raise ValueError("任务媒体输出在传输期间发生变化")
         if expected_query is not None and query != expected_query:
-            raise ValueError("任务视频登记在传输期间发生变化")
+            raise ValueError("任务媒体登记在传输期间发生变化")
         return output, query
 
     def media_input(self, job_id, data):
-        """Copy an owned completed video output to a local asset and bind it to a package field."""
-        if (not isinstance(data, dict) or set(data) != {"output_index", "package_id", "field_id"}
+        """Copy an owned completed audio/video file to a live package media field."""
+        required = {"output_index", "package_id", "field_id"}
+        if (not isinstance(data, dict) or not required <= set(data)
+                or set(data) - (required | {"media_type", "output_id"})
                 or type(data.get("output_index")) is not int
+                or data["output_index"] < 0
+                or not isinstance(data.get("media_type", "video"), str)
+                or data.get("media_type", "video") not in {"video", "audio"}
+                or ("output_id" in data and (not isinstance(data["output_id"], str) or not data["output_id"]))
                 or not isinstance(data.get("package_id"), str) or not data["package_id"]
                 or not isinstance(data.get("field_id"), str) or not data["field_id"]):
-            raise ValueError("视频结果复用需要 output_index、package_id 和 field_id，不接受 URL 或文件路径")
+            raise ValueError("媒体结果复用需要 output_index、package_id 和 field_id，不接受 URL 或文件路径")
         index, package_id, field_id = data["output_index"], data["package_id"], data["field_id"]
+        media_type, selected_id = data.get("media_type", "video"), data.get("output_id")
+        limit = MAX_AUDIO_BYTES if media_type == "audio" else MAX_LOCAL_VIDEO_BYTES
         with self.lock:
             backend = self.backend
-            output, query = self._check_video_source_locked(job_id, index, backend, None, None)
+            output, query = self._check_media_source_locked(job_id, media_type, index, selected_id,
+                                                           backend, None, None)
             output, query = copy.deepcopy(output), copy.deepcopy(query)
         filename = output.get("filename", "")
         extension = Path(filename).suffix.lower()
-        mime = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}.get(extension)
+        mime = ({".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}
+                if media_type == "video" else {".wav": "audio/wav", ".mp3": "audio/mpeg",
+                                               ".flac": "audio/flac", ".ogg": "audio/ogg"}).get(extension)
         if mime is None:
-            raise ValueError("只能复用 MP4、WebM 或 MOV 视频结果")
+            raise ValueError("只能复用 MP4/WebM/MOV 视频或 WAV/MP3/FLAC/OGG 音频结果")
         filename = safe_relative(query["filename"])
         subfolder = safe_relative(query["subfolder"]) if query.get("subfolder") else ""
         if "/" in filename:
-            raise ValueError("结果视频文件名无效")
-        source = (job_id, index, backend, output, query)
-        source_key = (backend.url, job_id, index, filename, subfolder, query["type"])
+            raise ValueError("结果媒体文件名无效")
+        output_id = output_identity(job_id, output)
+        # Old index calls retain index lifecycle checks; identity calls tolerate reorder.
+        source = (job_id, media_type, index, selected_id, backend, output, query)
+        source_key = (backend, job_id, output_id)
 
-        with self._transfer_lock(("job-video-output", *source_key)):
+        with self._transfer_lock(("job-media-output", *source_key)):
             with self.lock:
-                self._check_video_source_locked(job_id, index, backend, output, query)
+                self._check_media_source_locked(*source)
             package = self.packages.get(package_id)
             live_schema = self._object_info_for_backend(backend)
-            validate_package_media_field(package, field_id, live_schema, "video")
+            validate_package_media_field(_stored_package_document(package), field_id, live_schema, media_type)
             with self.lock:
-                self._check_video_source_locked(job_id, index, backend, output, query)
+                self._check_media_source_locked(*source)
                 asset_id = self.video_output_assets.get(source_key)
             if asset_id:
                 try:
                     cached_stream, _size, cached_mime, cached_type = self.local_media_assets.open(asset_id)
                     cached_stream.close()
-                    if cached_type != "video" or cached_mime != mime:
-                        raise ValueError("缓存视频类型与任务输出不一致")
+                    if cached_type != media_type or cached_mime != mime:
+                        raise ValueError("缓存媒体类型与任务输出不一致")
                 except FileNotFoundError:
                     with self.lock:
                         self.video_output_assets.pop(source_key, None)
@@ -692,51 +1382,51 @@ class App:
                 try:
                     with backend.opener.open(request, timeout=120) as response:
                         if response.status != 200 or response.headers.get_all("Content-Range", []):
-                            raise BackendError("结果视频未返回完整响应")
+                            raise BackendError("结果媒体未返回完整响应")
                         encodings = response.headers.get_all("Content-Encoding", [])
                         if len(encodings) > 1 or (encodings and encodings[0].strip().lower() != "identity"):
-                            raise BackendError("结果视频使用了不支持的传输编码")
+                            raise BackendError("结果媒体使用了不支持的传输编码")
                         lengths = response.headers.get_all("Content-Length", [])
                         transfers = response.headers.get_all("Transfer-Encoding", [])
                         transfer = transfers[0].strip().lower() if len(transfers) == 1 else ""
                         if (len(transfers) > 1 or transfer not in {"", "identity", "chunked"}
                                 or (transfer == "chunked" and lengths)):
-                            raise BackendError("结果视频响应传输格式不明确")
+                            raise BackendError("结果媒体响应传输格式不明确")
                         if len(lengths) > 1 or (lengths and not re.fullmatch(r"[0-9]{1,20}", lengths[0])):
-                            raise BackendError("结果视频响应长度无效")
+                            raise BackendError("结果媒体响应长度无效")
                         expected = int(lengths[0]) if lengths else None
-                        if expected is not None and not 8 <= expected <= MAX_LOCAL_VIDEO_BYTES:
-                            raise BackendError("结果视频响应大小超过 200 MiB 或为空")
+                        if expected is not None and not 8 <= expected <= limit:
+                            raise BackendError("结果媒体响应大小超限或为空")
                         size = 0
                         while True:
-                            chunk = response.read(min(128 * 1024, MAX_LOCAL_VIDEO_BYTES + 1 - size))
+                            chunk = response.read(min(128 * 1024, limit + 1 - size))
                             if not chunk:
                                 break
                             size += len(chunk)
-                            if size > MAX_LOCAL_VIDEO_BYTES:
-                                raise BackendError("结果视频响应大小超过 200 MiB")
+                            if size > limit:
+                                raise BackendError("结果媒体响应大小超限")
                             spool.write(chunk)
                         if size < 8 or (expected is not None and size != expected):
-                            raise BackendError("结果视频响应读取不完整")
+                            raise BackendError("结果媒体响应读取不完整")
                     spool.seek(0)
                     try:
                         saved = self.local_media_assets.create_from_stream(filename, spool, size, mime)
                     except ValueError as exc:
-                        raise BackendError("任务输出不是有效的完整视频：" + str(exc)) from None
+                        raise BackendError("任务输出不是有效的完整媒体：" + str(exc)) from None
                     asset_id = saved["asset_id"]
                     with self.lock:
-                        self._check_video_source_locked(job_id, index, backend, output, query)
+                        self._check_media_source_locked(*source)
                         self.video_output_assets[source_key] = asset_id
                 except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-                    raise BackendError("无法完整读取任务视频结果：" + str(exc)) from None
+                    raise BackendError("无法完整读取任务媒体结果：" + str(exc)) from None
                 finally:
                     spool.close()
 
             with self.lock:
-                self._check_video_source_locked(job_id, index, backend, output, query)
+                self._check_media_source_locked(*source)
             result = self.sync_local_media_asset(asset_id, package_id, field_id,
                                                  schema=live_schema, expected_backend=backend, source=source)
-            return {**result, "source_job": job_id, "output_index": index}
+            return {**result, "source_job": job_id, "output_index": index, "output_id": output_id}
 
     def upload_audio(self, data):
         with self.lock:
@@ -745,37 +1435,21 @@ class App:
                 content = base64.b64decode(data.get('data', ''), validate=True)
             except (ValueError, TypeError, binascii.Error):
                 raise ValueError('音频编码无效') from None
-            if not 12 <= len(content) <= MAX_IMAGE_BYTES:
-                raise ValueError('参考音频须在 12 字节到 20 MiB 之间')
-            if content[:4] == b'RIFF' and content[8:12] == b'WAVE':
-                if int.from_bytes(content[4:8], 'little') + 8 != len(content):
-                    raise ValueError('WAV 文件长度无效')
-                ext, mime = '.wav', 'audio/wav'
-            elif content.startswith(b'fLaC'):
-                ext, mime = '.flac', 'audio/flac'
-            elif content.startswith(b'ID3') or content[0] == 255 and content[1] & 0xe0 == 0xe0:
-                ext, mime = '.mp3', 'audio/mpeg'
-            elif content.startswith(b'OggS'):
-                ext, mime = '.ogg', 'audio/ogg'
-            else:
-                raise ValueError('参考音频仅支持 WAV、FLAC、MP3、OGG 文件')
+            mime, ext = audio_content_info(content)
             name = 'prismcanvas-' + uuid.uuid4().hex + ext
             result = self.backend.upload(name, content, mime)
             if not isinstance(result, dict) or not result.get('name') or result.get('type', 'input') != 'input':
                 raise BackendError('后端未确认音频上传')
             relative = '/'.join(filter(None, [result.get('subfolder', ''), result['name']]))
             safe_relative(relative)
-            url = self.register_media(result['name'], result.get('subfolder', ''), 'input')
-            self.uploaded.add(relative)
-            self.persist_input_media()
-            self.info_at = 0
+            url = self.register_input_media(result['name'], result.get('subfolder', ''))
             return {'name': relative, 'url': url, 'backend': self.backend.url}
 
     def output_location(self, job_id, data):
         if type(data.get('open', False)) is not bool:
             raise ValueError('打开目录选项无效')
         with self.lock:
-            job = self.jobs.get(job_id)
+            job = self.owned_job(job_id)
             if not job:
                 raise ValueError('结果不属于此客户端的任务')
             with self.engines._lock:
@@ -809,54 +1483,41 @@ class App:
             raise BackendError("后端没有返回有效的图片输入登记，无法交给下游节点")
         returned_name = result.get("name", name)
         subfolder = result.get("subfolder", "")
-        url = self.register_media(returned_name, subfolder, "input")
+        url = self.register_input_media(returned_name, subfolder)
         backend_name = f"{subfolder}/{returned_name}" if subfolder else returned_name
-        self.uploaded.add(backend_name)
-        self.persist_input_media()
-        self.info_at = 0
         return {"name": backend_name, "url": url, "backend": self.backend.url}
 
     def image_input(self, job_id, data):
-        """Copy an owned completed result into the current backend's image inputs."""
-        if not isinstance(data, dict) or set(data) != {"output_index"} or type(data["output_index"]) is not int:
+        """Transfer a frozen owned image without holding the job lock over I/O."""
+        if (not isinstance(data, dict) or "output_index" not in data
+                or set(data) - {"output_index", "output_id"}
+                or type(data["output_index"]) is not int or data["output_index"] < 0
+                or ("output_id" in data and (not isinstance(data["output_id"], str) or not data["output_id"]))):
             raise ValueError("图片结果复用需要整数 output_index，不接受 URL 或文件路径")
         index = data["output_index"]
         with self.lock:
-            job = self.jobs.get(job_id)
-            if not job:
-                raise ValueError("任务不属于此客户端")
-            if job.get("status") != "completed":
-                raise ValueError("只能复用已完成任务的图片结果")
-            if job.get("backend") != self.backend.url:
-                raise ValueError("结果来自另一个后端，请先恢复原后端连接")
-            outputs = [output for output in job.get("outputs", [])
-                       if isinstance(output, dict) and output.get("type") == "image"]
-            if not 0 <= index < len(outputs):
-                raise ValueError("图片结果索引越界，或此任务没有图片输出")
-            output = outputs[index]
-            if Path(output.get("filename", "")).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-                raise ValueError("只能复用 PNG、JPEG、WebP 图片结果")
-            url = output.get("url", "")
-            if not isinstance(url, str) or not re.fullmatch(r"/api/media/[0-9a-f]{32}", url):
-                raise ValueError("结果图片没有有效的本地媒体登记")
-            registered = self.media.get(url.rsplit("/", 1)[-1])
-            if not registered:
-                raise ValueError("结果图片未登记或已不可用")
-            media_backend, query = registered
-            if (media_backend != job["backend"] or query.get("type") not in {"output", "temp"}
-                    or query.get("filename") != output.get("filename")
-                    or query.get("subfolder", "") != output.get("subfolder", "")):
-                raise ValueError("结果图片与任务媒体登记不一致")
-            # Revalidate registered names rather than accepting a URL from a caller.
-            filename = safe_relative(query["filename"])
-            subfolder = safe_relative(query["subfolder"]) if query.get("subfolder") else ""
-            if "/" in filename:
-                raise ValueError("结果图片文件名无效")
+            backend = self.backend
+            output, query = self._check_media_source_locked(job_id, "image", index, data.get("output_id"),
+                                                           backend, None, None)
+            output, query = copy.deepcopy(output), copy.deepcopy(query)
+            source = (job_id, "image", index, data.get("output_id"), backend, output, query)
+        if Path(output.get("filename", "")).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("只能复用 PNG、JPEG、WebP 图片结果")
+        # The registered tuple is the only source; never use caller URLs/paths.
+        filename = safe_relative(query["filename"])
+        subfolder = safe_relative(query["subfolder"]) if query.get("subfolder") else ""
+        if "/" in filename:
+            raise ValueError("结果图片文件名无效")
+        identity = output_identity(job_id, output)
+        with self._transfer_lock(("job-image-output", backend, job_id, identity)):
+            with self.lock:
+                self._check_media_source_locked(*source)
+                self.check_input_storage()
             view_query = {"filename": filename, "subfolder": subfolder, "type": query["type"]}
-            request = urllib.request.Request(media_backend + "/view?" + urllib.parse.urlencode(view_query),
+            request = urllib.request.Request(backend.url + "/view?" + urllib.parse.urlencode(view_query),
                                              headers={"Accept-Encoding": "identity"})
             try:
-                with self.backend.opener.open(request, timeout=30) as response:
+                with backend.opener.open(request, timeout=30) as response:
                     if response.status != 200 or response.headers.get("Content-Range"):
                         raise BackendError("结果图片未返回完整响应")
                     if response.headers.get("Content-Encoding", "identity").lower() != "identity":
@@ -877,15 +1538,74 @@ class App:
                         raise BackendError("结果图片响应读取不完整")
             except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
                 raise BackendError("无法完整读取任务图片结果：" + str(exc)) from None
-            result = self._upload_content(content, complete=True)
-            return {**result, "backend": self.backend.url, "source_job": job_id, "output_index": index}
+
+            # Keep the existing image signature/end-boundary contract. The general
+            # _upload_content uses self.backend, so this path uploads explicitly
+            # through its frozen backend after releasing the short source check.
+            if not 8 <= len(content) <= MAX_IMAGE_BYTES:
+                raise ValueError("参考图大小须在 8 字节到 20 MiB 之间")
+            if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                ext, mime = ".png", "image/png"
+                complete = content.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+            elif content.startswith(b"\xff\xd8\xff"):
+                ext, mime = ".jpg", "image/jpeg"
+                complete = content.endswith(b"\xff\xd9")
+            elif content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+                ext, mime = ".webp", "image/webp"
+                complete = len(content) >= 20 and int.from_bytes(content[4:8], "little") + 8 == len(content)
+            else:
+                raise ValueError("初版参考图支持 PNG、JPEG、WebP；不接受 SVG 或可执行内容")
+            if not complete:
+                raise ValueError("结果图片数据不完整，无法作为下游输入")
+            with self.lock:
+                self._check_media_source_locked(*source)
+                self.check_input_storage()
+            name = "frameweave-" + uuid.uuid4().hex + ext
+            acknowledgement = backend.upload(name, content, mime)
+            if (not isinstance(acknowledgement, dict)
+                    or not isinstance(acknowledgement.get("name"), str)
+                    or not acknowledgement["name"] or acknowledgement.get("type", "input") != "input"):
+                raise BackendError("后端没有返回有效的图片输入登记，无法交给下游节点")
+            returned_name = safe_relative(acknowledgement["name"])
+            returned_folder = acknowledgement.get("subfolder", "")
+            returned_folder = safe_relative(returned_folder) if returned_folder else ""
+            if "/" in returned_name:
+                raise ValueError("媒体路径无效")
+            relative = "/".join(filter(None, [returned_folder, returned_name]))
+            with self.lock:
+                self._check_media_source_locked(*source)
+                self.check_input_storage()
+                url = self.register_input_media(returned_name, returned_folder, backend=backend.url)
+            return {"name": relative, "url": url, "backend": backend.url, "source_job": job_id,
+                    "output_index": index, "media_type": "image", "output_id": identity}
 
     def compile(self, data):
-        result = compile_workflow(self.resolve_request(data), self.object_info())
+        if not isinstance(data, dict):
+            raise ValueError("生成请求须为对象")
+        # The status cache is useful for browsing, but never evidence for a new
+        # submission. Capture the backend under the same lock as the one fresh
+        # schema read, then share that exact schema throughout this compile.
+        with self.lock:
+            backend, backend_url = self.backend, self.backend.url
+            info = self.object_info(refresh=True)
+            if self.backend is not backend or backend.url != backend_url:
+                raise ValueError('编译期间推理引擎已变化，请重新确认执行范围')
+        resolved = self.resolve_request(data, info=info, backend_url=backend_url)
+        contract = resolved.get('additional_inputs')
+        result = (compile_workflow(resolved, info, additional_inputs=contract)
+                  if contract is not None else compile_workflow(resolved, info))
+        if contract is not None:
+            result['additional_inputs'] = contract
+        if 'execution' in resolved:
+            result.setdefault('summary', {})['execution'] = resolved['execution']
+            result['summary']['warnings'] = [item['message'] for item in resolved['execution']['warnings']]
         if data.get("kind") == "package":
             package = self.packages.get(data.get("package_id"))
             result.setdefault("summary", {}).update({"package_id": package["id"], "package_name": package["name"]})
-        return result
+        with self.lock:
+            if self.backend is not backend or backend.url != backend_url:
+                raise ValueError('编译期间推理引擎已变化，请重新确认执行范围')
+            return result
 
     def submit(self, data):
         with self.lock:
@@ -895,7 +1615,7 @@ class App:
                 request = None  # The exact graph is already stored once below.
             elif data.get("kind") != "package":
                 summary = result.get("summary", {})
-                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles", "denoise", "loras", "custom_size", "ref_resolution"):
+                for key in ("kind", "models", "seed", "width", "height", "steps", "cfg", "sampler", "scheduler", "reference_roles", "denoise", "loras", "custom_size", "ref_resolution", "refine"):
                     if key in summary:
                         if key in {"width", "height"} and summary[key] is None:
                             # An input-derived output size is unknown until execution;
@@ -913,6 +1633,7 @@ class App:
         """Called under lock. Prepare storage before any inference side effect."""
         if self.exit_pending or self.closed.is_set():
             raise ValueError("棱光正在退出，未提交生成任务")
+        self.engines.verify_environment_endpoint(self.backend.url)
         if 'jobs.json' in self.recovery_protected_files:
             raise ValueError('任务记录无法安全保存，未提交生成；请先备份本地工作区、修复磁盘问题并重启客户端')
         if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
@@ -926,6 +1647,9 @@ class App:
         atomic_json(pending, result)
         try:
             try:
+                progress_warning = persist_progress_identity(self.data_dir, self.client_id)
+                if progress_warning and progress_warning not in self.recovery_warnings:
+                    self.recovery_warnings.append(progress_warning)
                 self.progress.ensure()
                 response = self.backend.request("/prompt", {"prompt": result["prompt"], "client_id": self.client_id}, timeout=30)
             except BackendError as exc:
@@ -942,7 +1666,11 @@ class App:
             job = {"id": job_id, "status": "queued", "progress": None, "elapsed": 0,
                    "created_at": time.time(), "started_at": None, "finished_at": None,
                    "kind": kind, "outputs": [], "backend": self.backend.url,
+                   "client_id": self.client_id,
                    "summary": result.get("summary", {}), "error": ""}
+            job["node_labels"] = {str(node_id): str(node.get("_meta", {}).get("title") or node.get("class_type", ""))[:120]
+                                  for node_id, node in result["prompt"].items()
+                                  if isinstance(node, dict) and isinstance(node.get("_meta", {}), dict)}
             if retry_of:
                 job["retry_of"] = retry_of
             self.jobs[job_id] = job
@@ -963,6 +1691,9 @@ class App:
 
     def public_job(self, job):
         result = copy.deepcopy(job)
+        for output in result.get("outputs", []):
+            if isinstance(output, dict):
+                output["output_id"] = output_identity(job["id"], output)
         try:
             has_run = (self.data_dir / "runs" / f"{job['id']}.json").is_file()
         except OSError:
@@ -972,6 +1703,8 @@ class App:
         result["can_retry"] = bool(has_run and job.get("status") in TERMINAL and
                                    job.get("backend") == self.backend.url and
                                    attempt.get("state") not in {"pending", "unknown"})
+        result["can_cancel"] = bool(job.get("status") not in TERMINAL and job.get("backend") == self.backend.url
+                                    and job.get("cancellation", {}).get("state") not in CANCEL_PENDING)
         if attempt.get("state") in {"pending", "unknown"}:
             result["retry_warning"] = "上次再次生成的提交结果不确定，请先在原后端核实队列；此记录已停止重提。"
         try:
@@ -980,11 +1713,19 @@ class App:
             result.pop("backend", None)
         result.pop("retry_attempt", None)
         result.pop("retry_requests", None)
+        result.pop("client_id", None)
         result.update(self.progress.snapshot(job))
+        labels = result.pop("node_labels", {})
+        label = labels.get(result.get("execution_node")) if isinstance(labels, dict) else None
+        if isinstance(label, str):
+            result["execution_label"] = label[:120]
+        if isinstance(labels, dict) and isinstance(result.get("execution_nodes"), list):
+            result["execution_labels"] = {node_id: labels[node_id][:120] for node_id in result["execution_nodes"]
+                                          if isinstance(labels.get(node_id), str)}
         return result
 
     def _read_run(self, job_id):
-        if job_id not in self.jobs:
+        if not self.owned_job(job_id):
             raise ValueError("任务不属于此客户端")
         try:
             file = self.data_dir / "runs" / f"{job_id}.json"
@@ -1002,7 +1743,7 @@ class App:
     def recipe(self, job_id):
         with self.lock:
             run = self._read_run(job_id)
-            job = self.jobs[job_id]
+            job = self.owned_job(job_id)
             warnings = ["再次生成使用保存的 API 图和种子，提交前重新校验节点与模型；原后端输入素材需要保留。"]
             request = run.get("request")
             if isinstance(request, dict) and request.get("kind") == "package":
@@ -1011,7 +1752,8 @@ class App:
                 except ValueError:
                     request = None
             if not isinstance(request, dict):
-                request = {"kind": "api", "prompt": run["prompt"]}
+                request = {"kind": "api", "prompt": run["prompt"],
+                           **({'additional_inputs': run['additional_inputs']} if run.get('additional_inputs') else {})}
                 warnings.append("此任务恢复为 API 工作流，完整保留原始节点和参数。")
             # Do not silently round legacy 64-bit seeds in the browser.
             stack = [request]
@@ -1026,7 +1768,17 @@ class App:
             same_backend = job.get("backend") == self.backend.url
             if not same_backend:
                 warnings.append("当前后端地址与原任务不同；可恢复编辑，请重新选择模型和上传参考图后再提交。")
+            # Reuse only previously registered input previews from this job's
+            # backend. Reading a recipe must not register/fetch guessed paths.
+            previews = {}
+            for key, (owner, query) in self.media.items():
+                if owner == job.get("backend") and query.get("type") == "input":
+                    name = "/".join(part for part in (query.get("subfolder"), query.get("filename")) if part)
+                    previews[name] = {"name": name, "backend": owner, "url": f"/api/media/{key}"}
+            references = [previews[name] for name in request.get("references", [])
+                          if isinstance(name, str) and name in previews]
             return {"request": copy.deepcopy(request), "summary": run.get("summary", {}),
+                    "job_id": job_id, "backend": job.get("backend"), "references": references,
                     "warnings": warnings, "replayable": same_backend}
 
     def retry(self, job_id, data):
@@ -1035,17 +1787,18 @@ class App:
             raise ValueError("再次生成需要有效的 request_id")
         with self.lock:
             run = self._read_run(job_id)
-            source = self.jobs[job_id]
+            source = self.owned_job(job_id)
             if source.get("backend") != self.backend.url or source.get("status") not in TERMINAL:
                 raise ValueError("只能在原后端对已结束的任务再次生成")
+            self.jobs[job_id] = source
             requests = source.setdefault("retry_requests", {})
             if key in requests:
-                known = self.jobs.get(requests[key])
+                known = self.owned_job(requests[key])
                 if not known:
                     raise ValueError("该请求已提交，其结果已超出最近任务范围；请核实后端历史")
                 return self.public_job(known)
             previous = source.get("retry_attempt", {})
-            child = self.jobs.get(previous.get("job_id"))
+            child = self.owned_job(previous["job_id"]) if previous.get("job_id") else None
             if child and (previous.get("key") == key or child.get("status") not in TERMINAL):
                 if len(requests) >= 64 and key not in requests:
                     raise ValueError("该历史任务的请求次数超过限制，请从最近生成的任务继续")
@@ -1059,7 +1812,9 @@ class App:
                 raise ValueError("上次提交结果不确定，请先在原后端检查；为避免重复任务已停止重提")
             if len(requests) >= 64:
                 raise ValueError("该历史任务已再次生成 64 次，请从最近生成的任务继续")
-            validate_prompt(run["prompt"], self.object_info(refresh=True))
+            info = self.object_info(refresh=True)
+            contract = self._authorized_additional_inputs(run.get('additional_inputs'), run['prompt'], info)
+            validate_prompt(run["prompt"], info, additional_inputs=contract)
             if sum(j["status"] not in TERMINAL for j in self.jobs.values()) >= 24:
                 raise ValueError("最多同时保留 24 个未结束任务")
             source["retry_attempt"] = {"key": key, "state": "pending"}
@@ -1085,19 +1840,82 @@ class App:
                 self.jobs[result["id"]]["storage_warning"] = "后端已接受任务，但本地记录保存失败；请保留任务 ID，勿重复提交。"
             return self.public_job(self.jobs[result["id"]])
 
+    def open_canvas(self, ident):
+        record = self.canvases.get(ident)
+        missing = []
+        seen = set()
+        for node in record["document"]["canvas"]["nodes"]:
+            if not isinstance(node, dict) or node.get("type") != "result":
+                continue
+            data = node.get("data", {})
+            outputs = data.get("outputs") if isinstance(data, dict) else None
+            for item in outputs if isinstance(outputs, list) else ():
+                url = item.get("url") if isinstance(item, dict) else None
+                match = re.fullmatch(r"/api/media/([a-f0-9]{32})", url) if isinstance(url, str) else None
+                if match and match[1] not in seen:
+                    key = match[1]
+                    seen.add(key)
+                    with self.lock:
+                        if key not in self.media:
+                            try:
+                                self.owned_job(None, media=key)
+                            except (OSError, ValueError):
+                                pass  # Preserve the canvas; report unavailable ownership below.
+                        if key not in self.media:
+                            missing.append(key)
+        if missing:
+            record["recovery_warning"] = f"{len(missing)} 个结果缺少原客户端的任务登记。请从原工作区恢复任务记录或重新导入结果文件。"
+        return record
+
+    def owned_job(self, ident, *, media=None):
+        """Load old, client-registered results on demand, independent of the UI list."""
+        with self.lock:
+            if ident is not None and ident in self.jobs:
+                return self.jobs[ident]
+            record = self.job_archive.lookup(ident=ident, media=media)
+            if record:
+                for output in record['outputs']:
+                    output['url'] = self.register_media(output['filename'], output['subfolder'],
+                                                       output['storage_type'], record['backend'])
+                    output['output_id'] = output_identity(record['id'], output)
+            return record
+
     def persist_jobs(self):
         if 'jobs.json' in self.recovery_protected_files:
             raise OSError('任务原始记录尚未成功备份，暂停覆盖；请先备份本地工作区')
-        atomic_json(self.data_dir / "jobs.json", list(self.jobs.values())[-200:])
+        with self.lock:
+            ordered = sorted(self.jobs.values(), key=lambda job: job.get('created_at', 0))
+            # Keep uncertain retry parents and cancellations available to the existing poller.
+            overflow = [job for job in ordered[:-200] if job['status'] in TERMINAL
+                        and job.get('retry_attempt', {}).get('state') not in {'pending', 'unknown'}
+                        and job.get('cancellation', {}).get('state') not in CANCEL_PENDING]
+            old_ids = {job['id'] for job in overflow}
+            self.job_archive.store(overflow)
+            hot = [job for job in ordered if job['id'] not in old_ids]
+            def encoded_size(rows):
+                raw = json.dumps(rows, ensure_ascii=False, indent=2, allow_nan=False)
+                return len(raw.replace("\n", os.linesep).encode("utf-8"))
+            if encoded_size(hot) > MAX_RECORD_BYTES:
+                hot = self.job_archive.snapshot(hot)
+                if encoded_size(hot) > MAX_RECORD_BYTES:
+                    raise OSError("任务索引超过可恢复大小，原记录已保留")
+            atomic_json(self.data_dir / "jobs.json", hot)
+            self.job_archive.release_unreferenced_snapshots(hot)
+            for ident in old_ids:
+                del self.jobs[ident]
 
     def job_list(self):
         with self.lock:
             now = time.time()
-            jobs = [self.public_job(job) for job in list(self.jobs.values())[-200:]]
+            ordered = sorted(self.jobs.values(), key=lambda job: job.get('created_at', 0))
+            active = [j for j in ordered[:-200] if j['status'] not in TERMINAL
+                      or j.get('retry_attempt', {}).get('state') in {'pending', 'unknown'}
+                      or j.get('cancellation', {}).get('state') in CANCEL_PENDING]
+            jobs = [self.public_job(job) for job in active + ordered[-200:]]
         for job in jobs:
             start = job.get("started_at") or job.get("created_at", now)
             job["elapsed"] = round(max(0, (job.get("finished_at") or now) - start), 1)
-        return {"jobs": list(reversed(jobs[-200:]))}
+        return {"jobs": list(reversed(jobs))}
 
     def cancel(self, job_id):
         with self.lock:
@@ -1105,95 +1923,203 @@ class App:
             if not job:
                 raise ValueError("只能取消由棱光提交的任务")
             if job["status"] in TERMINAL:
-                return {"id": job_id, "status": job["status"]}
-            # Newer ComfyUI exposes an atomic job-scoped cancellation API.
-            # Never fall back to a global interrupt, even after a queue ownership check.
+                return self.public_job(job)
+            if job.get("backend") != self.backend.url:
+                raise ValueError("此任务属于另一推理引擎；请查询原任务或切回原引擎后再请求取消")
+            if job.get("cancellation", {}).get("state") in CANCEL_PENDING:
+                return self.public_job(job)  # Repeated clicks cannot dispatch another cancellation.
+            previous = copy.deepcopy(job.get("cancellation"))
+            job["cancellation"] = new_cancellation()
             try:
-                targeted = self.backend.request("/api/jobs/" + urllib.parse.quote(job_id) + "/cancel", {})
-                if targeted.get("cancelled"):
-                    job["status"], job["finished_at"] = "cancelled", time.time()
+                self.persist_jobs()  # Persist intent before any backend mutation.
+            except OSError:
+                if previous is None:
+                    job.pop("cancellation", None)
+                else:
+                    job["cancellation"] = previous
+                raise
+            identifier = job["cancellation"]["id"]
+            adapter = self.backend
+
+        def record(state, message, method=None):
+            with self.lock:
+                if self.jobs.get(job_id) is not job or job.get("cancellation", {}).get("id") != identifier:
+                    raise ValueError("原取消记录已变化，请查询原任务")
+                # A concurrent poll may already have confirmed a real terminal.
+                if job["status"] not in TERMINAL:
+                    cancel_state(job, state, message, method)
+                try:
                     self.persist_jobs()
-                    return {"id": job_id, "status": "cancelled"}
-            except BackendError as exc:
-                if "HTTP 404" not in str(exc) and "HTTP 405" not in str(exc):
-                    raise
-            queue = self.backend.request("/queue")
-            pending = {str(row[1]) for row in queue.get("queue_pending", []) if len(row) > 1}
-            running = {str(row[1]) for row in queue.get("queue_running", []) if len(row) > 1}
-            if job_id in pending:
-                self.backend.request("/queue", {"delete": [job_id]})
-                # Queue deletion may race execution. Verify before claiming cancellation.
-                verify = self.backend.request("/queue")
-                active = {str(row[1]) for row in verify.get("queue_running", []) + verify.get("queue_pending", []) if len(row) > 1}
-                if job_id in active:
-                    raise ValueError("任务已经开始执行；为避免中断其他客户端，请在推理后端停止此运行")
-                job["status"], job["finished_at"] = "cancelled", time.time()
-            elif job_id in running:
-                raise ValueError("当前后端使用共享的全局中断接口；初版只安全取消排队任务。运行中任务请在推理后端停止")
-            else:
-                raise ValueError("后端队列中已无此任务，请等待状态刷新")
-            self.persist_jobs()
-            return {"id": job_id, "status": job["status"]}
+                except OSError:
+                    job["storage_warning"] = "取消请求记录保存失败；请保留原任务编号并查询原任务，不要重复发起。"
+                return self.public_job(job)
+
+        try:
+            targeted = adapter.request("/api/jobs/" + urllib.parse.quote(job_id, safe="") + "/cancel", {})
+            # ComfyUI's boolean means signal dispatched, not execution terminated.
+            if isinstance(targeted, dict) and targeted.get("cancelled") is True:
+                return record("requested", "已向原引擎发送定向取消请求，等待此任务的终态记录。", "job_scoped")
+            return record("uncertain", "原引擎未确认发送取消；任务可能已经结束，请查询原任务。", "job_scoped")
+        except BackendError as exc:
+            if not re.match(r"^(?:后端 )?HTTP (404|405)(?::|$)", str(exc)):
+                return record("uncertain", "取消请求的回复未确认；保留原任务，先查询原引擎。", "job_scoped")
+        except (OSError, ValueError):
+            return record("uncertain", "取消请求的回复未确认；保留原任务，先查询原引擎。", "job_scoped")
+        try:
+            queue = adapter.request("/queue")
+            pending = self._queue_ids(queue, "queue_pending")
+            if job_id not in pending:
+                return record("unavailable", "此引擎不支持安全的定向运行中取消；请在原引擎处理，客户端继续查询。")
+            # This exact-ID delete cannot interrupt another job. Its empty reply is
+            # not proof of terminal cancellation, even when the next queue is empty.
+            record("requesting", "正在请求移除原排队任务，随后核对原引擎历史。", "queue_delete")
+            adapter.request("/queue", {"delete": [job_id]})
+            return record("requested", "已请求移除排队任务；是否已开始或已生成仍需核对原任务。", "queue_delete")
+        except (BackendError, ValueError, OSError):
+            return record("uncertain", "取消请求结果待确认，请查询原任务；不会调用共享全局中断。")
+
+    @staticmethod
+    def _queue_ids(queue, key):
+        values = queue.get(key) if isinstance(queue, dict) else None
+        if not isinstance(values, list):
+            raise ValueError("引擎队列响应无效")
+        return [str(row[1]) for row in values if isinstance(row, (list, tuple)) and len(row) > 1]
+
+    def _history_outputs(self, job_id, backend, item):
+        outputs = []
+        groups = item.get("outputs", {})
+        if not isinstance(groups, dict):
+            return outputs
+        for output_node_id, node_result in groups.items():
+            if not isinstance(node_result, dict):
+                continue
+            for key in ("images", "gifs", "videos", "video", "audio", "audios"):
+                values = node_result.get(key, [])
+                if not isinstance(values, list):
+                    continue
+                for entry_index, entry in enumerate(values):
+                    if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+                        continue
+                    # Loaders can echo their input media through history UI channels.
+                    # Only saved outputs and generated temp previews are job results.
+                    if entry.get("type", "output") == "input":
+                        continue
+                    filename = entry["filename"]
+                    suffix = Path(filename).suffix.lower()
+                    if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
+                        continue
+                    subfolder = entry.get("subfolder", "")
+                    try:
+                        url = self.register_media(filename, subfolder, entry.get("type", "output"), backend)
+                    except ValueError:
+                        continue
+                    kind = "video" if suffix in (".mp4", ".webm", ".mov") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
+                    output = {"url": url, "filename": filename, "subfolder": subfolder, "type": kind,
+                              "storage_type": entry.get("type", "output"), "node_id": str(output_node_id),
+                              "history_channel": key, "entry_index": entry_index}
+                    output["output_id"] = output_identity(job_id, output)
+                    outputs.append(output)
+        return outputs
+
+    def refresh_job(self, job_id, *, adapter=None, queue=None):
+        """Read the owned original backend, without resubmitting or cancelling anything."""
+        with self.lock:
+            job = self.owned_job(job_id)
+            if not job:
+                raise ValueError("只能查询由棱光提交的原任务")
+            if job["status"] in TERMINAL:
+                return self.public_job(job)
+            owner = job["backend"]
+            adapter = adapter or (self.backend if owner == self.backend.url else Backend(owner))
+            if adapter.url != owner:
+                raise ValueError("原任务引擎身份不匹配")
+        history_available = queue_available = False
+        item, running, pending = None, [], []
+        try:
+            history = adapter.request("/history/" + urllib.parse.quote(job_id, safe=""), timeout=5)
+            if isinstance(history, dict):
+                history_available, item = True, history.get(job_id)
+        except (BackendError, ValueError, OSError):
+            pass
+        try:
+            queue = adapter.request("/queue", timeout=4) if queue is None else queue
+            running, pending = self._queue_ids(queue, "queue_running"), self._queue_ids(queue, "queue_pending")
+            queue_available = True
+        except (BackendError, ValueError, OSError):
+            pass
+        with self.lock:
+            current = self.jobs.get(job_id)
+            if current is None and job.get("backend") == owner and job["status"] in TERMINAL:
+                # A concurrent poll may have finished and archived this same
+                # registration while our engine reads were in flight.
+                saved = self.owned_job(job_id)
+                if (saved and saved["backend"] == owner and saved["status"] == job["status"]
+                        and saved.get("created_at") == job.get("created_at")):
+                    return self.public_job(saved)
+            if current is not job or job.get("backend") != owner:
+                raise ValueError("原任务记录已变化，请重新查询")
+            if job["status"] in TERMINAL:
+                return self.public_job(job)
+            outcome = history_outcome(job_id, item)
+            job.pop("queue_position", None)
+            if outcome:
+                terminal_observed(job, outcome)
+                if outcome == "failed":
+                    messages = item.get("status", {}).get("messages", [])
+                    errors = [v[1].get("exception_message") for v in messages
+                              if isinstance(v, list) and len(v) > 1 and v[0] == "execution_error" and isinstance(v[1], dict)] if isinstance(messages, list) else []
+                    job["error"] = "\n".join(value for value in errors if isinstance(value, str))[:4000] or "原引擎记录此任务执行失败"
+                # An interrupted/error history can omit already registered partial
+                # outputs. Merge by stable ownership identity; never erase them.
+                outputs = {output_identity(job_id, value): value for value in self._history_outputs(job_id, owner, item)}
+                for value in job.get("outputs", []):
+                    if value.get("storage_type", "output") == "input":
+                        continue
+                    key = output_identity(job_id, value)
+                    outputs.setdefault(key, {**value, "output_id": key})
+                job["outputs"] = list(outputs.values())
+            elif job_id in running or job_id in pending:
+                job.pop("status_warning", None)
+                job.pop("error", None)
+                job.pop("finished_at", None)
+                job["status"] = "running" if job_id in running else "queued"
+                if job_id in running:
+                    job["started_at"] = job.get("started_at") or time.time()
+                else:
+                    job["queue_position"] = pending.index(job_id) + 1
+            elif (not history_available or not queue_available or job.get("cancellation")
+                  or time.time() - job["created_at"] > 15):
+                job["status"], job["progress"] = "unknown", None
+                job.pop("finished_at", None)
+                job["status_warning"] = ("原引擎暂时不可读取；保留原任务，连接恢复后继续核对。" if not history_available or not queue_available
+                                         else "原任务不在队列中，且没有终态历史；可能已被移除或引擎已重启，不能据此判定失败或取消。")
+                if job.get("cancellation", {}).get("state") in CANCEL_PENDING:
+                    cancel_state(job, "uncertain", "取消结果待确认；原任务尚无可靠终态，请保留编号并查询原引擎。")
+            try:
+                self.persist_jobs()
+            except OSError:
+                job["storage_warning"] = "原任务状态记录保存失败；请保留编号，不要重复生成。"
+            return self.public_job(job)
 
     def update_jobs(self):
         with self.lock:
-            active = [(k, copy.deepcopy(v)) for k, v in self.jobs.items() if v["status"] not in TERMINAL]
+            active = [(k, v["backend"]) for k, v in self.jobs.items() if v["status"] not in TERMINAL]
         if not active:
             return
-        try:
-            queue = self.backend.request("/queue", timeout=4)
-            running = {str(row[1]) for row in queue.get("queue_running", []) if len(row) > 1}
-            pending = {str(row[1]) for row in queue.get("queue_pending", []) if len(row) > 1}
-            for job_id, old in active:
-                history = self.backend.request("/history/" + urllib.parse.quote(job_id), timeout=5)
-                item = history.get(job_id)
-                with self.lock:
-                    job = self.jobs[job_id]
-                    if job["status"] in TERMINAL:
-                        continue
-                    if item:
-                        result_status = item.get("status", {})
-                        failed = result_status.get("status_str") == "error"
-                        if failed or result_status.get("completed"):
-                            job["status"] = "failed" if failed else "completed"
-                            job["finished_at"] = time.time()
-                            job["progress"] = 100 if not failed else None
-                            if failed:
-                                messages = result_status.get("messages", [])
-                                errors = [v[1].get("exception_message", "生成执行失败") for v in messages
-                                          if isinstance(v, list) and len(v) > 1 and v[0] == "execution_error" and isinstance(v[1], dict)]
-                                job["error"] = "\n".join(errors)[:4000] or "后端执行失败或被中断"
-                            outputs = []
-                            for output_node_id, node_result in item.get("outputs", {}).items():
-                                for key in ("images", "gifs", "videos", "video", "audio", "audios"):
-                                    values = node_result.get(key, [])
-                                    if not isinstance(values, list):
-                                        continue
-                                    for entry in values:
-                                        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
-                                            continue
-                                        filename = entry["filename"]
-                                        suffix = Path(filename).suffix.lower()
-                                        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus"):
-                                            continue
-                                        subfolder = entry.get("subfolder", "")
-                                        url = self.register_media(filename, subfolder, entry.get("type", "output"), old["backend"])
-                                        out_type = "video" if suffix in (".mp4", ".webm", ".mov") else "audio" if suffix in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus") else "image"
-                                        outputs.append({"url": url, "filename": filename, "subfolder": subfolder, "type": out_type, "storage_type": entry.get("type", "output"), "node_id": str(output_node_id)})
-                            job["outputs"] = outputs
-                    elif job_id in running:
-                        job["status"] = "running"
-                        job["started_at"] = job.get("started_at") or time.time()
-                    elif job_id in pending:
-                        job["status"] = "queued"
-                    elif time.time() - job["created_at"] > 15:
-                        job["status"] = "failed"
-                        job["finished_at"] = time.time()
-                        job["error"] = "任务已离开后端队列且没有历史记录，可能被外部移除或后端重启"
-                    self.persist_jobs()
-        except (BackendError, ValueError, OSError):
-            # A disconnected backend is not proof a generation failed.
-            pass
+        # Restored tasks also need their event channel, without submitting again.
+        self.progress.ensure()
+        queues, adapters = {}, {}
+        for job_id, owner in active:
+            if owner not in adapters:
+                adapters[owner] = self.backend if owner == self.backend.url else Backend(owner)
+                try:
+                    queues[owner] = adapters[owner].request("/queue", timeout=4)
+                except (BackendError, ValueError, OSError):
+                    queues[owner] = {}  # An unavailable observation, not an empty queue.
+            try:
+                self.refresh_job(job_id, adapter=adapters[owner], queue=queues[owner])
+            except (BackendError, ValueError, OSError):
+                pass
 
     def poll(self):
         while not self.closed.wait(2):
@@ -1223,22 +2149,24 @@ def make_server(app, port=0):
         def respond(self, data, code=200, content_type="application/json; charset=utf-8", extra=None):
             if not isinstance(data, bytes):
                 data = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-src http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
-            for key, value in (extra or {}).items():
-                self.send_header(key, value)
-            self.end_headers()
             try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-src http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+                for key, value in (extra or {}).items():
+                    self.send_header(key, value)
+                self.end_headers()
                 self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # The operation may already be persisted. End this transport;
+                # do not send a second response or keep reading this connection.
+                self.close_connection = True
 
         def drain_rejected_body(self):
             """Consume only a small, explicitly sized body after the rejection is sent."""
@@ -1294,24 +2222,32 @@ def make_server(app, port=0):
                     self.reject({"error": "此 MCP 接口使用 POST；不提供 SSE 订阅"}, 405, extra={"Allow": "POST"})
                 elif path == "/api/status":
                     self.respond(app.status())
+                elif path == "/api/workspace/storage":
+                    self.respond(app.workspace_storage())
+                elif path == '/api/hub-connection':
+                    self.respond(app.hub_connection.snapshot())
                 elif path == '/api/performance-plan':
                     self.respond(performance_plan(app.settings['performance_profile'], app.status()))
                 elif path == '/api/canvases':
                     params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                     self.respond(app.canvases.list(offset=int(params.get('offset', ['0'])[0]),
                                                   limit=int(params.get('limit', ['200'])[0]),
-                                                  query=params.get('q', [''])[0]))
+                                                  query=params.get('q', [''])[0], gallery=params.get('gallery') == ['1']))
                 elif re.fullmatch(r'/api/canvases/[0-9a-f]{32}', path):
-                    self.respond(app.canvases.get(path.rsplit('/', 1)[-1]))
+                    self.respond(app.open_canvas(path.rsplit('/', 1)[-1]))
                 elif path == '/api/audio-capabilities':
                     from .audio_workflows import audio_capabilities
                     self.respond({**audio_capabilities(app.object_info(), [app.packages.get(p['id']) for p in app.packages.list()]), 'backend_url': app.backend.url})
                 elif path == "/api/engines":
                     self.respond(app.engines.status())
+                elif path == "/api/voice-environments":
+                    self.respond(app.voice_environments.list())
                 elif path == "/api/updates":
                     self.respond(app.update_status())
                 elif path == "/api/heartbeat":
                     self.respond({"ok": True})
+                elif path == "/api/desktop/status":
+                    self.respond(app.desktop.status())
                 elif path == "/api/jobs":
                     self.respond(app.job_list())
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/preview", path):
@@ -1324,9 +2260,22 @@ def make_server(app, port=0):
                 elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}', path):
                     self.respond(app.editor_workflows.get(path.rsplit('/', 1)[-1]))
                 elif path == "/api/packages":
-                    self.respond({"packages": app.packages.list()})
+                    params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+                    for key in ("summary", "refresh"):
+                        if key in params and (len(params[key]) != 1 or params[key][0] not in {"0", "1"}):
+                            raise ValueError("summary、refresh 查询参数须为单个 0 或 1")
+                    summary = params.get("summary", ["0"])[0] == "1"
+                    refresh = params.get("refresh", ["0"])[0] == "1"
+                    if refresh and not summary:
+                        raise ValueError("刷新摘要须同时提供 summary=1")
+                    if summary:
+                        self.respond({"packages": app.packages.list_summaries(refresh=refresh), "summary": True})
+                    else:
+                        self.respond({"packages": app.packages.list()})
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}", path):
                     self.respond({"package": app.packages.get(path.rsplit("/", 1)[-1])})
+                elif re.fullmatch(r'/api/packages/p-[0-9a-f]{24}/editor-sources', path):
+                    self.respond(app.package_editor_sources(path.split('/')[3]))
                 elif path.startswith("/api/assets/images/"):
                     match = re.fullmatch(r"/api/assets/images/([0-9a-f]{64})", path)
                     if not match:
@@ -1351,6 +2300,9 @@ def make_server(app, port=0):
                     key = path.rsplit("/", 1)[-1]
                     with app.lock:
                         registered = app.media.get(key)
+                        if registered is None and re.fullmatch(r'[a-f0-9]{32}', key):
+                            app.owned_job(None, media=key)
+                            registered = app.media.get(key)
                     if not registered:
                         self.reject({"error": "媒体不属于此客户端的任务或导入"}, 404)
                         return
@@ -1458,7 +2410,7 @@ def make_server(app, port=0):
         def upload_local_media(self):
             content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type not in {"image/png", "image/jpeg", "image/webp",
-                                    "video/mp4", "video/webm", "video/quicktime"}:
+                                    "video/mp4", "video/webm", "video/quicktime"} | AUDIO_MIMES:
                 self.reject({"error": "本地媒体 Content-Type 不受支持"}, 415)
                 return
             try:
@@ -1466,7 +2418,8 @@ def make_server(app, port=0):
             except ValueError:
                 self.reject({"error": "Content-Length 无效"}, 400)
                 return
-            limit = MAX_LOCAL_IMAGE_BYTES if content_type.startswith("image/") else MAX_LOCAL_VIDEO_BYTES
+            limit = (MAX_AUDIO_BYTES if content_type in AUDIO_MIMES else MAX_LOCAL_IMAGE_BYTES
+                     if content_type.startswith("image/") else MAX_LOCAL_VIDEO_BYTES)
             if not 8 <= length <= limit:
                 self.reject({"error": "本地媒体请求大小超限"}, 413)
                 return
@@ -1490,6 +2443,17 @@ def make_server(app, port=0):
                 self.reject({"error": str(exc)}, 502)
                 return
             self.respond(result)
+
+        def desktop_response(self, operation):
+            releases = []
+            try:
+                result = operation(releases)
+                self.respond(result)
+            finally:
+                # A confirmed exit may end the main process. Finish the ACK
+                # write before arming shutdown, including a lost write.
+                for release in releases:
+                    release()
 
         def do_POST(self):
             path = urllib.parse.urlsplit(self.path).path
@@ -1554,27 +2518,53 @@ def make_server(app, port=0):
                     raise ValueError("请求应为 JSON 对象")
                 if path == "/api/settings":
                     result = app.save_settings(data)
+                elif path == "/api/desktop/heartbeat":
+                    result = app.desktop.heartbeat(data)
+                elif path == "/api/desktop/complete":
+                    self.desktop_response(lambda releases: app.complete_desktop_command(data, after_response=releases))
+                    return
+                elif path == '/api/hub-connection/prepare-offer':
+                    result = prepare_offer(app, data)
+                elif path.startswith('/api/hub-connection/'):
+                    operation = {
+                        'grant': 'import_grant', 'probe': 'probe',
+                        'read-capability': 'read_capability', 'capabilities': 'save_capability',
+                        'remove-capability': 'remove_capability', 'enable-capability': 'enable_capability',
+                        'enabled': 'set_enabled', 'inbox': 'inbox', 'step': 'step',
+                        'executions': 'executions',
+                    }.get(path.removeprefix('/api/hub-connection/'))
+                    if operation is None:
+                        self.respond({'error': '未找到接入操作'}, 404)
+                        return
+                    result = getattr(app.hub_connection, operation)(data)
                 elif path == '/api/canvases':
                     result = app.canvases.save(data.get('document'))
                 elif path == '/api/assets/images':
                     result = app.create_local_image_asset(data)
                 elif re.fullmatch(r'/api/assets/images/[0-9a-f]{64}/backend-input', path):
-                    if data:
-                        raise ValueError('同步本地图片只接受空对象')
+                    if set(data) - {"expected_backend"}:
+                        raise ValueError('同步本地图片只接受可选 expected_backend')
+                    backend = app.media_sync_backend(data)
                     asset_id = path.split('/')[4]
                     try:
-                        result = app.sync_local_image_asset(asset_id)
+                        result = app.sync_local_image_asset(asset_id, expected_backend=backend)
                     except FileNotFoundError:
                         self.respond({"error": "本地图片不存在"}, 404)
                         return
                 elif re.fullmatch(r'/api/assets/media/[0-9a-f]{64}/backend-input', path):
-                    if data and (set(data) != {"package_id", "field_id"}
-                                 or any(not isinstance(value, str) or not value for value in data.values())):
-                        raise ValueError('媒体同步只接受空对象或 package_id 和 field_id')
+                    binding_keys = set(data) - {"expected_backend", "values", "refresh"}
+                    if binding_keys and (binding_keys not in ({"package_id", "field_id"}, {"package_id", "field_ids"})
+                                         or not isinstance(data.get("package_id"), str) or not data["package_id"]
+                                         or "field_id" in data and (not isinstance(data["field_id"], str) or not data["field_id"])):
+                        raise ValueError('媒体同步必须绑定 package_id 与 field_id 或 field_ids')
+                    if "values" in data and (not binding_keys or not isinstance(data["values"], dict)):
+                        raise ValueError('媒体同步 values 必须是绑定工作流的参数对象')
+                    backend = app.media_sync_backend(data)
                     asset_id = path.split('/')[4]
                     try:
                         result = app.sync_local_media_asset(
-                            asset_id, data.get("package_id"), data.get("field_id"))
+                            asset_id, data.get("package_id"), data.get("field_id"), expected_backend=backend,
+                            values=data.get("values"), field_ids=data.get("field_ids"), refresh=data.get("refresh", False))
                     except FileNotFoundError:
                         self.respond({"error": "本地媒体不存在"}, 404)
                         return
@@ -1584,6 +2574,14 @@ def make_server(app, port=0):
                     result = app.output_location(path.split('/')[3], data)
                 elif path == "/api/engines/start":
                     result = app.engines.start(data.get("id"))
+                elif path == "/api/voice-environments/inspect":
+                    result = app.voice_environments.inspect(data)
+                elif path == "/api/voice-environments/register":
+                    result = app.voice_environments.prepare(data)
+                elif path == "/api/voice-environments/recheck":
+                    if set(data) != {"id"}:
+                        raise ValueError("只接受已登记的声音环境标识")
+                    result = app.voice_environments.recheck(data["id"])
                 elif path == "/api/engines/register":
                     if set(data) - {"root", "port", "name"}:
                         raise ValueError("仅支持登记已有安装目录、名称和端口")
@@ -1591,11 +2589,8 @@ def make_server(app, port=0):
                 elif path in {"/api/updates/check", "/api/updates/stage"}:
                     result = app.begin_update(path.rsplit("/", 1)[-1])
                 elif path in {"/api/updates/install", "/api/exit"}:
-                    if not app.prepare_exit(self.server.server_port, install=path.endswith("/install")):
-                        raise ValueError("有生成任务、待确认提交或下载正在处理，请完成后再退出安装")
-                    self.respond({"ok": True, "exiting": True})
-                    app.closed.set()
-                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    self.desktop_response(lambda releases: app.direct_desktop_exit(
+                        install=path.endswith("/install"), after_response=releases))
                     return
                 elif path == "/api/environment":
                     result = app.environment()
@@ -1608,10 +2603,16 @@ def make_server(app, port=0):
                     document = data.get('document')
                     if document is None and isinstance(data.get('source_json'), str):
                         document = json.loads(data['source_json'].lstrip('\ufeff'))
-                    result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'))
-                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure|backends)', path):
+                    result = app.editor_workflows.create(data.get('name'), document, data.get('source_json'),
+                                                         origin=data.get('source_kind', 'native'))
+                elif re.fullmatch(r'/api/editor-workflows/e-[0-9a-f]{24}/(session|draft|apply|export|interface|configure|backends|fork)', path):
                     workflow_id, action = path.split('/')[3:5]
-                    if action == 'backends':
+                    if action == 'fork':
+                        if set(data) != {'base_revision'}:
+                            raise ValueError('编辑副本只接受准确的当前来源修订')
+                        with app.lock:
+                            result = app.editor_workflows.fork_current(workflow_id, data.get('base_revision'))
+                    elif action == 'backends':
                         result = app.editor_backends(workflow_id)
                     elif action == 'session':
                         result = app.editor_session(workflow_id, 'http://' + self.headers['Host'])
@@ -1635,16 +2636,64 @@ def make_server(app, port=0):
                     if session:
                         session['proxy'].close()
                     result = {'ok': True}
+                elif path == "/api/editor-prepare":
+                    result = app.prepare_editor(data)
+                elif path == "/api/interfaces/inspect":
+                    carrier = {key: value for key, value in data.items() if key not in {'output_nodes', 'missing_values', 'previous_package_id'}}
+                    document = None if data.get('package_id') else transport_document(carrier)
+                    prompt = app._editor_package_prompt(data) if data.get('package_id') else api_prompt(document)
+                    previous = app._interface_previous_package(data)
+                    info = app.object_info(refresh=True)
+                    migrated = normalize_editor_inputs(prompt, info)
+                    contract = app._inspection_contract({**data, 'additional_inputs': (previous.get('additional_inputs') if previous else (document.get('additional_inputs') if document else None))}, migrated['prompt'], info)
+                    repaired = apply_missing_interface_values(migrated['prompt'], info, data.get('missing_values', {}),
+                                                              output_nodes=data.get('output_nodes'), additional_inputs=contract)
+                    result = validate_inspection_result({**inspect_interface(repaired['prompt'], info, output_nodes=data.get('output_nodes'),
+                                                 previous_fields=previous['fields'] if previous else None,
+                                                 previous_prompt=previous['prompt'] if previous else None, additional_inputs=contract),
+                              'migrations': migrated['migrations'], 'repairs': repaired['repairs']})
+                elif path == "/api/interfaces/apply":
+                    with app.lock:
+                        if data.get('backend_url') != app.backend.url:
+                            raise ValueError('推理引擎已变化，请重新编译接口')
+                        prompt = app._editor_package_prompt(data) if data.get('package_id') else api_prompt(data)
+                        result = app.apply_interface(prompt, data, data.get('name', '我的工作流'))
+                        result.pop('_compiled_prompt', None)
+                        result.pop('_additional_inputs', None)
+                        result.pop('_contract_proof', None)
                 elif path == "/api/packages/inspect":
-                    result = inspect_document(transport_document(data), app.info)
+                    result = app.inspect_package(data)
+                elif path == "/api/h3-reference/prepare":
+                    result = app.prepare_h3_reference(data)
                 elif path == "/api/packages":
                     result = {"package": app.packages.save(transport_document(data, allow_bare=True))}
+                elif re.fullmatch(r'/api/packages/p-[0-9a-f]{24}/fork-editor-source', path):
+                    result = app.fork_package_editor_source(path.split('/')[3], data)
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/export", path):
                     result = app.packages.export_transport(path.split("/")[3])
+                elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/model-options", path):
+                    if set(data) - {"backend_url", "output_id", "choices"} or "choices" in data and not isinstance(data["choices"], dict):
+                        raise ValueError("模型选择参数无效")
+                    with app.lock:
+                        if data.get("backend_url") != app.backend.url:
+                            raise ValueError("引擎已切换，请重新读取模型目录")
+                        pack = app.packages.get(path.split("/")[3])
+                        info = app.object_info(refresh="choices" in data)
+                        contract = app._inspection_contract({"additional_inputs": pack.get("additional_inputs")}, pack["prompt"], info)
+                        result = workflow_models(pack, info, data.get("output_id"), data.get("choices"), contract=contract)
+                        if "document" in result:
+                            result["package"] = app.packages.save(result.pop("document"))
+                            result.pop("slots")
+                        result["backend_url"] = app.backend.url
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/apply", path):
-                    result = {"prompt": apply_values(app.packages.get(path.split("/")[3]), data.get("values", {}))}
+                    resolved = app.resolve_request({**data, 'kind': 'package', 'package_id': path.split('/')[3]})
+                    result = {"prompt": resolved['prompt'], 'execution': resolved['execution'],
+                              **({'additional_inputs': resolved['additional_inputs']}
+                                 if resolved.get('additional_inputs') else {})}
                 elif re.fullmatch(r"/api/packages/p-[0-9a-f]{24}/metadata", path):
                     result = {"package": app.packages.update_metadata(path.split("/")[3], data)}
+                elif path == "/api/execution-plan":
+                    result = app.execution_plan(data)
                 elif path == "/api/compile":
                     result = app.compile(data)
                 elif path == "/api/jobs":
@@ -1661,6 +2710,10 @@ def make_server(app, port=0):
                     result = app.upload(data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/cancel", path):
                     result = app.cancel(path.split("/")[3])
+                elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/refresh", path):
+                    if data:
+                        raise ValueError("任务刷新不接受生成参数")
+                    result = app.refresh_job(path.split("/")[3])
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/image-input", path):
                     result = app.image_input(path.split("/")[3], data)
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/media-input", path):
@@ -1668,18 +2721,27 @@ def make_server(app, port=0):
                 elif re.fullmatch(r"/api/jobs/[\w-]{1,100}/retry", path):
                     result = app.retry(path.split("/")[3], data)
                 elif path == "/api/shutdown":
-                    self.respond({"ok": True})
-                    app.closed.set()
-                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    if data:
+                        raise ValueError("候选清理不接受参数；请使用原有退出入口。")
+                    # Cleanup has no browser-draft ACK. It is only safe with
+                    # zero live registered pages and must never start updates.
+                    self.desktop_response(lambda releases: app.direct_desktop_exit(
+                        after_response=releases, require_no_sessions=True, allow_update=False))
                     return
                 else:
                     self.respond({"error": "接口不存在"}, 404)
                     return
                 self.respond(result)
+            except DesktopExitUncertain as exc:
+                self.respond({"error": str(exc)}, 502)
+            except EditorPrewriteRejected as exc:
+                self.respond({"error": str(exc), "persisted": False,
+                              "persistence_stage": "prewrite"}, exc.status)
             except SubmissionRejected as exc:
                 self.respond({"error": str(exc), "submission_state": "rejected"}, 400)
             except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
-                self.respond({"error": "请求的 JSON 嵌套或数字超出限制" if isinstance(exc, (RecursionError, OverflowError)) else str(exc)}, 400)
+                self.respond({"error": "请求的 JSON 嵌套或数字超出限制" if isinstance(exc, (RecursionError, OverflowError)) else str(exc),
+                              **({'code': exc.code} if getattr(exc, 'code', None) else {})}, 400)
             except (BackendError, OSError) as exc:
                 self.respond({"error": str(exc)}, 502)
 
@@ -1696,4 +2758,44 @@ def make_server(app, port=0):
 
     server = Server(("127.0.0.1", port), Handler)
     server.app = app
+    app.listen_port = server.server_port
+    def owner_exit(*, install=False, after_response=None, allow_update=True):
+        # Start a cancellable waiter BEFORE any exit intent/update handoff.
+        # Failure to create a thread therefore leaves nothing to roll back.
+        release, cancel = threading.Event(), threading.Event()
+        def shutdown():
+            release.wait()
+            if cancel.is_set():
+                return
+            try:
+                server.shutdown()
+                app.closed.set()
+            except Exception:
+                with app.lock:
+                    handoff = app.exit_handoff_pending or app.closed.is_set()
+                    if not handoff:
+                        app.exit_pending = False
+                app.desktop.owner_shutdown_failed(handoff_pending=handoff)
+        try:
+            threading.Thread(target=shutdown, daemon=True, name="PrismCanvas-owner-exit").start()
+        except Exception:
+            app.desktop.owner_shutdown_failed()
+            raise ValueError("退出线程未能启动，未退出；请在主界面重新核实。") from None
+        committed = False
+        try:
+            safe = (app.prepare_exit(server.server_port, install=install) if allow_update
+                    else app.prepare_exit(server.server_port, install=install, allow_update=False))
+            if not safe:
+                return False
+            committed = True
+            return True
+        finally:
+            if committed and after_response is not None:
+                after_response.append(release.set)
+            else:
+                if not committed:
+                    cancel.set()
+                release.set()
+    app._owner_exit = owner_exit
+    app.desktop.configure(tray_ready=False)
     return server

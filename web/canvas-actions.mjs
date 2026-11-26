@@ -1,5 +1,5 @@
 /** Canvas editing operations. They never submit jobs or alter the source graph. */
-import { makeId, parseGraph, serializeGraph } from './graph.mjs';
+import { makeId, parseGraph, serializeGraph, edgeInputField } from './graph.mjs';
 
 const LIMIT = 1e7;
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -14,7 +14,12 @@ export function selectionBounds(nodes, sizeOf) {
 
 export function copySelection(graph, ids) {
   const selected = new Set(ids);
-  return copy({ nodes: graph.nodes.filter(node => selected.has(node.id)), edges: graph.edges.filter(edge => selected.has(edge.source) && selected.has(edge.target)) });
+  const edges = graph.edges.filter(edge => selected.has(edge.source) && selected.has(edge.target)).map(edge => {
+    const source = graph.nodes.find(node => node.id === edge.source);
+    const field = !edge.targetField && ['reference','generation','result'].includes(source?.type) ? edgeInputField(graph,edge) : '';
+    return field ? {...edge,targetField:field} : edge;
+  });
+  return copy({ nodes: graph.nodes.filter(node => selected.has(node.id)), edges });
 }
 
 export function pasteSelection(fragment, position, currentCount = 0) {

@@ -16,7 +16,11 @@ test('recorded image and H3 requests restore isolated controls and ordered image
 
 test('package and legacy API recipes retain explicit values and advanced graph parameters', () => {
   const pack = { kind: 'package', package_id: 'p-stable', values: { scene: 'rainy street', count: 3, seed: 9007199254740000 } };
-  const packaged = recipeGraph({ request: pack });
+  const fields = [{ id: 'scene', type: 'text', label: '场景' }, { id: 'count', type: 'integer', label: '数量' }, { id: 'seed', type: 'integer', label: '种子' }]
+    .map(field => ({ ...field, node_id: '1', input: field.id }));
+  const definition = { id: pack.package_id, name: '原工作流', fields, prompt: { '1': { class_type: 'SavedWorkflow', inputs: pack.values } } };
+  assert.throws(() => recipeGraph({ request: pack }), /完整定义/);
+  const packaged = recipeGraph({ request: pack, packageDefinition: definition });
   assert.deepEqual(generationPayload(packaged, packaged.generationId), pack);
   const api = { kind: 'api', prompt: { '4': { class_type: 'CustomImage', inputs: { image: 'reference.png', settings: { factor: .9, values: [2, true] } } } } };
   const restored = recipeGraph({ request: api });
@@ -50,9 +54,10 @@ test('task history filters by combined status and visible metadata without searc
   const jobs = [
     { id: 'done-1', kind: 'package', status: 'completed', summary: { package_name: '电影海报' }, prompt: 'private secret' },
     { id: 'failed-2', kind: 'h3_t2v', status: 'failed', error: 'Missing model' },
-    { id: 'waiting-3', status: 'queued' }, { id: 'rendering-4', status: 'running' },
+    { id: 'waiting-3', status: 'queued' }, { id: 'rendering-4', status: 'running' }, { id: 'unknown-5', status: 'unknown' },
   ];
-  assert.deepEqual(filterJobs(jobs, 'active').map(job => job.id), ['waiting-3', 'rendering-4']);
+  assert.deepEqual(filterJobs(jobs, 'active').map(job => job.id), ['waiting-3', 'rendering-4', 'unknown-5']);
+  assert.deepEqual(filterJobs(jobs, 'unknown').map(job => job.id), ['unknown-5']);
   assert.deepEqual(filterJobs(jobs, 'failed', 'ＭＩＳＳＩＮＧ').map(job => job.id), ['failed-2']);
   assert.equal(filterJobs(jobs, 'completed', '海报').length, 1);
   assert.equal(filterJobs(jobs, 'all', 'private').length, 0);

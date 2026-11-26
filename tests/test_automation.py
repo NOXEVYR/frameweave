@@ -394,7 +394,7 @@ class AutomationTests(unittest.TestCase):
             imported = self.call("fw_package_import", args)
             self.assertFalse(imported["isError"], imported)
             self.assertEqual(imported["structuredContent"]["id"], package["id"])
-        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(self.backend.calls, [("GET", "/object_info", None)] * 1)
 
     def test_package_source_json_schema_and_manual_exclusivity_match(self):
         for tool_name in ("fw_package_import", "fw_package_inspect"):
@@ -415,7 +415,7 @@ class AutomationTests(unittest.TestCase):
         draft["fields"][0]["required"] = "true"
         self.assertTrue(self.call("fw_package_import", {"source_json": json.dumps(draft)})["isError"])
         self.assertEqual(self.app.packages.list(), [])
-        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(self.backend.calls, [("GET", "/object_info", None)] * 1)
 
     def test_job_query_recipe_retry_and_owned_cancel(self):
         job = self.generate()["structuredContent"]
@@ -423,8 +423,10 @@ class AutomationTests(unittest.TestCase):
         recipe = self.call("fw_job_recipe", {"job_id": job["id"]})["structuredContent"]
         self.assertEqual(recipe["request"]["prompt"], API_JOB["prompt"])
         self.assertTrue(self.call("fw_cancel", {"job_id": "foreign-job"})["isError"])
-        self.assertEqual(self.call("fw_cancel", {"job_id": job["id"]})["structuredContent"]["status"], "cancelled")
+        self.assertEqual(self.call("fw_cancel", {"job_id": job["id"]})["structuredContent"]["cancellation"]["state"], "requested")
         args = {"job_id": job["id"], "request_id": "retry-key-0001"}
+        self.assertTrue(self.call("fw_retry", args)["isError"])
+        self.confirm_cancel(job)
         first = self.call("fw_retry", args)["structuredContent"]
         self.assertEqual(self.call("fw_retry", args)["structuredContent"]["id"], first["id"])
         self.assertEqual(len(self.prompts()), 2)
@@ -432,8 +434,16 @@ class AutomationTests(unittest.TestCase):
 
     def terminal_job(self, key="source-operation-0001"):
         job = self.generate(key)["structuredContent"]
-        self.assertEqual(self.call("fw_cancel", {"job_id": job["id"]})["structuredContent"]["status"], "cancelled")
+        self.assertEqual(self.call("fw_cancel", {"job_id": job["id"]})["structuredContent"]["cancellation"]["state"], "requested")
+        self.confirm_cancel(job)
         return job
+
+    def confirm_cancel(self, job):
+        self.backend.history[job['id']] = {'status': {'status_str': 'error', 'completed': False,
+            'messages': [['execution_interrupted', {'prompt_id': job['id']}]]}, 'outputs': {}}
+        confirmed = self.call('fw_jobs', {'job_id': job['id'], 'refresh': True})['structuredContent']
+        self.assertEqual(confirmed['status'], 'cancelled')
+        self.assertEqual(confirmed['cancellation']['state'], 'confirmed')
 
     @staticmethod
     def retry_message(job_id, key="retry-operation-0001"):

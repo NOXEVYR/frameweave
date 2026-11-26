@@ -1,9 +1,13 @@
 /** User-facing choices for exposing native ComfyUI controls on the outer canvas. */
+import { MAX_INTERFACE_FIELDS, DEFAULT_INTERFACE_FIELDS } from './interface-limits.mjs';
+import { interfacePage, interfaceSearch } from './interface-pagination.mjs';
 
 export const EDITOR_INTERFACE_GROUPS = Object.freeze([
   '模型与编码器', '提示词', '媒体', '采样尺寸', '其他',
 ]);
-export const EDITOR_INTERFACE_FIELD_LIMIT = 64;
+export const EDITOR_INTERFACE_FIELD_LIMIT = MAX_INTERFACE_FIELDS;
+export const EDITOR_INTERFACE_CANDIDATE_LIMIT = MAX_INTERFACE_FIELDS;
+export const EDITOR_INTERFACE_OUTPUT_LIMIT = 64;
 const FIELD_DISCONNECT = null;
 
 const idOf = value => {
@@ -20,19 +24,43 @@ const hasKey = (value, key) => value instanceof Map ? value.has(key) :
 const getKey = (value, key) => value instanceof Map ? value.get(key) : value?.[key];
 const normalizedType = value => String(value ?? '').trim().toLowerCase();
 const typeOf = field => Array.isArray(field?.type) ? field.type.map(normalizedType).filter(Boolean).join('|') : normalizedType(field?.type);
-const mediaTokens = field => [field?.type, field?.mediaType, field?.input, field?.label]
+const mediaTokens = field => [field?.type, field?.mediaType]
   .flatMap(value => Array.isArray(value) ? value : [value]).map(normalizedType);
 
 export function isRequiredEditorMediaField(field) {
-  return mediaTokens(field).some(value => value === 'image' || value === 'audio');
+  return mediaTokens(field).some(value => ['image', 'audio', 'video'].includes(value));
+}
+
+export function editorFieldSupportsPort(field) {
+  return ['text', 'string', 'image', 'video', 'audio'].includes(typeOf(field));
+}
+
+function fieldPresentation(field, previous) {
+  if (!editorFieldSupportsPort(field)) return 'control';
+  if (previous?.presentation === 'port' || previous?.presentation === 'control') return previous.presentation;
+  if (field.presentation === 'port' || field.presentation === 'control') return field.presentation;
+  // Older interfaces exposed all connectable types. Preserve that behavior on recompilation.
+  if (previous && typeof previous === 'object') return 'port';
+  return ['image', 'video', 'audio'].includes(typeOf(field)) || editorFieldGroup(field) === '提示词' ? 'port' : 'control';
+}
+
+function retainedField(field, previousFields) {
+  const match = previousFields instanceof Map ? previousFields.get(fieldId(field)) : previousFields.find(item => previousFieldId(item) === fieldId(field));
+  const previous = match && typeof match === 'object' && sameKnownType(match, field) ? match : undefined;
+  return { ...field, ...(previous?.label !== undefined ? { label: previous.label } : {}),
+    presentation: fieldPresentation(field, previous) };
 }
 
 export function editorFieldGroup(field) {
   if (EDITOR_INTERFACE_GROUPS.includes(field?.group)) return field.group;
-  const type = typeOf(field);
-  const text = [field?.input, field?.label, field?.type].flatMap(value => Array.isArray(value) ? value : [value])
-    .filter(value => value !== undefined && value !== null).join(' ').toLowerCase();
   if (mediaTokens(field).some(value => ['image', 'audio', 'video', 'mask'].includes(value))) return '媒体';
+  const roles = { model: '模型与编码器', encoder: '模型与编码器', lora: '模型与编码器',
+    prompt: '提示词', positive_prompt: '提示词', negative_prompt: '提示词',
+    seed: '采样尺寸', sampling: '采样尺寸', size: '采样尺寸', custom: '其他' };
+  if (roles[field?.role]) return roles[field.role];
+  const type = typeOf(field);
+  const text = [field?.input, field?.label].flatMap(value => Array.isArray(value) ? value : [value])
+    .filter(value => value !== undefined && value !== null).join(' ').toLowerCase();
   if (/model|checkpoint|ckpt|vae|lora|clip|encoder|unet|diffusion|safetensor|gguf/.test(`${type} ${text}`)) return '模型与编码器';
   if (/prompt|positive|negative|caption|text|文本|提示词|正向|反向/.test(text)) return '提示词';
   if (/width|height|size|seed|steps|cfg|sampler|scheduler|denoise|noise|batch|fps|seconds|frames|shift|尺寸|采样|种子|步数|强度/.test(text)) return '采样尺寸';
@@ -54,7 +82,7 @@ function previousFieldId(item) {
   return typeof item === 'string' || typeof item === 'number' ? String(item) : fieldId(item);
 }
 
-export function initialEditorFieldIds(fields, previousFields = [], previousValues = {}, previousBaseline = {}) {
+function defaultEditorFieldIds(fields, previousFields, previousValues, previousBaseline, limit) {
   const candidates = Array.isArray(fields) ? fields : [];
   const previous = Array.isArray(previousFields) ? previousFields : [];
   const previousById = new Map(previous.map(item => [previousFieldId(item), item]).filter(([id]) => id));
@@ -72,17 +100,15 @@ export function initialEditorFieldIds(fields, previousFields = [], previousValue
       const id = fieldId(field), old = previousById.get(id);
       return previousIds.has(id) && (!old || typeof old !== 'object' || sameKnownType(old, field));
     })
-    : [
-      ...candidates.filter(field => editorFieldGroup(field) === '模型与编码器'),
-      ...candidates.filter(field => editorFieldGroup(field) === '提示词'),
-      ...candidates.filter(field => editorFieldGroup(field) === '采样尺寸'),
-      ...candidates.filter(field => field.recommended === true && editorFieldGroup(field) === '其他'),
-      ...candidates.filter(field => field.recommended !== true && editorFieldGroup(field) === '其他'),
-    ];
+    : candidates.filter(field => field.recommended === true ||
+      field.recommended === undefined && ['模型与编码器', '提示词', '采样尺寸'].includes(editorFieldGroup(field)));
   const ordered = [...required, ...wanted.filter(field => !required.includes(field))];
-  const capped = required.length > EDITOR_INTERFACE_FIELD_LIMIT
-    ? required : ordered.slice(0, EDITOR_INTERFACE_FIELD_LIMIT);
+  const capped = hasPrevious || required.length > limit ? ordered : ordered.slice(0, limit);
   return capped.map(fieldId).filter(Boolean);
+}
+
+export function initialEditorFieldIds(fields, previousFields = [], previousValues = {}, previousBaseline = {}) {
+  return defaultEditorFieldIds(fields, previousFields, previousValues, previousBaseline, DEFAULT_INTERFACE_FIELDS);
 }
 
 export function initialEditorOutputIds(outputs, selectedOutputs = []) {
@@ -113,18 +139,24 @@ function connectionCounts(connections, direction, property) {
   return counts;
 }
 
-function candidateFieldsFor(oldField, candidates, oldId) {
-  const oldType = typeOf(oldField);
-  if (!oldType) return [];
-  return candidates.filter(candidate => fieldId(candidate) !== oldId && typeOf(candidate) === oldType);
-}
-
 export function deriveEditorRebindings({
   fields = [], previousFields = [], selectedFieldIds = [], outputs = [], selectedOutputIds = [],
-  selectedOutputs = [], connections = [],
+  selectedOutputs = [], connections = [], replaced_nodes: replacedNodes = {},
 } = {}) {
   const fieldList = Array.isArray(fields) ? fields : [];
   const outputList = Array.isArray(outputs) ? outputs : [];
+  const currentFields = new Map(fieldList.map(item => [fieldId(item), item]));
+  // Share compatible candidates instead of retaining an N-by-N array of
+  // references when a large interface replaces every prior field.
+  const candidatesByType = new Map();
+  for (const field of fieldList) {
+    const type = typeOf(field);
+    if (!type) continue;
+    if (!candidatesByType.has(type)) candidatesByType.set(type, []);
+    candidatesByType.get(type).push(field);
+  }
+  for (const group of candidatesByType.values()) Object.freeze(group);
+  const currentOutputs = new Map(outputList.map(item => [outputId(item), item]));
   const selectedFields = new Set((selectedFieldIds || []).map(idOf).filter(Boolean));
   const selectedOutputSet = new Set((selectedOutputIds || []).map(idOf).filter(Boolean));
   const previousById = new Map((Array.isArray(previousFields) ? previousFields : [])
@@ -148,7 +180,7 @@ export function deriveEditorRebindings({
   const inputIds = new Set([...previousById.keys(), ...inputCounts.keys()]);
   const inputRebindings = [];
   for (const id of inputIds) {
-    const current = fieldList.find(item => fieldId(item) === id);
+    const current = currentFields.get(id);
     const prior = previousById.get(id);
     const connection = inputConnections.get(id);
     const old = prior && typeof prior === 'object' ? prior : connection || current || { id };
@@ -161,21 +193,24 @@ export function deriveEditorRebindings({
     const descriptor = fieldDisplay(old, id);
     descriptor.type = old.type ?? connection?.type ?? current?.type;
     descriptor.connected = connected;
-    descriptor.reason = !current ? 'removed' : typeChanged ? 'type_changed' : 'not_exposed';
-    descriptor.candidates = candidateFieldsFor(descriptor, fieldList, id);
+    descriptor.reason = old.node_id && Object.hasOwn(replacedNodes, old.node_id) ? 'node_replaced' : !current ? 'removed' : typeChanged ? 'type_changed' : 'not_exposed';
+    const group = candidatesByType.get(typeOf(descriptor)) || [];
+    const includesSelf = current && typeOf(current) === typeOf(descriptor);
+    Object.defineProperty(descriptor, 'candidates', { enumerable: true, get: () =>
+      includesSelf ? group.filter(candidate => fieldId(candidate) !== id) : group });
     inputRebindings.push(descriptor);
   }
 
   const outputIds = new Set(outputCounts.keys());
   const outputRebindings = [];
   for (const id of outputIds) {
-    const current = outputList.find(item => outputId(item) === id);
+    const current = currentOutputs.get(id);
     const prior = selectedOutputById.get(id);
     const connection = outputConnections.get(id);
     const oldMediaType = normalizedType(prior?.mediaType) || normalizedType(connection?.mediaType) || normalizedType(prior?.type);
     const currentMediaType = normalizedType(current?.mediaType ?? current?.type);
     const typeChanged = !!current && !!oldMediaType && !!currentMediaType && oldMediaType !== currentMediaType;
-    if (selectedOutputSet.has(id) && current && !typeChanged) continue;
+    if (selectedOutputSet.has(id) && current && !typeChanged && current.replaced !== true) continue;
     const old = prior && typeof prior === 'object' ? prior : connection || current || { id };
     const mediaType = oldMediaType || normalizedType(old.mediaType ?? old.type ?? currentMediaType);
     const descriptor = {
@@ -183,10 +218,10 @@ export function deriveEditorRebindings({
       label: String(old.label ?? connection?.label ?? current?.label ?? id),
       mediaType,
       connected: outputCounts.get(id) || 0,
-      reason: typeChanged ? 'type_changed' : !current ? 'removed' : 'not_selected',
+      reason: current?.replaced === true ? 'node_replaced' : typeChanged ? 'type_changed' : !current ? 'removed' : 'not_selected',
       candidates: outputList.filter(candidate => {
         const candidateId = outputId(candidate);
-        if (!candidateId || candidateId === id) return false;
+        if (!candidateId || candidateId === id && current?.replaced !== true) return false;
         const candidateType = normalizedType(candidate.mediaType);
         return !mediaType || !candidateType || candidateType === mediaType;
       }),
@@ -219,41 +254,41 @@ function element(tag, text = '', className = '') {
 }
 
 const PANEL_STYLE = `
-  .editor-interface-dialog{padding:0;border:1px solid #d1d8e5;border-radius:15px;color:#253b60;background:#fdfdfb;
-    width:min(980px,calc(100vw - 28px));max-width:none;max-height:calc(100dvh - 28px);overflow:hidden;box-shadow:0 24px 90px #25345042}
-  .editor-interface-dialog::backdrop{background:#26334d88;backdrop-filter:blur(3px)}
+  .editor-interface-dialog{padding:0;border:1px solid var(--line);border-radius:15px;color:var(--text);background:var(--panel);
+    width:min(980px,calc(100vw - 28px));max-width:none;max-height:calc(100dvh - 28px);overflow:hidden;box-shadow:0 24px 90px #26396a1c}
+  .editor-interface-dialog::backdrop{background:#17234170;backdrop-filter:blur(3px)}
   .editor-interface-layout{display:grid;grid-template-rows:auto minmax(0,1fr) auto;max-height:calc(100dvh - 28px);min-height:min(560px,calc(100dvh - 28px))}
-  .editor-interface-header,.editor-interface-footer{position:sticky;z-index:2;background:#fdfdfb;padding:15px 20px;display:flex;align-items:center;gap:12px}
-  .editor-interface-header{top:0;border-bottom:1px solid #e0e5ed}.editor-interface-header-copy{min-width:0;flex:1}
-  .editor-interface-header h2{margin:0;font-size:19px}.editor-interface-header p{margin:5px 0 0;color:#65748a;font-size:12px;line-height:1.55}
+  .editor-interface-header,.editor-interface-footer{position:sticky;z-index:2;background:var(--panel);padding:15px 20px;display:flex;align-items:center;gap:12px}
+  .editor-interface-header{top:0;border-bottom:1px solid var(--line)}.editor-interface-header-copy{min-width:0;flex:1}
+  .editor-interface-header h2{margin:0;font-size:19px}.editor-interface-header p{margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.55}
   .editor-interface-close{flex:0 0 auto}.editor-interface-body{overflow:auto;overscroll-behavior:contain;padding:16px 20px}
-  .editor-interface-footer{bottom:0;justify-content:space-between;border-top:1px solid #e0e5ed}
+  .editor-interface-footer{bottom:0;justify-content:space-between;border-top:1px solid var(--line)}
   .editor-interface-footer .editor-interface-actions{display:flex;justify-content:flex-end;gap:8px;margin-left:auto}
-  .editor-interface-status{margin:0;color:#66758d;font-size:12px;line-height:1.5}.editor-interface-status[data-error="true"]{color:#a34533}
+  .editor-interface-status{margin:0;color:var(--muted);font-size:12px;line-height:1.5}.editor-interface-status[data-error="true"]{color:var(--danger)}
   .editor-interface-toolbar{display:grid;grid-template-columns:minmax(180px,1fr) auto;gap:11px;align-items:center;margin-bottom:12px}
-  .editor-interface-search{width:100%;min-height:36px;padding:8px 10px;border:1px solid #d2dceb;border-radius:8px;background:#fff;color:#263b5e}
+  .editor-interface-search{width:100%;min-height:36px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--muted)}
   .editor-interface-tabs{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
-  .editor-interface-tab{border:1px solid #d8dfeb;border-radius:99px;padding:6px 9px;background:#fff;color:#566987;font-size:11px;cursor:pointer}
-  .editor-interface-tab[aria-pressed="true"]{background:#e9eefc;border-color:#aebfe9;color:#354e9d}
-  .editor-interface-count{margin:5px 0 10px;color:#60708a;font-size:12px}
-  .editor-interface-group{border:1px solid #e0e5ed;border-radius:10px;background:#fff;margin:10px 0;overflow:hidden}
-  .editor-interface-group h3,.editor-interface-section h3{font-size:13px;margin:0;padding:10px 12px;color:#344968;background:#f4f6fa}
-  .editor-interface-field{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(145px,230px);align-items:center;gap:10px;padding:9px 12px;border-top:1px solid #eef1f5}
-  .editor-interface-field:first-of-type{border-top:0}.editor-interface-field input[type="checkbox"]{width:16px;height:16px;accent-color:#526fc8}
+  .editor-interface-tab{border:1px solid var(--line);border-radius:99px;padding:6px 9px;background:var(--panel);color:var(--muted);font-size:11px;cursor:pointer}
+  .editor-interface-tab[aria-pressed="true"]{background:var(--accent-dim);border-color:var(--accent-line);color:var(--accent-text)}
+  .editor-interface-count{margin:5px 0 10px;color:var(--muted);font-size:12px}
+  .editor-interface-group{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin:10px 0;overflow:hidden}
+  .editor-interface-group h3,.editor-interface-section h3{font-size:13px;margin:0;padding:10px 12px;color:var(--muted);background:var(--panel)}
+  .editor-interface-field{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(145px,230px);align-items:center;gap:10px;padding:9px 12px;border-top:1px solid var(--line)}
+  .editor-interface-field:first-of-type{border-top:0}.editor-interface-field input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent)}
   .editor-interface-field-main{min-width:0}.editor-interface-field-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}
-  .editor-interface-field-meta{margin-top:3px;color:#7a879b;font-size:10px;overflow-wrap:anywhere}
-  .editor-interface-field-name{width:100%;min-width:0;min-height:32px;padding:5px 8px;border:1px solid #d9e0eb;border-radius:6px;font-size:11px;color:#354866;background:#fff}
-  .editor-interface-badge{display:inline-block;margin-left:5px;padding:2px 5px;border-radius:5px;background:#eef2fe;color:#566ca2;font-size:9px;font-weight:500}
-  .editor-interface-section{border:1px solid #e0e5ed;border-radius:10px;background:#fff;margin-top:16px;overflow:hidden}
-  .editor-interface-section>p{margin:10px 12px;color:#6c7990;font-size:11px;line-height:1.6}
-  .editor-interface-output,.editor-interface-binding{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(190px,290px);align-items:center;gap:10px;padding:10px 12px;border-top:1px solid #eef1f5}
-  .editor-interface-output input[type="checkbox"]{width:16px;height:16px;accent-color:#526fc8}
+  .editor-interface-field-meta{margin-top:3px;color:var(--muted);font-size:10px;overflow-wrap:anywhere}
+  .editor-interface-field-name{width:100%;min-width:0;min-height:32px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;font-size:11px;color:var(--muted);background:var(--panel)}
+  .editor-interface-badge{display:inline-block;margin-left:5px;padding:2px 5px;border-radius:5px;background:var(--panel);color:var(--muted);font-size:9px;font-weight:500}
+  .editor-interface-section{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin-top:16px;overflow:hidden}
+  .editor-interface-section>p{margin:10px 12px;color:var(--muted);font-size:11px;line-height:1.6}
+  .editor-interface-output,.editor-interface-binding{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(190px,290px);align-items:center;gap:10px;padding:10px 12px;border-top:1px solid var(--line)}
+  .editor-interface-output input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent)}
   .editor-interface-binding{grid-template-columns:minmax(0,1fr) minmax(220px,340px);align-items:start}
   .editor-interface-binding-main{min-width:0;font-size:12px;font-weight:600;overflow-wrap:anywhere}
-  .editor-interface-binding-meta{display:block;margin-top:4px;color:#77849a;font-size:10px;font-weight:400;line-height:1.5}
-  .editor-interface-binding select{width:100%;min-height:34px;padding:5px 8px;border:1px solid #d2dceb;border-radius:6px;background:#fff;color:#314968;font-size:11px}
-  .editor-interface-empty{padding:14px 12px;color:#77849a;font-size:12px}.editor-interface-required{color:#9a5a36}
-  .editor-interface-conflict-preview{display:block;color:#748198;font-size:10px;line-height:1.45;overflow-wrap:anywhere;margin-top:4px}
+  .editor-interface-binding-meta{display:block;margin-top:4px;color:var(--muted);font-size:10px;font-weight:400;line-height:1.5}
+  .editor-interface-binding select{width:100%;min-height:34px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--muted);font-size:11px}
+  .editor-interface-empty{padding:14px 12px;color:var(--muted);font-size:12px}.editor-interface-required{color:var(--muted)}
+  .editor-interface-conflict-preview{display:block;color:var(--muted);font-size:10px;line-height:1.45;overflow-wrap:anywhere;margin-top:4px}
   .editor-interface-conflict select{grid-column:1/-1}.editor-interface-conflict{grid-template-columns:minmax(0,1fr) minmax(200px,310px)}
   @media(max-width:720px){.editor-interface-layout{min-height:calc(100dvh - 28px)}.editor-interface-header,.editor-interface-footer{padding:12px}
     .editor-interface-body{padding:12px}.editor-interface-toolbar{grid-template-columns:1fr}.editor-interface-tabs{justify-content:flex-start}
@@ -316,56 +351,90 @@ function openPanel({ title, description, confirmLabel, render, canConfirm, value
   });
 }
 
-function fieldSearchText(field) {
-  return [fieldId(field), field.node_id, field.input, field.label, typeOf(field), editorFieldGroup(field)]
-    .filter(value => value !== undefined && value !== null).join(' ').toLowerCase();
-}
-
 function idOptionText(item, id, labelKey = 'label') {
   const label = String(item?.[labelKey] ?? id);
   const mediaType = item?.mediaType ? ` · ${item.mediaType}` : '';
   return `${label} · ${id}${mediaType}`;
 }
 
+function appendPageControls(container, page, name, onPage) {
+  if (page.pages <= 1) return;
+  const controls = element('nav', '', 'editor-interface-actions');
+  controls.setAttribute('aria-label', `${name}分页`);
+  const previous = element('button', `${name}上一页`, 'button quiet'); previous.type = 'button'; previous.disabled = page.page === 0;
+  const next = element('button', `${name}下一页`, 'button quiet'); next.type = 'button'; next.disabled = page.page === page.pages - 1;
+  previous.addEventListener('click', () => onPage(page.page - 1));
+  next.addEventListener('click', () => onPage(page.page + 1));
+  controls.append(previous, element('span', `${page.page + 1}/${page.pages} 页 · ${page.total} 项`), next);
+  container.append(controls);
+}
+
 function appendRebindingRows({
-  container, title, note, rows, kind, choices, allCandidates, selectedIds, onTarget,
+  container, title, note, rows, kind, choices, allCandidates, selectedIds, onTarget, viewState, rerender,
 }) {
   if (!rows.length) return;
   const section = element('section', '', 'editor-interface-section');
   section.append(element('h3', title), element('p', note));
-  for (const row of rows) {
+  const rowPage = interfacePage(rows, viewState.page);
+  viewState.page = rowPage.page;
+  appendPageControls(section, rowPage, title, page => { viewState.page = page; rerender(); });
+  for (const row of rowPage.items) {
     const item = element('div', '', 'editor-interface-binding');
     const main = element('div', '', 'editor-interface-binding-main');
     main.append(element('span', row.label || row.id));
     const details = [];
     if (row.type || row.mediaType) details.push(`类型：${row.type ?? row.mediaType}`);
-    details.push(row.connected ? `关联 ${row.connected} 条连线` : '当前无连线');
+    details.push(row.connected ? `关联 ${row.connected} 条连线` :
+      kind === 'field' ? '没有画布连线，仍需确认旧字段的绑定去向' : '当前无连线');
     if (kind === 'field' && row.reason === 'removed') details.push('字段已移除');
     if (kind === 'field' && row.reason === 'type_changed') details.push('字段类型已变化');
     if (row.reason === 'not_exposed') details.push('当前未暴露');
+    if (row.reason === 'node_replaced') details.push('同编号内部节点已更换类型，须明确确认新绑定');
     if (kind === 'output' && row.reason === 'type_changed') details.push('输出媒体类型已变化');
     if (kind === 'output' && row.reason === 'removed') details.push('输出已移除');
     main.append(element('span', details.join(' · '), 'editor-interface-binding-meta'));
     if (row.valueSummary) main.append(element('span', row.valueSummary, 'editor-interface-binding-meta'));
     const select = element('select');
     select.setAttribute('aria-label', `${row.label || row.id} 的${kind === 'field' ? '字段' : '输出'}连线处理方式`);
-    const blank = element('option', '请选择保留新连接或解除绑定'); blank.value = ''; select.append(blank);
-    const candidates = row.candidates || allCandidates;
-    for (const candidate of candidates) {
-      const id = kind === 'field' ? fieldId(candidate) : outputId(candidate);
-      if (!id || id === row.id) continue;
-      const option = element('option', idOptionText(candidate, id)); option.value = JSON.stringify(id); select.append(option);
-    }
-    const disconnect = element('option', kind === 'field' ? '解除字段绑定（断开连线）' : '解除输出绑定（断开连线）');
-    disconnect.value = 'null'; select.append(disconnect);
-    if (choices.has(row.id)) select.value = JSON.stringify(choices.get(row.id));
+    const blank = element('option', '请选择替代接口或解除绑定'); blank.value = ''; select.append(blank);
+    const candidates = (row.candidates || allCandidates).filter(candidate =>
+      (kind === 'field' ? fieldId(candidate) : outputId(candidate)) !== row.id || kind === 'output' && row.reason === 'node_replaced');
+    const control = element('div');
+    let candidateView = viewState.targets.get(row.id);
+    if (!candidateView) { candidateView = { page: 0, query: '' }; viewState.targets.set(row.id, candidateView); }
+    const search = element('input', '', 'editor-interface-search'); search.type = 'search'; search.value = candidateView.query;
+    search.placeholder = '搜索重绑目标名称、ID、节点…';
+    search.setAttribute('aria-label', `${row.label || row.id} 搜索重绑目标`);
+    const targetPageArea = element('div');
+    const renderTargets = () => {
+      select.replaceChildren(blank);
+      const page = interfacePage(interfaceSearch(candidates, candidateView.query), candidateView.page);
+      candidateView.page = page.page;
+      const displayed = [...page.items];
+      const chosen = choices.get(row.id);
+      if (chosen != null && !displayed.some(candidate => (kind === 'field' ? fieldId(candidate) : outputId(candidate)) === chosen)) {
+        const retained = candidates.find(candidate => (kind === 'field' ? fieldId(candidate) : outputId(candidate)) === chosen);
+        if (retained) displayed.unshift(retained);
+      }
+      for (const candidate of displayed) {
+        const id = kind === 'field' ? fieldId(candidate) : outputId(candidate);
+        const option = element('option', idOptionText(candidate, id)); option.value = JSON.stringify(id); select.append(option);
+      }
+      const disconnect = element('option', kind === 'field' ? '解除旧字段绑定' : '解除输出绑定（断开连线）');
+      disconnect.value = 'null'; select.append(disconnect);
+      select.value = choices.has(row.id) ? JSON.stringify(choices.get(row.id)) : '';
+      targetPageArea.replaceChildren();
+      appendPageControls(targetPageArea, page, `${row.label || row.id} 目标`, number => { candidateView.page = number; renderTargets(); });
+    };
+    search.addEventListener('input', () => { candidateView.query = search.value; candidateView.page = 0; renderTargets(); });
+    control.append(search, select, targetPageArea); renderTargets();
     select.addEventListener('change', () => {
       if (!select.value) { choices.delete(row.id); onTarget(null, row); return; }
       const targetId = JSON.parse(select.value);
       choices.set(row.id, targetId === null ? FIELD_DISCONNECT : targetId);
       onTarget(targetId, row);
     });
-    item.append(main, select); section.append(item);
+    item.append(main, control); section.append(item);
   }
   container.append(section);
 }
@@ -387,52 +456,90 @@ export function editorInputTargetsUnique(connections, choices) {
   return new Set(targets).size === targets.length;
 }
 
+/** Automatic compilation uses the same defaults and safety gates as the review panel. */
+export function autoEditorInterfaceSelection({
+  fields = [], outputs = [], previousFields = [], previousValues = {}, previousBaseline = {},
+  selectedOutputs = [], connections = [], replaced_nodes: replacedNodes = {},
+} = {}) {
+  const candidates = (Array.isArray(fields) ? fields : []).filter(field => field && fieldId(field));
+  const outputCandidates = (Array.isArray(outputs) ? outputs : []).filter(output => output && outputId(output));
+  if (candidates.length > EDITOR_INTERFACE_CANDIDATE_LIMIT ||
+      new Set(candidates.map(fieldId)).size !== candidates.length ||
+      new Set(outputCandidates.map(outputId)).size !== outputCandidates.length) return null;
+  const selectedFieldIds = initialEditorFieldIds(candidates, previousFields, previousValues, previousBaseline);
+  const selectedOutputIds = initialEditorOutputIds(outputCandidates, selectedOutputs);
+  if (selectedFieldIds.length > EDITOR_INTERFACE_FIELD_LIMIT || !selectedOutputIds.length ||
+      selectedOutputIds.length > EDITOR_INTERFACE_OUTPUT_LIMIT ||
+      !editorInputTargetsUnique(connections, {})) return null;
+  const { inputRebindings, outputRebindings } = deriveEditorRebindings({
+    fields: candidates, previousFields, selectedFieldIds, outputs: outputCandidates,
+    selectedOutputIds, selectedOutputs, connections, replaced_nodes: replacedNodes,
+  });
+  if (inputRebindings.length || outputRebindings.length) return null;
+  const selected = new Set(selectedFieldIds);
+  const retained = new Map(previousFields.map(item => [previousFieldId(item), item]));
+  return {
+    fields: candidates.filter(field => selected.has(fieldId(field))).map(field => retainedField(field, retained)),
+    output_nodes: selectedOutputIds, rebindings: {}, output_rebindings: {},
+  };
+}
+
 /** Open a review panel. It never performs a fetch, edits the graph, or submits a job. */
 export async function chooseEditorInterface({
   fields, outputs, previousFields = [], previousValues = {}, previousBaseline = {},
-  selectedOutputs = [], connections = [],
+  selectedOutputs = [], connections = [], opaque_inputs: opaqueInputs = [], requires_native_compile: requiresNativeCompile = false,
+  replaced_nodes: replacedNodes = {},
 } = {}) {
-  const candidates = (Array.isArray(fields) ? fields : []).filter(field => field && fieldId(field));
+  const retained = new Map(previousFields.map(item => [previousFieldId(item), item]));
+  const candidates = (Array.isArray(fields) ? fields : []).filter(field => field && fieldId(field))
+    .map(field => retainedField(field, retained));
   const outputCandidates = (Array.isArray(outputs) ? outputs : []).filter(output => output && outputId(output));
   if (typeof document === 'undefined' || !document.body) return null;
 
   const selectedFieldIds = new Set(initialEditorFieldIds(candidates, previousFields, previousValues, previousBaseline));
+  const candidatesById = new Map(candidates.map(field => [fieldId(field), field]));
   const selectedOutputIds = new Set(initialEditorOutputIds(outputCandidates, selectedOutputs));
   const requiredFieldIds = new Set(candidates.filter(isRequiredEditorMediaField).map(fieldId));
   const labels = new Map();
+  const presentations = new Map(candidates.map(field => [fieldId(field), field.presentation]));
   const inputChoices = new Map();
   const outputChoices = new Map();
   let groupFilter = '全部';
   let searchText = '';
+  let fieldPage = 0, outputPage = 0, outputSearch = '';
+  const bindingViews = { field: { page: 0, targets: new Map() }, output: { page: 0, targets: new Map() } };
   let transientError = '';
 
   const getBindings = () => deriveEditorRebindings({
     fields: candidates, previousFields, selectedFieldIds: [...selectedFieldIds],
-    outputs: outputCandidates, selectedOutputIds: [...selectedOutputIds], selectedOutputs, connections,
+    outputs: outputCandidates, selectedOutputIds: [...selectedOutputIds], selectedOutputs, connections, replaced_nodes: replacedNodes,
   });
   const hasValidBindings = (rows, choices, selected, kind) => rows.every(row => {
     if (!choices.has(row.id)) return false;
     const target = choices.get(row.id);
     if (target === null) return true;
-    return selected.has(target) && (kind === 'output' || row.candidates.some(field => fieldId(field) === target));
+    return selected.has(target) && (kind === 'output' || target !== row.id &&
+      typeOf(row) && typeOf(row) === typeOf(candidatesById.get(target)));
   });
   const valid = () => {
     const { inputRebindings, outputRebindings } = getBindings();
-    return selectedFieldIds.size <= EDITOR_INTERFACE_FIELD_LIMIT &&
+    return candidates.length <= EDITOR_INTERFACE_CANDIDATE_LIMIT && selectedFieldIds.size <= EDITOR_INTERFACE_FIELD_LIMIT &&
       editorInputTargetsUnique(connections, inputChoices) &&
       [...requiredFieldIds].every(id => selectedFieldIds.has(id)) && selectedOutputIds.size >= 1 &&
+      selectedOutputIds.size <= EDITOR_INTERFACE_OUTPUT_LIMIT &&
       hasValidBindings(inputRebindings, inputChoices, selectedFieldIds, 'field') &&
       hasValidBindings(outputRebindings, outputChoices, selectedOutputIds, 'output');
   };
 
   return openPanel({
     title: '配置外层接口',
-    description: '选择常用参数与输出。重绑字段时一并核对原值；重绑输出从新分支首张图开始，可回到连线设置修改序号。每条连线须明确保留、重绑或解除。',
+    description: '勾选需要外露到侧栏的输入，再选择显示为画布端口或侧栏控件。可搜索和按分类查找；图像、视频、音频入口均可连线或上传。旧字段或连线受影响时须明确重绑或解除。',
     confirmLabel: '应用外层面板',
     canConfirm: valid,
     value: () => {
       const chosenFields = candidates.filter(field => selectedFieldIds.has(fieldId(field))).map(field => ({
         ...field, label: labels.has(fieldId(field)) ? labels.get(fieldId(field)) : field.label,
+        presentation: presentations.get(fieldId(field)),
       }));
       const { inputRebindings, outputRebindings } = getBindings();
       return {
@@ -443,6 +550,10 @@ export async function chooseEditorInterface({
       };
     },
     render({ body, status, updateConfirm }) {
+      if (Array.isArray(opaqueInputs) && opaqueInputs.length) body.append(element('p',
+        `${opaqueInputs.length} 个内部输入尚未取得当前节点的输入契约。原值与连线已保留；请在当前引擎的原生工作流中重新编译。额外连线可编辑其上游已声明输入，未知纯值不会自动外露为可写控件。`,
+        'editor-interface-note'));
+      else if (requiresNativeCompile) body.append(element('p', '此工作流的动态输入需要在当前引擎中重新打开、编译并应用。已保存的图与参数仍保留。', 'editor-interface-note'));
       const toolbar = element('div', '', 'editor-interface-toolbar');
       const search = element('input', '', 'editor-interface-search');
       search.type = 'search'; search.placeholder = '搜索参数名、节点、类型…';
@@ -451,13 +562,16 @@ export async function chooseEditorInterface({
       const fieldCount = element('p', '', 'editor-interface-count');
       const fieldArea = element('div');
       const outputArea = element('div');
+      const outputSearchInput = element('input', '', 'editor-interface-search');
+      outputSearchInput.type = 'search'; outputSearchInput.placeholder = '搜索输出名称、ID…';
+      outputSearchInput.setAttribute('aria-label', '搜索输出分支');
       const bindingArea = element('div');
       const setTabs = () => {
         tabs.replaceChildren();
         for (const group of ['全部', ...EDITOR_INTERFACE_GROUPS]) {
           const button = element('button', group, 'editor-interface-tab'); button.type = 'button';
           button.setAttribute('aria-pressed', String(groupFilter === group));
-          button.addEventListener('click', () => { groupFilter = group; setTabs(); renderFields(); });
+          button.addEventListener('click', () => { groupFilter = group; fieldPage = 0; setTabs(); renderFields(); });
           tabs.append(button);
         }
       };
@@ -471,22 +585,30 @@ export async function chooseEditorInterface({
         const invalidOutputTargets = outputRebindings.some(row => outputChoices.has(row.id) &&
           outputChoices.get(row.id) !== null && !selectedOutputIds.has(outputChoices.get(row.id)));
         const messages = [];
+        if (candidates.length > EDITOR_INTERFACE_CANDIDATE_LIMIT) messages.push(`候选参数超过 ${EDITOR_INTERFACE_CANDIDATE_LIMIT} 个，请精简内部工作流后重新编译。`);
         if (selectedFieldIds.size > EDITOR_INTERFACE_FIELD_LIMIT) messages.push(`最多暴露 ${EDITOR_INTERFACE_FIELD_LIMIT} 个参数。`);
-        if (requiredMissing) messages.push('所有 image/audio 媒体参数都必须保留。');
+        if (requiredMissing) messages.push('所有 image/video/audio 媒体参数都必须保留。');
         if (!selectedOutputIds.size) messages.push('至少选择一个输出分支。');
-        if (unresolvedInputs || unresolvedOutputs) messages.push(`请处理 ${unresolvedInputs + unresolvedOutputs} 项现有连线。`);
+        if (selectedOutputIds.size > EDITOR_INTERFACE_OUTPUT_LIMIT) messages.push(`最多选择 ${EDITOR_INTERFACE_OUTPUT_LIMIT} 个输出分支，请取消其他输出。`);
+        if (unresolvedInputs || unresolvedOutputs) messages.push(`请处理 ${unresolvedInputs + unresolvedOutputs} 项接口绑定。`);
         if (invalidInputTargets || invalidOutputTargets) messages.push('重绑定目标也必须选入外层面板。');
         if (!editorInputTargetsUnique(connections, inputChoices)) messages.push('多个输入不能重绑到同一字段，请改选或解除其中一条。');
         if (transientError) messages.push(transientError);
         status(messages.join(' ') || `${selectedFieldIds.size}/${EDITOR_INTERFACE_FIELD_LIMIT} 个参数已选；${selectedOutputIds.size} 个输出已选。`, !!transientError);
         updateConfirm();
       };
+      const matchingFields = () => {
+        const matches = new Set(interfaceSearch(candidates.map(field => ({ ...field,
+          label: labels.get(fieldId(field)) ?? field.label, group: editorFieldGroup(field) })), searchText).map(fieldId));
+        return candidates.filter(field => matches.has(fieldId(field)) &&
+          (groupFilter === '全部' || editorFieldGroup(field) === groupFilter));
+      };
       const renderFields = () => {
-        const needle = searchText.trim().toLowerCase();
         fieldArea.replaceChildren();
-        const visible = candidates.filter(field =>
-          (groupFilter === '全部' || editorFieldGroup(field) === groupFilter) &&
-          (!needle || fieldSearchText(field).includes(needle)));
+        const matching = matchingFields();
+        const page = interfacePage(matching, fieldPage); fieldPage = page.page;
+        const visible = page.items;
+        appendPageControls(fieldArea, page, '参数', number => { fieldPage = number; renderFields(); });
         if (!visible.length) fieldArea.append(element('p', '没有匹配的参数。', 'editor-interface-empty'));
         for (const group of EDITOR_INTERFACE_GROUPS) {
           const groupItems = visible.filter(field => editorFieldGroup(field) === group);
@@ -516,11 +638,24 @@ export async function chooseEditorInterface({
             name.maxLength = 100; name.value = labels.get(id) ?? String(field.label ?? field.input ?? id);
             name.setAttribute('aria-label', `外层显示名称：${field.label || field.input || id}`);
             name.addEventListener('input', () => { labels.set(id, name.value.trim() || String(field.label ?? field.input ?? id)); });
-            row.append(checkbox, info, name); section.append(row);
+            const settings = element('div', '', 'editor-interface-field-settings');
+            const presentation = element('select', '', 'editor-interface-field-name');
+            presentation.setAttribute('aria-label', `显示方式：${field.label || field.input || id}`);
+            const control = element('option', '侧栏控件'); control.value = 'control'; presentation.append(control);
+            if (editorFieldSupportsPort(field)) {
+              const port = element('option', '画布端口 + 侧栏控件'); port.value = 'port'; presentation.append(port);
+            }
+            presentation.value = presentations.get(id);
+            presentation.disabled = !selectedFieldIds.has(id) || !editorFieldSupportsPort(field);
+            presentation.addEventListener('change', () => {
+              presentations.set(id, editorFieldSupportsPort(field) && presentation.value === 'port' ? 'port' : 'control');
+            });
+            settings.append(name, presentation);
+            row.append(checkbox, info, settings); section.append(row);
           }
           fieldArea.append(section);
         }
-        fieldCount.textContent = `已选 ${selectedFieldIds.size}/${EDITOR_INTERFACE_FIELD_LIMIT} 个参数 · image/audio 必须暴露`;
+        fieldCount.textContent = `已选 ${selectedFieldIds.size}/${EDITOR_INTERFACE_FIELD_LIMIT} 个参数 · 筛选 ${matching.length}/${candidates.length} 项 · 默认推荐最多 ${DEFAULT_INTERFACE_FIELDS} 项（媒体全保留） · image/video/audio 必须暴露 · 已连接端口仍保留连线`;
       };
       const renderOutputs = () => {
         outputArea.replaceChildren();
@@ -528,7 +663,9 @@ export async function chooseEditorInterface({
         section.append(element('h3', `输出分支 · ${selectedOutputIds.size} 个已选`),
           element('p', '至少保留一个输出。已连线的输出如被取消，需明确改接其他输出或解除连线。'));
         if (!outputCandidates.length) section.append(element('div', '当前工作流没有可用输出节点。', 'editor-interface-empty'));
-        for (const output of outputCandidates) {
+        const page = interfacePage(interfaceSearch(outputCandidates, outputSearch), outputPage); outputPage = page.page;
+        appendPageControls(section, page, '输出', number => { outputPage = number; renderOutputs(); });
+        for (const output of page.items) {
           const id = outputId(output), row = element('label', '', 'editor-interface-output');
           const checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = selectedOutputIds.has(id);
           checkbox.setAttribute('aria-label', `选择输出 ${output.label || id}`);
@@ -558,20 +695,38 @@ export async function chooseEditorInterface({
         const { inputRebindings, outputRebindings } = getBindings();
         for (const row of inputRebindings) row.valueSummary = mappingSummary(previousValues, previousBaseline, row.id);
         appendRebindingRows({
-          container: bindingArea, title: '外层输入连线处理',
+          container: bindingArea, title: '外层输入绑定处理',
           note: '旧字段已删除、类型变化或不再暴露。每项须明确选兼容字段或解除绑定。',
           rows: inputRebindings, kind: 'field', choices: inputChoices, allCandidates: candidates,
           selectedIds: selectedFieldIds, onTarget: target => activateTarget(target, 'field'),
+          viewState: bindingViews.field, rerender: renderBindings,
         });
         appendRebindingRows({
           container: bindingArea, title: '输出连线处理',
           note: '这些输出仍有外层连线，但已取消选择或从内部工作流移除。请选择新输出或明确解除。',
           rows: outputRebindings, kind: 'output', choices: outputChoices, allCandidates: outputCandidates,
           selectedIds: selectedOutputIds, onTarget: target => activateTarget(target, 'output'),
+          viewState: bindingViews.output, rerender: renderBindings,
         });
       };
-      toolbar.append(search, tabs); body.append(toolbar, fieldCount, fieldArea, outputArea, bindingArea);
-      search.addEventListener('input', () => { searchText = search.value; renderFields(); });
+      const bulk = element('div', '', 'editor-interface-actions');
+      for (const [select, label] of [[true, '勾选筛选结果'], [false, '取消筛选结果']]) {
+        const action = element('button', label, 'button quiet'); action.type = 'button';
+        action.addEventListener('click', () => {
+          transientError = '';
+          for (const field of matchingFields()) {
+            const id = fieldId(field);
+            if (select) selectedFieldIds.add(id);
+            else if (!requiredFieldIds.has(id)) selectedFieldIds.delete(id);
+          }
+          renderFields(); renderBindings(); showStatus();
+        }); bulk.append(action);
+      }
+      toolbar.append(search, tabs); body.append(toolbar, fieldCount, bulk, fieldArea);
+      if (outputCandidates.length > 64) body.append(outputSearchInput);
+      body.append(outputArea, bindingArea);
+      outputSearchInput.addEventListener('input', () => { outputSearch = outputSearchInput.value; outputPage = 0; renderOutputs(); });
+      search.addEventListener('input', () => { searchText = search.value; fieldPage = 0; renderFields(); });
       setTabs(); renderFields(); renderOutputs(); renderBindings(); showStatus();
     },
   });
@@ -601,8 +756,13 @@ export async function resolveEditorConflicts(conflicts) {
     value: () => Object.fromEntries(keys.map(key => [key, choices.get(key)])),
     render({ body, status, updateConfirm }) {
       const section = element('section', '', 'editor-interface-section editor-interface-conflict-list');
-      section.append(element('h3', `需要决定 · ${items.length} 项`));
-      for (const [index, conflict] of items.entries()) {
+      let conflictPage = 0;
+      const renderConflicts = () => {
+      section.replaceChildren(element('h3', `需要决定 · ${items.length} 项 · 已决定 ${choices.size} 项`));
+      const page = interfacePage(items.map((conflict, index) => ({ conflict, index })), conflictPage);
+      conflictPage = page.page;
+      appendPageControls(section, page, '冲突', number => { conflictPage = number; renderConflicts(); });
+      for (const { index, conflict } of page.items) {
         const key = keys[index];
         const row = element('div', '', 'editor-interface-binding editor-interface-conflict');
         const main = element('div', '', 'editor-interface-binding-main');
@@ -623,6 +783,7 @@ export async function resolveEditorConflicts(conflicts) {
           if (Array.isArray(conflict?.allowed) && !conflict.allowed.includes(value)) continue;
           const option = element('option', label); option.value = value; select.append(option);
         }
+        select.value = choices.get(key) || '';
         select.addEventListener('change', () => {
           if (select.value === 'outer' || select.value === 'inner') choices.set(key, select.value);
           else choices.delete(key);
@@ -631,6 +792,7 @@ export async function resolveEditorConflicts(conflicts) {
         });
         row.append(main, select); section.append(row);
       }
+      }; renderConflicts();
       body.append(section);
       status('请为每项冲突选择保留的一方。');
       updateConfirm();

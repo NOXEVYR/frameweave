@@ -1,0 +1,79 @@
+:root[data-native-host="true"] { --chrome-height:44px; }
+:root[data-native-host="true"] .topbar { justify-content:flex-end; }
+:root[data-native-host="true"] .topbar>.brand { display:none; }
+.canvas-manager-card {position:relative;min-width:0}
+.canvas-manager-card-caption {padding-right:2px}
+.canvas-card-more {position:absolute;right:12px;top:12px;display:grid;place-items:center;width:34px;height:32px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--text);font:700 21px/1 system-ui;cursor:pointer;opacity:0}
+.canvas-manager-card:hover .canvas-card-more,.canvas-manager-card:focus-within .canvas-card-more,.canvas-card-more[aria-expanded=true] {opacity:1}
+.canvas-card-more:hover,.canvas-card-more[aria-expanded=true] {background:var(--panel);color:var(--text)}
+.canvas-folder-filter {height:35px;max-width:160px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);padding:4px 9px}
+.canvas-card-menu {position:fixed;z-index:1300;min-width:155px;max-height:calc(100dvh - 16px);overflow:auto;padding:5px;border:1px solid var(--line);border-radius:11px;background:var(--panel);box-shadow:0 8px 30px var(--shadow)}
+.canvas-card-menu button {display:block;width:100%;margin:0;padding:8px 12px;border:0;border-radius:6px;background:transparent;color:var(--text);text-align:left;font:inherit;cursor:pointer}
+.canvas-card-menu button:hover,.canvas-card-menu button:focus-visible {outline:none;background:var(--panel);color:var(--text)}
+.canvas-card-more:focus-visible,.canvas-manager-project:focus-visible {outline:2px solid var(--line);outline-offset:3px}
+.canvas-manager-card-visual>.canvas-custom-cover {display:block;width:100%;height:100%;object-fit:cover}
+.card-action-dialog {width:min(400px,calc(100vw - 32px));padding:22px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text)}
+.card-action-dialog form {display:grid;gap:15px}
+.card-action-dialog h2 {margin:0;font-size:19px}
+.card-action-dialog input {min-width:0;width:100%;padding:9px;border:1px solid var(--line);border-radius:7px}
+@media (hover:none),(pointer:coarse) { .canvas-card-more {opacity:1} }
+
+/* Home uses the full work area beneath the native title bar and app header. */
+body[data-workspace=canvas][data-canvas-view=management] .workspace-bar {display:none}
+body[data-workspace=canvas][data-canvas-view=management] #canvas-manager {grid-column:2/-1;grid-row:1/-1}
+.app-navigation .workspace-nav svg {width:23px;height:23px;flex:none}
+.app-navigation .workspace-nav>.nav-title {font:inherit;line-height:1.25}
+.app-navigation .creation-label {margin:20px 0 6px}
+.app-navigation .app-nav-label {text-transform:none;letter-spacing:.04em}
+body[data-canvas-view=management][data-workspace=canvas] .topbar {background:var(--panel)}
+body[data-canvas-view=management][data-workspace=canvas] .alpha {display:none}
+body[data-canvas-view=management][data-workspace=canvas] .brand-mark {width:37px;height:37px}
+#rename-current-project {display:inline-flex;align-items:center;gap:7px;min-width:0;max-width:100%;cursor:pointer;padding:5px;border:0;background:none;color:inherit;font:inherit}
+#rename-current-project .rename-mark {font-size:13px;color:var(--muted)}
+.project-detail-dialog {width:min(530px,93vw);max-height:80dvh}
+.project-detail-dialog .modal-heading {display:flex;align-items:center;justify-content:space-between}
+.project-detail-dialog .dialog-close {border:0;border-radius:6px;background:var(--panel);color:var(--text);cursor:pointer;width:32px;height:32px;font-size:19px}
+.project-history-info {font-size:14px;color:var(--muted)}
+.project-history-list {display:grid;gap:4px}
+.project-history-row {display:grid;grid-template-columns:38px minmax(0,1fr) auto;align-items:center;gap:9px;padding:11px 0;border-bottom:1px solid var(--line)}
+.project-history-row strong,.project-history-row small {display:block;overflow-wrap:anywhere}
+.project-history-row small {margin-top:4px;color:var(--muted);font-size:13px}
+.project-version-number {font:600 13px Consolas,monospace;color:var(--muted)}
+.project-rename-form {padding:18px 24px;display:grid;gap:10px}
+.project-rename-form input {width:100%;height:40px}.project-rename-form button {justify-self:end}
+.canvas-cover {position:relative;isolation:isolate;overflow:hidden;width:100%;height:100%;display:grid;align-content:center;justify-items:center;background-color:var(--panel);background-image:radial-gradient(#cdd7f0 1px,transparent 1.35px);background-size:14px 14px}
+.canvas-cover>canvas,.canvas-cover>img {position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain}
+.canvas-cover>img {background:var(--panel)}
+.canvas-cover-image {opacity:0}.canvas-cover-image.is-ready {opacity:1}
+.canvas-cover-sheet {width:56px;height:66px;display:block;margin-bottom:11px;background:linear-gradient(225deg,var(--prism-ice) 0 11px,#fff 11.5px 100%);border:1px solid var(--accent-line);border-radius:6px;box-shadow:4px 4px 0 var(--prism-ice),0 5px 10px var(--shadow);transform:rotate(-6deg)}
+.canvas-cover-caption {color:var(--muted);font-size:13px;font-weight:600}
+@media(min-width:1001px) {
+  body[data-workspace=canvas][data-canvas-view=management] .workbench,
+  body.inspector-open[data-workspace=canvas][data-canvas-view=management] .workbench {grid-template-columns:clamp(190px,13.5vw,246px) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+  body[data-workspace=canvas][data-canvas-view=management] .app-navigation {background:var(--panel);padding:26px 14px;gap:5px;border-color:var(--line)}
+  body[data-workspace=canvas][data-canvas-view=management] .app-nav-label {font-size:13px;text-align:left;padding-left:14px;color:var(--muted);margin-bottom:8px}
+  body[data-workspace=canvas][data-canvas-view=management] .workspace-nav {flex-direction:row;justify-content:flex-start;align-items:center;gap:13px;font-size:16px;padding:12px 15px;line-height:1.45;border-radius:8px;min-height:47px}
+  body[data-workspace=canvas][data-canvas-view=management] .workspace-nav.active {background:var(--accent-dim);border-color:transparent;color:var(--accent-text)}
+}
+@media(min-width:761px) and (max-width:1000px) {
+  body[data-workspace=canvas][data-canvas-view=management] .workbench,
+  body.inspector-open[data-workspace=canvas][data-canvas-view=management] .workbench {grid-template-rows:minmax(0,1fr)}
+}
+@media(max-width:760px) {
+  body[data-workspace=canvas][data-canvas-view=management] .workbench,
+  body.inspector-open[data-workspace=canvas][data-canvas-view=management] .workbench {grid-template-columns:minmax(0,1fr);grid-template-rows:55px minmax(0,1fr)}
+  body[data-workspace=canvas][data-canvas-view=management] #canvas-manager {grid-column:1;grid-row:2}
+  .app-navigation {overflow-x:auto;scrollbar-width:thin;align-items:center;gap:1px}
+  .app-navigation .workspace-nav {min-width:43px;gap:2px}
+  .app-navigation .workspace-nav svg {width:18px;height:18px}
+  .app-navigation .workspace-nav>.nav-title {font-size:11px}
+  .app-navigation .creation-label {display:none}
+  #project-history {font-size:11px;padding-inline:4px}
+  body[data-workspace=canvas][data-canvas-view=editor] .workspace-bar {gap:1px}
+  .project-actions {gap:2px}
+  .topbar #engine-label {display:inline;font-size:11px}
+}
+
+.canvas-cover.has-excerpt>canvas {height:calc(100% - 36px)}
+.canvas-cover-excerpt {position:absolute;bottom:0;inset-inline:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:8px 14px;background:var(--panel);border-top:1px solid var(--line);color:var(--text);font-size:14px;text-align:left}
+.canvas-cover .canvas-cover-image.is-ready {z-index:2}

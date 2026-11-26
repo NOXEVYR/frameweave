@@ -587,7 +587,7 @@ def diagnose(settings, object_info, status, request, model_catalog, environment=
 
     if kind == "api" and online and prompt and all(node in info for node in needed):
         try:
-            validate_prompt(prompt, info)
+            validate_prompt(prompt, info, additional_inputs=request.get("additional_inputs"))
         except ValueError as exc:
             issue = _safe_api_problem(exc, prompt)
             add("workflow.schema", "workflow", "API 图结构", "error", issue,

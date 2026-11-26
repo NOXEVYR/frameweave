@@ -74,6 +74,7 @@ class Backend:
         # Only generated ASCII filenames enter multipart headers.
         body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\n"
                 f"Content-Type: {mime}\r\n\r\n").encode() + content
-        body += (f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\nfalse\r\n--{boundary}--\r\n").encode()
+        body += (f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\nfalse"
+                 f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"type\"\r\n\r\ninput\r\n--{boundary}--\r\n").encode()
         return self.request("/upload/image", body, timeout=60,
                             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})

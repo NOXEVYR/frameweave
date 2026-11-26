@@ -48,7 +48,9 @@ test('legacy output wires through preview require explicit stable branch migrati
   const target = createNode('generation', 600, 0, { kind: 'package', package_id: 'p-' + '2'.repeat(24), packageFields: [{ id: 'image', label: 'Image', type: 'image' }] });
   const graph = { nodes: [source, preview, target], edges: [] };
   connect(graph, source.id, preview.id);
-  connect(graph, preview.id, target.id, { targetField: 'image', outputIndex: 3 });
+  // Persisted legacy data predates typed output contracts; new unknown wires
+  // are intentionally rejected, but this old wire must still be migratable.
+  graph.edges.push({id:'legacy-output-edge',source:preview.id,target:target.id,targetField:'image',outputIndex:3});
   const key = editorConnectionSummary(graph, source.id, [])[0].outputId;
   assert.equal(key, `legacy-${graph.edges[1].id}`);
   const result = { package: { id: source.data.package_id, fields: [] }, values: {}, baseline: {}, backend_url: 'http://127.0.0.1:8188', output_nodes: ['7'], outputs: [{ id: '7', label: 'Final', mediaType: 'image' }] };
@@ -70,10 +72,38 @@ test('invalid duplicate input remaps do not mutate the existing canvas', () => {
   assert.equal(serializeGraph(graph), before);
 });
 
+test('replaced same-ID output cannot reuse an existing wire until explicitly rebound', () => {
+  for (const type of ['image', 'audio', 'video']) {
+    const source = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '1'.repeat(24),
+      editor_outputs: ['7'], editor_output_fields: [{ id: '7', label: 'Old', mediaType: type }] });
+    const target = createNode('generation', 400, 0, { kind: 'package', package_id: 'p-' + '2'.repeat(24),
+      packageFields: [{ id: 'ref', label: 'Reference', type }] });
+    const graph = { nodes: [source, target], edges: [] };
+    connect(graph, source.id, target.id, { targetField: 'ref', sourceOutput: '7', outputIndex: 3 });
+    const before = serializeGraph(graph);
+    const result = { package: { id: source.data.package_id, fields: [] }, values: {}, baseline: {},
+      backend_url: 'http://127.0.0.1:8188', output_nodes: ['7'], outputs: [{ id: '7', label: 'New', mediaType: type, replaced: true }] };
+    assert.throws(() => applyEditorInterfaceGraph(graph, source.id, result), /输出连线/);
+    assert.equal(serializeGraph(graph), before);
+    const rebound = applyEditorInterfaceGraph(graph, source.id, { ...result, output_rebindings: { '7': '7' } });
+    assert.equal(rebound.edges[0].sourceOutput, '7');
+    assert.equal(rebound.edges[0].outputIndex, 0);
+    assert.equal(applyEditorInterfaceGraph(graph, source.id, { ...result, output_rebindings: { '7': '7' } },
+      { preserveOutputIndices: true }).edges[0].outputIndex, 0);
+    assert.equal(serializeGraph(graph), before);
+  }
+});
+
 test('native JSON accepts BOM and keeps bypassed nodes and object widgets', () => {
   const document = { version: .4, nodes: [{ id: 1, type: 'Example', mode: 4, widgets_values: { strength: .7 } }], links: [], extra: { custom: ['kept'] } };
   assert.deepEqual(editorDocument('\uFEFF' + JSON.stringify(document)), document);
   assert.equal(editorDocument('{"prompt":{}}'), null);
+});
+
+test('native document parsing rejects duplicate keys and unsafe integers through the shared JSON guard', () => {
+  assert.throws(() => editorDocument('{"nodes":[],"nodes":[{"PRIVATE":"content"}]}'), /重复/);
+  assert.throws(() => editorDocument('{"nodes":[],"\\u006eodes":[]}'), /重复/);
+  assert.throws(() => editorDocument('{"nodes":[{"id":1,"widgets_values":[9007199254740993]}]}'), /整数|精度|安全/);
 });
 
 test('canvas keeps native controls, internal baseline and stable output identity', () => {
@@ -118,6 +148,25 @@ test('rebindings migrate image ownership only with the same filename and media t
   });
   assert.deepEqual(updated.nodes[0].data.packageMediaBackends, { newImage: { name: 'same.png', backend } });
   assert.throws(() => workflowBackendTarget(updated, [node.id], nextBackend), /请在目标引擎中重新上传/);
+});
+
+test('upload previews survive unchanged interface application but are removed on rebind, value or engine changes', () => {
+  const backend = 'http://127.0.0.1:8188', preview_url = `/api/media/${'a'.repeat(32)}`;
+  const field = { id: 'image', label: 'Image', type: 'image' };
+  const node = createNode('generation', 0, 0, { kind: 'package', package_id: 'p-' + '4'.repeat(24),
+    editor_backend: backend, packageFields: [field], packageValues: { image: 'same.png' },
+    packageMediaBackends: { image: { name: 'same.png', backend, preview_url } } });
+  const result = { package: { id: node.data.package_id, fields: [field] }, values: { image: 'same.png' },
+    baseline: {}, backend_url: backend, output_nodes: [], outputs: [] };
+  const apply = options => applyEditorInterfaceGraph({ nodes: [node], edges: [] }, node.id, { ...result, ...options }).nodes[0].data;
+  assert.equal(apply({}).packageMediaBackends.image.preview_url, preview_url);
+  assert.equal(apply({ backend_url: 'http://127.0.0.1:8189' }).packageMediaBackends.image.preview_url, undefined);
+  assert.deepEqual(apply({ values: { image: 'changed.png' } }).packageMediaBackends, {});
+  assert.deepEqual(apply({ invalidated_media_fields: ['image'] }).packageMediaBackends, {});
+  assert.deepEqual(apply({ package: { id: node.data.package_id, fields: [{ ...field, id: 'newImage' }] },
+    values: { newImage: 'same.png' }, rebindings: { image: 'newImage' }, invalidated_media_fields: ['image'] }).packageMediaBackends, {});
+  assert.equal(apply({ package: { id: node.data.package_id, fields: [{ ...field, id: 'newImage' }] },
+    values: { newImage: 'same.png' }, rebindings: { image: 'newImage' } }).packageMediaBackends.newImage.preview_url, undefined);
 });
 
 test('legacy unowned media keeps its old engine and the execution guard rejects it after interface reapply', () => {

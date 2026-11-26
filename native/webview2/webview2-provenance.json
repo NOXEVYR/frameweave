@@ -1,0 +1,10 @@
+{
+  "Package": "Microsoft.Web.WebView2",
+  "Version": "1.0.3856.49",
+  "Bytes": 9025251,
+  "SHA256": "BC0F76EB911B569838DC4AA8F8D325269B966BEDB592863D26211AEF3A099F1A",
+  "Source": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3856.49/microsoft.web.webview2.1.0.3856.49.nupkg",
+  "Signature": "Microsoft author and NuGet repository verified; see signature-verification.log",
+  "ArchiveCRC": "passed",
+  "RuntimeDownloaded": false
+}

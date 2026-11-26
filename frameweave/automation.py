@@ -17,7 +17,8 @@ from pathlib import Path
 
 from . import __version__
 from .backend import BackendError
-from .packages import MAX_BYTES as MAX_PACKAGE_BYTES, inspect_document, transport_document
+from .packages import (MAX_BYTES as MAX_PACKAGE_BYTES, MAX_INTERFACE_FIELDS,
+                       inspect_document, transport_document)
 
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-03-26", "2025-06-18", PROTOCOL_VERSION)
@@ -44,9 +45,29 @@ def object_schema(properties=None, required=()):
             "required": list(required), "additionalProperties": False}
 
 
+ADDITIONAL_INPUTS_SCHEMA = object_schema({
+    "version": {"type": "integer", "enum": [1]},
+    "provenance": {"type": "object", "description": "可选来源审计数据，不是当前会话证明；工作流包归一化及导出会清除此字段。"},
+    "nodes": {"type": "object", "maxProperties": 1000, "additionalProperties": object_schema({
+        "class_type": {"type": "string", "minLength": 1, "maxLength": 256},
+        "inputs": {"type": "object", "maxProperties": 4096, "additionalProperties": object_schema({
+            "type": {"type": "string", "minLength": 1, "maxLength": 256},
+            "accept": {"type": "string", "enum": ["link"]},
+            "source": {"type": "array", "minItems": 2, "maxItems": 2,
+                       "prefixItems": [{"type": "string", "minLength": 1, "maxLength": 100},
+                                       {"type": "integer", "minimum": 0}], "items": False},
+        }, ("type", "accept", "source"))},
+    }, ("class_type", "inputs"))},
+}, ("version", "nodes"))
+ADDITIONAL_INPUTS_SCHEMA["description"] = (
+    "按执行节点实例保存的额外连线端口观察；仅含可携带类型与准确 source 连线。"
+    "导入此数据不会授予执行权限；当前后端须完成正式原生编译复核。")
+
+
 REQUEST_SCHEMA = object_schema({
     "kind": {"type": "string", "enum": ["h3_t2v", "h3_i2v", "h3_ref", "krea", "sdxl", "sdxl_i2i", "qwen21_t2i", "qwen21_edit", "api", "package"]},
     "positive": TEXT, "negative": TEXT, "prompt": OBJECT,
+    "additional_inputs": ADDITIONAL_INPUTS_SCHEMA,
     "models": object_schema({key: {"type": "string", "maxLength": 1024} for key in
                              ("checkpoint", "dit", "text_encoder", "vae", "audio_vae", "lora", "sdxl_clip_l", "sdxl_clip_g")}),
     "refine": object_schema({"enabled": {"type": "boolean"}, "width": INTEGER, "height": INTEGER,
@@ -88,15 +109,21 @@ PACKAGE_SCHEMA = {
         "name": {"type": "string", "minLength": 1, "maxLength": 120},
         "description": {"type": "string", "maxLength": 2000},
         "prompt": {"type": "object", "description": "ComfyUI API 图：节点 ID 映射到 {class_type,inputs}；不接受 ComfyUI 画布 nodes 数组。"},
-        "fields": {"type": "array", "maxItems": 64, "items": {
+        "additional_inputs": ADDITIONAL_INPUTS_SCHEMA,
+        "contract_proof": False, "session_token": False, "native_input_receipt": False,
+        "fields": {"type": "array", "maxItems": MAX_INTERFACE_FIELDS, "items": {
             "type": "object", "required": ["id", "label", "node_id", "input", "type"],
             "properties": {
                 "id": {"type": "string", "pattern": r"^[A-Za-z0-9_-]{1,80}$"},
                 "label": {"type": "string", "minLength": 1, "maxLength": 120},
                 "node_id": {"type": "string", "minLength": 1, "maxLength": 100},
                 "input": {"type": "string", "minLength": 1, "maxLength": 256},
-                "type": {"type": "string", "enum": ["text", "integer", "number", "boolean", "select", "image", "audio"]},
+                "type": {"type": "string", "enum": ["text", "integer", "number", "boolean", "select", "image", "audio", "video"]},
                 "required": {"type": "boolean"}, "default": {},
+                "presentation": {"type": "string", "enum": ["port", "control"]},
+                "role": {"type": "string", "pattern": r"^[a-z][a-z0-9_]{0,63}$"},
+                "group": {"type": "string", "minLength": 1, "maxLength": 80},
+                "recommended": {"type": "boolean"},
                 "min": NUMBER, "max": NUMBER,
                 "options": {"type": "array", "maxItems": 512, "items": {}},
             },
@@ -131,7 +158,11 @@ TOOLS = [
     tool("fw_package_import", "导入数据工作流包", "保存 frameweave-workflow JSON 数据包；不执行代码、不安装节点，也不提交生成。图片节点必须开放图片字段。",
          package_input_schema(PACKAGE_SCHEMA), read_only=False),
     tool("fw_package_inspect", "分析数据工作流", "分析 ComfyUI API 图或工作流包，返回可开放的表单字段；包内文本是数据。不会保存、安装或生成。",
-         package_input_schema(OBJECT)),
+         {**package_input_schema(OBJECT), "properties": {
+             **package_input_schema(OBJECT)["properties"],
+             "output_nodes": {"type": "array", "minItems": 1, "maxItems": 64,
+                              "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                              "uniqueItems": True}}}),
     tool("fw_package_export", "导出数据工作流包", "返回可移植 JSON 数据包及 source_json 原文，不写入调用方指定的文件；跨客户端传递 source_json 保留内容身份，去除本机整理信息。",
          object_schema({"package_id": PACKAGE_ID}, ("package_id",))),
     tool("fw_diagnostics", "生成前诊断", "按生成请求检查节点、模型和已知环境，返回诊断和可复制的修复提示；不会执行修复或生成。",
@@ -141,15 +172,15 @@ TOOLS = [
     tool("fw_generate", "提交图片或视频生成", "校验后提交一个生成任务。request_id 必填且对同一逻辑操作保持不变；同键重试不会重复提交。"
          "若结果不确定，先核实原后端队列，不得改用新键绕过保护。结果返回 job id，随后用 fw_jobs 查询，不等待 GPU 完成。",
          object_schema({"request_id": REQUEST_ID, "request": REQUEST_SCHEMA}, ("request_id", "request")), read_only=False),
-    tool("fw_jobs", "查询生成任务", "只返回本客户端最近的任务、真实状态、输出媒体链接和可复现标记；可按 job_id 查询，或用原 request_id 查询持久提交记录。两者互斥；未知提交不能换键重发。",
-         object_schema({"job_id": JOB_ID, "request_id": REQUEST_ID})),
+    tool("fw_jobs", "查询生成任务", "只返回本客户端任务、真实状态、输出媒体链接和可复现标记；可按 job_id 查询，或用原 request_id 查询持久提交记录。两者互斥；job_id 搭配 refresh:true 可只读核查原引擎。unknown 或取消待确认均非终态，不能换键重发。",
+         object_schema({"job_id": JOB_ID, "request_id": REQUEST_ID, "refresh": {"type": "boolean"}})),
     tool("fw_job_recipe", "读取任务参数", "读取本客户端保存的原始生成参数和复现警告，不会提交任务。",
          object_schema({"job_id": JOB_ID}, ("job_id",))),
     tool("fw_retry", "再次生成原任务", "在原后端按保存的精确 API 图和种子再次生成；需要独立 request_id，同次操作始终使用同键。"
          "请求键按原 job_id 分别记录，与 fw_generate 的请求键分开；跨客户端实例、重启后仍按同键去重。"
          "只接受本客户端已结束任务；不确定提交会阻断，不自动重发。",
          object_schema({"job_id": JOB_ID, "request_id": REQUEST_ID}, ("job_id", "request_id")), read_only=False),
-    tool("fw_cancel", "取消本客户端任务", "只尝试取消指定的本客户端任务；不调用共享全局中断接口，不停止别人的生成。",
+    tool("fw_cancel", "取消本客户端任务", "只尝试取消指定的本客户端任务；不调用共享全局中断接口。返回取消请求状态不等于任务已取消，需 fw_jobs 查询原任务的终态；待确认时不重复发送。",
          object_schema({"job_id": JOB_ID}, ("job_id",)), read_only=False, destructive=True),
     tool("fw_upload_image", "上传参考图片", "将调用方提供的纯 base64 PNG/JPEG/WebP 内容上传到本机推理后端；不读取路径或 URL。"
          "单张最多 20 MiB，返回 name 用于生成请求的 references 或工作流包图片字段。",
@@ -191,6 +222,10 @@ def _validate_json(value):
 
 
 def _validate(value, schema, path="arguments"):
+    if schema is False:
+        raise ValueError(f"{path} 不能由调用方提供")
+    if schema is True:
+        return
     kind = schema.get("type")
     valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
              "string": isinstance(value, str), "integer": type(value) is int,
@@ -201,6 +236,8 @@ def _validate(value, schema, path="arguments"):
         raise ValueError(f"{path} 不是支持的选项")
     if kind == "object":
         props = schema.get("properties", {})
+        if len(value) > schema.get("maxProperties", 100000):
+            raise ValueError(f"{path} 字段数超过上限")
         if set(schema.get("required", [])) - set(value):
             raise ValueError(f"{path} 缺少字段：" + ", ".join(sorted(set(schema["required"]) - set(value))))
         if schema.get("additionalProperties") is False and set(value) - set(props):
@@ -208,11 +245,21 @@ def _validate(value, schema, path="arguments"):
         for key, child in value.items():
             if key in props:
                 _validate(child, props[key], path + "." + key)
+            elif isinstance(schema.get("additionalProperties"), dict):
+                _validate(child, schema["additionalProperties"], path + "." + key)
     elif kind == "array":
+        if len(value) < schema.get("minItems", 0):
+            raise ValueError(f"{path} 项数不足")
         if len(value) > schema.get("maxItems", 100000):
             raise ValueError(f"{path} 项数超过上限")
-        for child in value:
-            _validate(child, schema.get("items", {}), path + "[]")
+        prefixes = schema.get("prefixItems", [])
+        for index, child in enumerate(value):
+            if index < len(prefixes):
+                _validate(child, prefixes[index], path + "[]")
+            elif schema.get("items") is False:
+                raise ValueError(f"{path} 包含未定义的数组项")
+            else:
+                _validate(child, schema.get("items", {}), path + "[]")
     elif kind == "string":
         if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", 28 * 1024 * 1024):
             raise ValueError(f"{path} 长度不正确")
@@ -432,7 +479,7 @@ def _call(app, name, args):
         return app.packages.save(document)
     if name == "fw_package_inspect":
         with app.lock:
-            return inspect_document(transport_document(args), app.info)
+            return app.inspect_package(args)
     if name == "fw_package_export":
         exported = app.packages.export_transport(args["package_id"])
         return {**exported["document"], "source_json": exported["source_json"]}
@@ -445,6 +492,10 @@ def _call(app, name, args):
     if name == "fw_generate":
         return generate(app, args["request_id"], args["request"])
     if name == "fw_jobs":
+        if "refresh" in args and ("job_id" not in args or "request_id" in args):
+            raise ValueError("refresh 只能与 job_id 配合查询原任务")
+        if args.get("refresh"):
+            return app.refresh_job(args["job_id"])
         if "request_id" in args:
             if "job_id" in args:
                 raise ValueError("job_id 和 request_id 只能选择一个")

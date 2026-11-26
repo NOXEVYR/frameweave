@@ -6,6 +6,7 @@ backup policy, idle detection, and restart belong to the application host.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ GITHUB_RELEASES_PREFIX = (
 )
 
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_BACKGROUND_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_FILES = 2_000
 MAX_UNPACKED_BYTES = 256 * 1024 * 1024
@@ -172,7 +174,9 @@ class UpdateManager:
         self.staging_dir = self.data_dir / "updates" / "staged"
         self.auto_check = bool(auto_check)
         self.timeout = float(timeout)
-        self.manifest_url = _validate_url(manifest_url)
+        if manifest_url != MANIFEST_URL:
+            raise UpdateError("只能使用固定的官方发布清单")
+        self.manifest_url = MANIFEST_URL
         self.max_manifest_bytes = int(max_manifest_bytes)
         self.max_archive_bytes = int(max_archive_bytes)
         self._opener = opener
@@ -180,6 +184,7 @@ class UpdateManager:
         self._last_error: str | None = None
         self._release: dict[str, Any] | None = None
         self._staged: dict[str, Any] | None = None
+        self._actual_download_bytes = 0
 
     def set_auto_check(self, enabled: bool) -> dict[str, Any]:
         """Change the in-memory preference; caller persists it in app settings."""
@@ -198,7 +203,11 @@ class UpdateManager:
             "available": bool(release.get("update_available", False)),
             "new_version": release.get("version") if release.get("update_available") else None,
             "release": self._public_release(release) if release else None,
-            "staged": dict(self._staged) if self._staged else None,
+            "staged": copy.deepcopy(self._staged) if self._staged else None,
+            "download_mode": "full-archive",
+            "download_bytes": release.get("bytes"),
+            "actual_download_bytes": self._actual_download_bytes,
+            "requires_download_confirmation": bool(release.get("bytes", 0) > MAX_BACKGROUND_DOWNLOAD_BYTES),
             "last_error": self._last_error,
         }
 
@@ -210,29 +219,44 @@ class UpdateManager:
             payload = self._fetch_bytes(self.manifest_url, self.max_manifest_bytes)
             manifest = _decode_manifest(payload)
             release = self._select_release(manifest)
+            release["manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+            release["identity"] = {
+                key: release[key] for key in (
+                    "app", "platform", "arch", "channel", "version", "name", "url",
+                    "bytes", "sha256", "exe_bytes", "exe_sha256", "manifest_sha256", "build_id",
+                )
+            }
             release["update_available"] = compare_versions(
                 release["version"], self.current_version
             ) > 0
             self._release = release
         except UpdateError as exc:
+            self._release = None
             self._last_error = str(exc)
             raise
         except (OSError, urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            self._release = None
             self._last_error = _error_message(exc)
             raise UpdateError(self._last_error) from exc
         return self.status()
 
-    def stage(self) -> dict[str, Any]:
+    def stage(self, *, expected_identity: dict[str, Any] | None = None, allow_large: bool = False) -> dict[str, Any]:
         """Download, hash-check and inspect the latest portable ZIP.
 
         Returns verified staging metadata only.  It does not extract, install,
         replace, terminate, or restart the application.
         """
+        self._actual_download_bytes = 0
         if self._release is None:
             self.check()
         release = self._release
         if not release or not release.get("update_available"):
             raise UpdateError("当前没有可暂存的新版本")
+        if expected_identity is not None and (
+            not isinstance(expected_identity, dict) or expected_identity != release["identity"]
+        ):
+            self._last_error = "发布身份已变化，请重新检查并确认下载"
+            raise UpdateError(self._last_error)
 
         if self._staged and self._staged.get('version') == release['version']:
             try:
@@ -245,7 +269,6 @@ class UpdateManager:
                 self._staged, self._last_error = info, None
                 return self.status()
 
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
         filename = release["name"]
         destination = self.staging_dir / filename
         recovery_note = ''
@@ -262,6 +285,10 @@ class UpdateManager:
                 self._last_error = None
                 return self.status()
 
+        if release["bytes"] > MAX_BACKGROUND_DOWNLOAD_BYTES and allow_large is not True:
+            self._last_error = "完整更新包超过 50 MiB，请确认此发布版本的下载大小后重试"
+            raise UpdateError(self._last_error)
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
         try:
             fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".part", dir=self.staging_dir)
@@ -283,6 +310,7 @@ class UpdateManager:
                         if not chunk:
                             break
                         total += len(chunk)
+                        self._actual_download_bytes = total
                         if total > self.max_archive_bytes or total > release["bytes"]:
                             raise UpdateError("下载文件超过清单大小限制")
                         digest.update(chunk)
@@ -295,7 +323,7 @@ class UpdateManager:
             actual_sha = digest.hexdigest()
             if actual_sha.lower() != release["sha256"].lower():
                 raise UpdateError("下载文件 SHA-256 校验失败")
-            _validate_portable_zip(temp_path)
+            _validate_portable_zip(temp_path, release)
             if destination.exists():
                 raise UpdateError("暂存目标已存在，未覆盖现有文件")
             os.replace(temp_path, destination)
@@ -308,6 +336,11 @@ class UpdateManager:
                 "sha256": actual_sha,
                 "exe_bytes": release["exe_bytes"],
                 "exe_sha256": release["exe_sha256"],
+                "identity": copy.deepcopy(release["identity"]),
+                "manifest_sha256": release["manifest_sha256"],
+                "build_id": release["build_id"],
+                "download_mode": "full-archive",
+                "download_bytes": release["bytes"],
                 "verified": True,
                 "installed": False,
                 **({'recovery_note': recovery_note} if recovery_note else {}),
@@ -358,15 +391,15 @@ class UpdateManager:
         return opener.open(request, timeout=self.timeout)
 
     def _select_release(self, manifest: dict[str, Any]) -> dict[str, Any]:
-        if manifest.get("compatibility_identity") not in (None, "FrameWeave"):
-            raise UpdateError("发布清单的产品身份不匹配")
+        _validate_release_fields(manifest)
         version = manifest.get("version")
-        _parse_version(version)
-        if manifest.get("published") is False or manifest.get("release_channel") == "local-candidate":
-            raise UpdateError("当前清单不是公开发布版本")
+        if _parse_version(version)[1] is not None:
+            raise UpdateError("稳定更新通道不接受预发布版本")
+        version = version.removeprefix("v")
         artifacts = manifest.get("artifacts")
         if not isinstance(artifacts, list):
             raise UpdateError("发布清单缺少安装包列表")
+        candidates = []
         for item in artifacts:
             if not isinstance(item, dict):
                 continue
@@ -374,8 +407,16 @@ class UpdateManager:
             if not isinstance(name, str):
                 continue
             match = _WINDOWS_ARCHIVE_RE.fullmatch(name)
-            if not match or match.group("version") != version.removeprefix("v"):
+            if not match or match.group("version") != version:
                 continue
+            candidates.append(item)
+        if len(candidates) > 1:
+            raise UpdateError("发布清单包含重复或歧义的 Windows 安装包")
+        for item in candidates:
+            _validate_release_fields(item)
+            name = item["name"]
+            if "version" in item and item["version"] != version:
+                raise UpdateError("安装包版本与发布清单不一致")
             size = item.get("bytes")
             sha256 = item.get("sha256")
             if isinstance(size, bool) or not isinstance(size, int) or not (1 <= size <= self.max_archive_bytes):
@@ -396,9 +437,24 @@ class UpdateManager:
             if url is None:
                 url = RAW_RELEASES_PREFIX + name
             url = _validate_url(url)
+            parts = urlsplit(url)
+            if parts.path.rsplit("/", 1)[-1] != name:
+                raise UpdateError("下载地址文件名与安装包不一致")
+            if parts.netloc.lower() == "raw.githubusercontent.com" and parts.path != "/NOXEVYR/frameweave/main/releases/" + name:
+                raise UpdateError("安装包不在官方发布目录中")
+            if parts.netloc.lower() == "github.com" and parts.path.split("/")[-2] not in (version, "v" + version):
+                raise UpdateError("下载地址发布标签与版本不一致")
             kind = item.get("kind", "Windows x64 portable")
+            if kind not in ("Windows-x64", "Windows x64 portable"):
+                raise UpdateError("安装包类型不是 Windows x64 完整包")
+            build_id = _select_build_id(manifest, item)
             return {
-                "version": version.removeprefix("v"),
+                "app": "FrameWeave",
+                "platform": "windows",
+                "arch": "x64",
+                "channel": "stable",
+                "build_id": build_id,
+                "version": version,
                 "name": name,
                 "kind": str(kind),
                 "bytes": size,
@@ -408,6 +464,8 @@ class UpdateManager:
                 "url": url,
                 "update_available": False,
                 "published": manifest.get("published", True) is True,
+                "download_mode": "full-archive",
+                "download_bytes": size,
             }
         raise UpdateError("发布清单中没有匹配版本的 Windows x64 安装包")
 
@@ -417,7 +475,7 @@ class UpdateManager:
         digest = _sha256_file(path)
         if digest != release["sha256"]:
             raise UpdateError("已存在的暂存文件哈希不符，未覆盖")
-        _validate_portable_zip(path)
+        _validate_portable_zip(path, release)
         return {
             "version": release["version"],
             "filename": path.name,
@@ -426,14 +484,53 @@ class UpdateManager:
             "sha256": digest,
             "exe_bytes": release["exe_bytes"],
             "exe_sha256": release["exe_sha256"],
+            "identity": copy.deepcopy(release["identity"]),
+            "manifest_sha256": release["manifest_sha256"],
+            "build_id": release["build_id"],
+            "download_mode": "full-archive",
+            "download_bytes": release["bytes"],
             "verified": True,
             "installed": False,
         }
 
     @staticmethod
     def _public_release(release: dict[str, Any]) -> dict[str, Any]:
-        keys = ("version", "name", "kind", "bytes", "sha256", "exe_bytes", "exe_sha256", "update_available", "published")
-        return {key: release[key] for key in keys if key in release}
+        keys = ("app", "platform", "arch", "channel", "version", "name", "kind", "bytes", "sha256", "exe_bytes", "exe_sha256", "update_available", "published", "identity", "manifest_sha256", "build_id", "download_mode", "download_bytes")
+        return {key: copy.deepcopy(release[key]) for key in keys if key in release}
+
+
+def _validate_release_fields(value: dict[str, Any]) -> None:
+    # Missing fields retain the published 0.11.1 feed's compatibility. Explicit
+    # declarations must agree; null is not an absent identity declaration.
+    allowed = {
+        "compatibility_identity": {"FrameWeave"},
+        "app": {"FrameWeave", "PrismCanvas"},
+        "app_id": {"FrameWeave", "PrismCanvas"},
+        "application": {"FrameWeave", "PrismCanvas"},
+        "platform": {"windows", "Windows"},
+        "arch": {"x64"},
+        "architecture": {"x64"},
+        "channel": {"stable", "public-release"},
+        "release_channel": {"stable", "public-release"},
+        "download_mode": {"full-archive"},
+    }
+    for key, choices in allowed.items():
+        if key in value and (not isinstance(value[key], str) or value[key] not in choices):
+            raise UpdateError(f"发布清单的 {key} 与稳定 Windows x64 更新身份不匹配")
+    if "published" in value and value["published"] is not True:
+        raise UpdateError("当前清单不是公开发布版本")
+    for key in ("prerelease", "draft", "source_candidate"):
+        if key in value and value[key] is not False:
+            raise UpdateError("稳定更新通道不接受草稿、源码候选或预发布版本")
+
+
+def _select_build_id(manifest: dict[str, Any], artifact: dict[str, Any]) -> str | None:
+    values = [value["build_id"] for value in (manifest, artifact) if "build_id" in value]
+    if any(not isinstance(value, str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}", value) for value in values):
+        raise UpdateError("发布清单 build_id 无效")
+    if len(set(values)) > 1:
+        raise UpdateError("安装包 build_id 与发布清单不一致")
+    return values[0] if values else None
 
 
 def _decode_manifest(payload: bytes) -> dict[str, Any]:
@@ -455,7 +552,7 @@ def _reject_duplicate_keys(items: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _validate_portable_zip(path: Path) -> dict[str, int]:
+def _validate_portable_zip(path: Path, release: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(path, "r") as archive:
             members = archive.infolist()
@@ -463,6 +560,7 @@ def _validate_portable_zip(path: Path) -> dict[str, int]:
                 raise UpdateError("安装包文件数量无效")
             total_unpacked = 0
             seen: set[str] = set()
+            executable_members = []
             for info in members:
                 # ZipInfo.filename normalizes backslashes on Windows. Inspect
                 # orig_filename so path validation sees the bytes' original path.
@@ -484,6 +582,8 @@ def _validate_portable_zip(path: Path) -> dict[str, int]:
                 ):
                     raise UpdateError("安装包包含不安全路径")
                 normalized = "/".join(path_parts).casefold()
+                if not info.is_dir() and path_parts[-1].casefold() in ("prismcanvas.exe", "frameweave.exe"):
+                    executable_members.append(info)
                 if normalized in seen:
                     raise UpdateError("安装包包含重复路径")
                 seen.add(normalized)
@@ -508,7 +608,25 @@ def _validate_portable_zip(path: Path) -> dict[str, int]:
                         raise UpdateError("安装包压缩比例异常")
             if archive.testzip() is not None:
                 raise UpdateError("安装包包含损坏的 ZIP 数据")
+            if release is not None:
+                if len(executable_members) != 1:
+                    raise UpdateError("安装包必须包含唯一的 PrismCanvas/FrameWeave EXE")
+                executable = executable_members[0]
+                if executable.file_size != release["exe_bytes"]:
+                    raise UpdateError("安装包内 EXE 大小与发布清单不一致")
+                digest = hashlib.sha256()
+                total = 0
+                with archive.open(executable) as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        total += len(chunk)
+                        if total > release["exe_bytes"]:
+                            raise UpdateError("安装包内 EXE 超过清单大小")
+                        digest.update(chunk)
+                if total != release["exe_bytes"] or digest.hexdigest() != release["exe_sha256"]:
+                    raise UpdateError("安装包内 EXE SHA-256 校验失败")
             return {"file_count": len(members), "unpacked_bytes": total_unpacked}
+    except UpdateError:
+        raise
     except zipfile.BadZipFile as exc:
         raise UpdateError("下载内容不是有效 ZIP 安装包") from exc
     except (NotImplementedError, RuntimeError) as exc:

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
 import http.client
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.parse
 from pathlib import Path
-from ctypes import wintypes
 
 from . import __version__
 
@@ -158,7 +155,7 @@ def read_legacy_url(data_dir: Path) -> str | None:
     return value if value else None
 
 
-def validate_prismcanvas_url(url: str, timeout: float = 1.0, *, allow_legacy: bool = False) -> bool:
+def validate_prismcanvas_url(url: str, timeout: float = 1.0, *, allow_legacy: bool = False, allow_previous_owner: bool = False) -> bool:
     """Probe one fixed, read-only endpoint on a numeric IPv4 loopback address.
 
     Never follow redirects or honor proxy settings. The URL is parsed and
@@ -196,7 +193,10 @@ def validate_prismcanvas_url(url: str, timeout: float = 1.0, *, allow_legacy: bo
         if not isinstance(payload, dict):
             return False
         version = payload.get("version")
-        current_identity = payload.get("application") == "PrismCanvas" and version == __version__
+        # The existing workspace lock can belong to the preceding desktop build
+        # while its pending jobs finish. Keep the same workspace and browser origin.
+        known_version = version == __version__ or (allow_previous_owner and version in ("0.11.5", "0.11.6", "0.11.7"))
+        current_identity = payload.get("application") == "PrismCanvas" and known_version
         legacy_identity = (allow_legacy and "application" not in payload and
                            version in _LEGACY_PRISMCANVAS_VERSIONS)
         if not (current_identity or legacy_identity):
@@ -215,22 +215,6 @@ def validate_prismcanvas_url(url: str, timeout: float = 1.0, *, allow_legacy: bo
         return False
 
 
-def open_app_window(url: str) -> None:
-    """Open the known local app URL using the same lightweight window mode."""
-    edge_paths = [
-        Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Microsoft/Edge/Application/msedge.exe",
-    ]
-    edge = next((path for path in edge_paths if path.is_file()), None)
-    if edge:
-        subprocess.Popen([str(edge), "--app=" + url, "--window-size=1500,960", "--no-first-run"],
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    else:
-        import webbrowser
-
-        webbrowser.open(url)
-
-
 def _app_window_title_for_url(url: str) -> str:
     parts = urllib.parse.urlsplit(url)
     if (parts.scheme != "http" or parts.hostname != "127.0.0.1" or
@@ -241,139 +225,36 @@ def _app_window_title_for_url(url: str) -> str:
     return APP_WINDOW_TITLE_PREFIX + str(parts.port)
 
 
-def _edge_app_windows(window_title: str) -> list[int]:
-    """Find visible Edge app-mode windows by the product's exact window title."""
-    if os.name != "nt":
-        return []
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    user32.GetWindowTextLengthW.restype = ctypes.c_int
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                                    wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
-    get_long.restype = ctypes.c_ssize_t
-
-    windows = []
-    def inspect(hwnd, _param):
-        length = user32.GetWindowTextLengthW(hwnd)
-        if not length or not user32.IsWindowVisible(hwnd):
-            return True
-        title = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, title, length + 1)
-        if title.value != window_title:
-            return True
-        class_name = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, class_name, len(class_name))
-        if class_name.value != "Chrome_WidgetWin_1":
-            return True
-        style = get_long(hwnd, -16)
-        exstyle = get_long(hwnd, -20)
-        if not (style & 0x10000000) or exstyle & 0x00000080:  # visible, not a tool window
-            return True
-        process_id = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-        process = kernel32.OpenProcess(0x1000, False, process_id.value)  # QUERY_LIMITED_INFORMATION
-        if not process:
-            return True
-        try:
-            image = ctypes.create_unicode_buffer(32768)
-            image_size = wintypes.DWORD(len(image))
-            if kernel32.QueryFullProcessImageNameW(process, 0, image, ctypes.byref(image_size)):
-                if Path(image.value).name.lower() == "msedge.exe":
-                    windows.append(int(hwnd))
-        finally:
-            kernel32.CloseHandle(process)
-        return True
-
-    callback = callback_type(inspect)
-    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
-    user32.EnumWindows(callback, 0)
-    return windows
-
-
 def activate_existing_app_window(url: str, timeout: float = 3.0, *, window_title: str | None = None) -> bool:
-    """Find the existing Edge app window and request foreground activation.
+    """Recall only the native client belonging to this workspace origin."""
+    from .native_window import recall
 
-    A matching HWND counts as an existing window even when Windows declines to
-    transfer foreground ownership. Callers must never open a duplicate just
-    because a background process could not steal focus.
-    """
-    if os.name != "nt" or not re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}/", url):
-        return False
-    if window_title is None:
-        try:
-            window_title = _app_window_title_for_url(url)
-        except ValueError:
-            return False
     try:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        user32.BringWindowToTop.argtypes = [wintypes.HWND]
-        user32.SetActiveWindow.argtypes = [wintypes.HWND]
-        user32.SetFocus.argtypes = [wintypes.HWND]
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
-        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-        windows = _edge_app_windows(window_title)
-        for hwnd in windows:
-            foreground = user32.GetForegroundWindow()
-            foreground_pid = wintypes.DWORD()
-            target_pid = wintypes.DWORD()
-            foreground_thread = user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid)) if foreground else 0
-            target_thread = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(target_pid))
-            current_thread = kernel32.GetCurrentThreadId()
-            attached = []
-            try:
-                for thread_id in dict.fromkeys((foreground_thread, target_thread)):
-                    if thread_id and thread_id != current_thread and user32.AttachThreadInput(current_thread, thread_id, True):
-                        attached.append(thread_id)
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
-                if user32.GetForegroundWindow() != hwnd:
-                    user32.SetActiveWindow(hwnd)
-                    user32.SetFocus(hwnd)
-                    user32.SetForegroundWindow(hwnd)
-            finally:
-                for thread_id in reversed(attached):
-                    user32.AttachThreadInput(current_thread, thread_id, False)
-            return True
+        _app_window_title_for_url(url)
+        return recall(url)
+    except (OSError, ValueError):
         return False
-    except (AttributeError, OSError, ValueError):
+
+
+def open_app_window(url: str, data_dir: Path | None = None) -> bool:
+    try:
+        _app_window_title_for_url(url)
+        if os.name == "nt":
+            from .native_window import launch
+            data_dir = data_dir or Path(os.environ["LOCALAPPDATA"]) / "FrameWeave"
+            return launch(url, data_dir)
+        import webbrowser
+        return bool(webbrowser.open(url))
+    except (OSError, ValueError, KeyError):
         return False
 
 
 def focus_or_open_app_window(url: str, data_dir: Path, *, window_title: str | None = None) -> bool:
-    """Serialize second-launch window handling and reopen if the app was closed."""
+    """Serialize window creation without touching the backend instance lock."""
     gate = _FileLock(Path(data_dir).resolve() / "window-open.lock")
-    if not gate.acquire(timeout=8):
+    if not gate.acquire(timeout=12):
         return False
     try:
-        if activate_existing_app_window(url, window_title=window_title):
-            return True
-        open_app_window(url)
-        # Chromium may hand the request to an existing browser process and
-        # return before the app-mode window appears. Keep the gate until it can
-        # be found, so two rapid launches do not each create a window.
-        deadline = time.monotonic() + 4
-        while os.name == "nt" and time.monotonic() < deadline:
-            time.sleep(0.25)
-            if activate_existing_app_window(url, timeout=1.0, window_title=window_title):
-                return True
-        return True
+        return activate_existing_app_window(url) or open_app_window(url, data_dir)
     finally:
         gate.release()

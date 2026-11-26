@@ -22,6 +22,14 @@ internal sealed class DesktopWindow : Window
     [DllImport("dwmapi.dll", ExactSpelling=true)]
     private static extern int DwmSetWindowAttribute(nint hwnd, DwmAttribute attribute, in int value, int size);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint LoadImageW(nint instance, string path, uint type, int width, int height, uint flags);
+    [DllImport("user32.dll")]
+    private static extern nint SendMessageW(nint hwnd, uint message, nint kind, nint value);
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(nint icon);
+    private nint taskbarIcon;
+
     private readonly Uri origin;
     private readonly string profile;
     private readonly WebView2 view = new();
@@ -48,6 +56,7 @@ internal sealed class DesktopWindow : Window
         Closing += CheckClosing;
         Closed += (_,_) => {
             closed = true;
+            if (taskbarIcon != 0) DestroyIcon(taskbarIcon);
             SystemParameters.StaticPropertyChanged -= OnSystemSettingChanged;
             view.Dispose();
         };
@@ -57,7 +66,23 @@ internal sealed class DesktopWindow : Window
     {
         base.OnSourceInitialized(e);
         ApplyCaptionColors();
+        ApplyTaskbarIcon();
+        DpiChanged += (_, _) => Dispatcher.InvokeAsync(ApplyTaskbarIcon);
         SystemParameters.StaticPropertyChanged += OnSystemSettingChanged;
+    }
+
+    private void ApplyTaskbarIcon()
+    {
+        if (closed) return;
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == 0) return;
+        var size = (int)Math.Round(32 * VisualTreeHelper.GetDpi(this).DpiScaleX);
+        var icon = LoadImageW(0, Path.Combine(AppContext.BaseDirectory, "taskbar.ico"), 1, size, size, 0x10);
+        if (icon == 0) return;
+        // ICON_BIG supplies the shell with the transparent mark. WPF owns ICON_SMALL for the caption.
+        SendMessageW(hwnd, 0x0080, 1, icon);
+        if (taskbarIcon != 0) DestroyIcon(taskbarIcon);
+        taskbarIcon = icon;
     }
 
     private void OnSystemSettingChanged(object? sender, PropertyChangedEventArgs e)

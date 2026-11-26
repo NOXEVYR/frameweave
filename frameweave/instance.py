@@ -195,7 +195,7 @@ def validate_prismcanvas_url(url: str, timeout: float = 1.0, *, allow_legacy: bo
         version = payload.get("version")
         # The existing workspace lock can belong to the preceding desktop build
         # while its pending jobs finish. Keep the same workspace and browser origin.
-        known_version = version == __version__ or (allow_previous_owner and version in ("0.11.5", "0.11.6", "0.11.7"))
+        known_version = version == __version__ or (allow_previous_owner and version in ("0.11.5", "0.11.6", "0.11.7", "0.11.8"))
         current_identity = payload.get("application") == "PrismCanvas" and known_version
         legacy_identity = (allow_legacy and "application" not in payload and
                            version in _LEGACY_PRISMCANVAS_VERSIONS)

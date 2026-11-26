@@ -1,0 +1,39 @@
+{
+  "display_name": "棱光 PrismCanvas",
+  "compatibility_identity": "FrameWeave",
+  "version": "0.11.9",
+  "release_channel": "public-release",
+  "published": true,
+  "contains_weights": false,
+  "contains_private_configuration": false,
+  "exe_bytes": 12457093,
+  "exe_sha256": "a386ad835b7da9d16f3fc0dc8995e2a1a76c4c35aa3c97dc0a4f9681ad099d3a",
+  "artifacts": [
+    {
+      "name": "PrismCanvas-v0.11.9-Windows-x64.zip",
+      "kind": "Windows-x64",
+      "bytes": 12279319,
+      "sha256": "ba7edf327ea000fa0403a9af0c2dac78ffd52c370cc7e348ddad850080ab5ffd"
+    },
+    {
+      "name": "PrismCanvas-v0.11.9-source.zip",
+      "kind": "source",
+      "bytes": 2211513,
+      "sha256": "d9d6f3170c795426c895fdd6f363e2bd8ea0718cee5e28ff99ded2925cd28050"
+    }
+  ],
+  "checks": {
+    "python_tests": 1558,
+    "python_passed": 1538,
+    "python_skipped": 20,
+    "node_tests": 2218,
+    "node_passed": 2217,
+    "node_skipped": 1,
+    "native_checks": 13,
+    "desktop_version": "0.11.9",
+    "real_backend_smoke": [
+      "poster PNG"
+    ],
+    "visible_taskbar_verified": true
+  }
+}

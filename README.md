@@ -8,9 +8,11 @@
 
 ## 下载与使用
 
-[Windows x64 便携版 0.11.8](https://github.com/NOXEVYR/frameweave/releases/download/v0.11.8/PrismCanvas-v0.11.8-Windows-x64.zip) · [源码包](https://github.com/NOXEVYR/frameweave/releases/download/v0.11.8/PrismCanvas-v0.11.8-source.zip) · [发布说明与校验值](https://github.com/NOXEVYR/frameweave/releases/tag/v0.11.8)
+[Windows x64 便携版 0.11.9](https://github.com/NOXEVYR/frameweave/releases/download/v0.11.9/PrismCanvas-v0.11.9-Windows-x64.zip) · [源码包](https://github.com/NOXEVYR/frameweave/releases/download/v0.11.9/PrismCanvas-v0.11.9-source.zip) · [发布说明与校验值](https://github.com/NOXEVYR/frameweave/releases/tag/v0.11.9)
 
 解压后运行 `PrismCanvas.exe`。独立 Windows 窗口使用 .NET 8 桌面运行时（x64）和系统 WebView2。首页可直接创建画布或点击缩略图继续编辑，在画布内查看版本历史。
+
+0.11.9 恢复原版品牌图标。Windows 任务栏使用同一切面的透明图标。
 
 在图片、视频或声音工作台打开「工作流与模型」，选择已导入的包和一个输出。棱光沿这条输出分支查找加载器，从当前 ComfyUI 的节点定义读取模型选项。确认后，工作流成为画布上的盒子。每个模型值写入对应的内部节点与输入。打开检查器可以查看绑定，在「管理外部接口」中调整。引擎未运行时仍可编辑画布。
 

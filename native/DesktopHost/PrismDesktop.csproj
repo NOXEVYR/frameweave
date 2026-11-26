@@ -8,7 +8,7 @@
     <AssemblyName>PrismDesktop</AssemblyName>
     <AssemblyTitle>棱光</AssemblyTitle>
     <Product>棱光</Product>
-    <ApplicationIcon>../../assets/frameweave.ico</ApplicationIcon>
+    <ApplicationIcon>../../assets/taskbar.ico</ApplicationIcon>
     <DebugType>none</DebugType>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WebView2SdkDir Condition="'$(WebView2SdkDir)'==''">$(MSBuildThisFileDirectory)..\webview2</WebView2SdkDir>
@@ -20,5 +20,6 @@
     <Content Include="$(WebView2SdkDir)/WEBVIEW2-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" Link="WEBVIEW2-LICENSE.txt" />
     <EmbeddedResource Include="../../web/**/*"><LogicalName>Prism.Ui/%(RecursiveDir)%(Filename)%(Extension)</LogicalName></EmbeddedResource>
     <Resource Include="../../assets/frameweave.ico" Link="frameweave.ico" />
+    <Content Include="../../assets/taskbar.ico" Link="taskbar.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
